@@ -33,10 +33,15 @@
 
 #include "../util/util_shared_res.h"
 
+
+
 namespace dxvk {
   
   constexpr uint32_t D3D11DXGIDevice::DefaultFrameLatency;
 
+    Rc<DxvkDevice> D3D11Device::GetWorkerDXVKDevice() {
+    return m_container->GetWorkerDXVKDevice();
+  }
 
 
   D3D11Device::D3D11Device(
@@ -3795,12 +3800,16 @@ namespace dxvk {
           Rc<DxvkInstance>    pDxvkInstance,
           Rc<DxvkAdapter>     pDxvkAdapter,
           Rc<DxvkDevice>      pDxvkDevice,
+          Rc<DxvkAdapter>     pWorkerAdapter,
+          Rc<DxvkDevice>      pWorkerDevice,
           D3D_FEATURE_LEVEL   FeatureLevel,
           UINT                FeatureFlags)
   : m_dxgiAdapter   (pAdapter),
     m_dxvkInstance  (pDxvkInstance),
     m_dxvkAdapter   (pDxvkAdapter),
     m_dxvkDevice    (pDxvkDevice),
+    m_workerAdapter (pWorkerAdapter),
+    m_workerDevice  (pWorkerDevice),
     m_d3d11Device   (this, FeatureLevel, FeatureFlags),
     m_d3d11DeviceExt(this, &m_d3d11Device),
     m_d3d11Interop  (this, &m_d3d11Device),

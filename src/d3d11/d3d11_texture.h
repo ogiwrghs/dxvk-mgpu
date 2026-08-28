@@ -582,6 +582,7 @@ namespace dxvk {
     DXGI_USAGE                    m_dxgiUsage;
     VkFormat                      m_packedFormat;
     
+    Rc<DxvkImage>                 m_workerImage;
     Rc<DxvkImage>                 m_image;
     small_vector<MappedBuffer, 6> m_buffers;
     small_vector<MappedInfo, 6>   m_mapInfo;

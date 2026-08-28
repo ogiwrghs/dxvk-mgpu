@@ -418,6 +418,8 @@ namespace dxvk {
     Rc<DxvkDevice> GetDXVKDevice() {
       return m_dxvkDevice;
     }
+
+    Rc<DxvkDevice> GetWorkerDXVKDevice();
     
     void FlushInitCommands() {
       m_initializer->FlushCsChunk();
@@ -921,6 +923,8 @@ namespace dxvk {
             Rc<DxvkInstance>    pDxvkInstance,
             Rc<DxvkAdapter>     pDxvkAdapter,
             Rc<DxvkDevice>      pDxvkDevice,
+            Rc<DxvkAdapter>     pWorkerAdapter,
+            Rc<DxvkDevice>      pWorkerDevice,
             D3D_FEATURE_LEVEL   FeatureLevel,
             UINT                FeatureFlags);
     
@@ -989,6 +993,10 @@ namespace dxvk {
     
     Rc<DxvkDevice> STDMETHODCALLTYPE GetDXVKDevice();
 
+    Rc<DxvkDevice> GetWorkerDXVKDevice() {
+      return m_workerDevice;
+    }
+
     BOOL Is11on12Device() const {
       return m_d3d11on12.Is11on12Device();
     }
@@ -1000,6 +1008,8 @@ namespace dxvk {
     Rc<DxvkInstance>    m_dxvkInstance;
     Rc<DxvkAdapter>     m_dxvkAdapter;
     Rc<DxvkDevice>      m_dxvkDevice;
+    Rc<DxvkAdapter>     m_workerAdapter;
+    Rc<DxvkDevice>      m_workerDevice;
 
     D3D11Device         m_d3d11Device;
     D3D11DeviceExt      m_d3d11DeviceExt;

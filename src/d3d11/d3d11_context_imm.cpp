@@ -37,8 +37,19 @@ namespace dxvk {
     SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
     
     ClearState();
+
+    // Set up a second, independent CS thread + context on the
+    // worker GPU, if one exists. This is a standalone pipeline:
+    // it does not participate in sequence number tracking,
+    // flush tracking, or any of the machinery above.
+    Rc<DxvkDevice> workerDevice = pParent->GetWorkerDXVKDevice();
+    if (workerDevice != nullptr) {
+      m_workerCsThread = std::make_unique<DxvkCsThread>(
+        workerDevice, workerDevice->createContext());
+
+      Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
+    }
   }
-  
   
   D3D11ImmediateContext::~D3D11ImmediateContext() {
     // Avoids hanging when in this state, see comment

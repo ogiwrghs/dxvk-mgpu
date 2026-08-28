@@ -108,6 +108,17 @@ namespace dxvk {
       m_buffer = m_parent->GetDXVKDevice()->createBuffer(info, memoryFlags);
       m_cookie = m_buffer->cookie();
       m_mapPtr = m_buffer->mapPtr(0);
+
+      // Mirror the same buffer on the worker GPU, if one exists.
+      // Full-mirror phase: identical resource on both devices.
+      // Mirror the same buffer on the worker GPU, if one exists.
+      // Full-mirror phase: identical resource on both devices.
+      Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
+      if (workerDevice != nullptr) {
+        m_workerBuffer = workerDevice->createBuffer(info, memoryFlags);
+        static std::atomic<uint32_t> s_workerBufferCount{0u};
+        Logger::info(str::format("D3D11Buffer: Created worker buffer #", ++s_workerBufferCount, " (", info.size, " bytes)"));
+      }
     } else {
       m_sparseAllocator = m_parent->GetDXVKDevice()->createSparsePageAllocator();
       m_sparseAllocator->setCapacity(info.size / SparseMemoryPageSize);

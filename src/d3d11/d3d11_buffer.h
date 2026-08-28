@@ -189,6 +189,7 @@ namespace dxvk {
     D3D11_COMMON_BUFFER_MAP_MODE  m_mapMode;
     
     Rc<DxvkBuffer>                m_buffer;
+    Rc<DxvkBuffer>                m_workerBuffer;
     uint64_t                      m_cookie = 0u;
 
     Rc<DxvkBuffer>                m_soCounter;

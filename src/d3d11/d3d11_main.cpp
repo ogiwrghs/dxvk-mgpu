@@ -68,6 +68,27 @@ extern "C" {
       // Create Vulkan device so we have up-to-date features / properties
       Rc<DxvkDevice> dxvkDevice = dxvkAdapter->createDevice();
 
+      // Find a second, independent GPU to act as the tiled-rendering worker.
+      // "Other than dxvkAdapter" -- don't assume it's always index 1, since
+      // dxvkAdapter itself may not always resolve to index 0.
+      Rc<DxvkAdapter> workerAdapter;
+      Rc<DxvkDevice>  workerDevice;
+      for (uint32_t i = 0; ; i++) {
+        Rc<DxvkAdapter> candidate = dxvkInstance->enumAdapters(i);
+        if (candidate == nullptr)
+          break;
+        if (candidate != dxvkAdapter) {
+          workerAdapter = candidate;
+          break;
+        }
+      }
+      if (workerAdapter != nullptr) {
+        Logger::info("D3D11InternalCreateDevice: Found second GPU, creating worker device");
+        workerDevice = workerAdapter->createDevice();
+      } else {
+        Logger::info("D3D11InternalCreateDevice: No second GPU found, running single-GPU");
+      }
+
       // Find the highest feature level supported by the device.
       // This works because the feature level array is ordered.
       D3D_FEATURE_LEVEL maxFeatureLevel = D3D11Device::GetMaxFeatureLevel(*dxvkDevice);
@@ -95,6 +116,7 @@ extern "C" {
       Com<D3D11DXGIDevice> device = new D3D11DXGIDevice(
         pAdapter, nullptr, nullptr,
         dxvkInstance, dxvkAdapter, dxvkDevice,
+        workerAdapter, workerDevice,
         devFeatureLevel, Flags);
 
       return device->QueryInterface(
@@ -429,6 +451,7 @@ extern "C" {
       Com<D3D11DXGIDevice> device = new D3D11DXGIDevice(
         dxgiAdapter.ptr(), d3d12Device.ptr(), d3d12Queue.ptr(),
         dxvkInstance, dxvkAdapter, dxvkDevice,
+        nullptr, nullptr,
         featureLevel.MaxSupportedFeatureLevel, Flags);
 
       Com<ID3D11Device> d3d11Device;

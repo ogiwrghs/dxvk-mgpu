@@ -239,10 +239,21 @@ namespace dxvk {
     if (m_11on12.Resource != nullptr)
       vkImage = VkImage(m_11on12.VulkanHandle);
 
-    if (!vkImage)
+    if (!vkImage) {
       m_image = m_device->GetDXVKDevice()->createImage(imageInfo, memoryProperties);
-    else
+
+      // Mirror the same image on the worker GPU, if one exists.
+      // Full-mirror phase: identical resource on both devices.
+      Rc<DxvkDevice> workerDevice = m_device->GetWorkerDXVKDevice();
+      if (workerDevice != nullptr) {
+        m_workerImage = workerDevice->createImage(imageInfo, memoryProperties);
+        static std::atomic<uint32_t> s_workerImageCount{0u};
+        Logger::info(str::format("D3D11CommonTexture: Created worker image #", ++s_workerImageCount,
+          " (", m_desc.Width, "x", m_desc.Height, "x", m_desc.Depth, ")"));
+      }
+    } else {
       m_image = m_device->GetDXVKDevice()->importImage(imageInfo, vkImage, memoryProperties);
+    }
 
     if (m_mapMode == D3D11_COMMON_TEXTURE_MAP_MODE_DIRECT)
       m_mapPtr = m_image->mapPtr(0);

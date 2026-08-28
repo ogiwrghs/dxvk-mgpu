@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include "../util/util_time.h"
 
 #include "../util/sync/sync_signal.h"
@@ -115,6 +116,7 @@ namespace dxvk {
   private:
     
     DxvkCsThread            m_csThread;
+    std::unique_ptr<DxvkCsThread> m_workerCsThread;
     uint64_t                m_csSeqNum = 0ull;
 
     uint32_t                m_mappedImageCount = 0u;
