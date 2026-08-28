@@ -1,0 +1,16 @@
+# Build output
+build.w64/
+build.w32/
+*.dll
+*.exe
+
+# Meson/subprojects
+subprojects/*/
+!subprojects/*.wrap
+.wraplock
+
+# Vulkan/driver dumps
+vulkaninfo.txt
+
+# Logs
+*.log
