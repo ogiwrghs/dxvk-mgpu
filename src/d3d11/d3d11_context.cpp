@@ -475,8 +475,7 @@ namespace dxvk {
         workerAttachment.view = workerView;
 
         GetTypedContext()->EmitWorkerClearRenderTarget(workerAttachment,
-          ConvertColorValue(ColorRGBA, workerView->formatInfo()),
-          primaryView->image());
+          ConvertColorValue(ColorRGBA, workerView->formatInfo()));
       }
     }
   }

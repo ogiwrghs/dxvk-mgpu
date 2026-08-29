@@ -981,18 +981,14 @@ namespace dxvk {
 
   
 
-  void D3D11ImmediateContext::EmitWorkerClearRenderTarget(
+    void D3D11ImmediateContext::EmitWorkerClearRenderTarget(
     const DxvkAttachment&       Attachment,
-    const VkClearValue&         ClearValue,
-    const Rc<DxvkImage>&        PrimaryImage) {
+    const VkClearValue&         ClearValue) {
     if (!m_workerCsThread)
       return;
 
-    Rc<DxvkImage>  workerImage  = Attachment.view->image();
-    Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
-
     // TEST ONLY: force the worker clear to green so GPU1's pixels are
-    // visually distinguishable from GPU0's on screen. Not permanent.
+    // visually distinguishable from GPU0's on screen.
     VkClearValue workerClear = { };
     workerClear.color.float32[0] = 0.0f;
     workerClear.color.float32[1] = 1.0f;
@@ -1011,14 +1007,27 @@ namespace dxvk {
 
     m_workerCsThread->dispatchChunk(std::move(chunk));
 
-    // ---- cross-device transfer -------------------------------------------
-    // Deliberately the dumb version: full frame, hard stall, done inline in
-    // the clear path. Opaque external memory is not usable here (the two
-    // cards have different deviceUUIDs), so pixels round-trip through host
-    // memory with one memcpy between two host-visible buffers.
+    // Remember which worker image holds this frame's output so that
+    // Present knows what to composite. No transfer happens here any
+    // more -- that is once per frame, not once per clear.
+    m_workerFrameImage = Attachment.view->image();
+  }
 
-    VkExtent3D   extent     = workerImage->info().extent;
+
+  void D3D11ImmediateContext::CompositeWorkerOutput(
+    const Rc<DxvkImage>&        DstImage) {
+    if (!m_workerCsThread || m_workerFrameImage == nullptr || DstImage == nullptr)
+      return;
+
+    Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
+
+    VkExtent3D   extent     = m_workerFrameImage->info().extent;
     VkDeviceSize imageBytes = VkDeviceSize(extent.width) * extent.height * 4u;
+
+    if (extent != DstImage->info().extent) {
+      Logger::warn("D3D11: worker/primary extent mismatch, skipping composite");
+      return;
+    }
 
     if (m_stagingSize < imageBytes) {
       DxvkBufferCreateInfo info = { };
@@ -1042,13 +1051,18 @@ namespace dxvk {
         imageBytes, " bytes (", extent.width, "x", extent.height, ")"));
     }
 
-    // GPU1: worker image -> worker host buffer
+    // GPU1: worker image -> worker host buffer, then flush and wait on
+    // that specific submission rather than stalling the whole device.
+    DxvkSubmitStatus submitStatus = { };
+    submitStatus.result.store(VK_NOT_READY);
+
     DxvkCsChunkRef download = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
 
     download->push([
       cBuffer = m_workerStaging,
-      cImage  = workerImage,
-      cExtent = extent
+      cImage  = m_workerFrameImage,
+      cExtent = extent,
+      cStatus = &submitStatus
     ] (DxvkContext* ctx) {
       VkImageSubresourceLayers sub = { };
       sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1058,20 +1072,30 @@ namespace dxvk {
         VK_FORMAT_R8G8B8A8_UNORM, cImage, sub,
         VkOffset3D{ 0, 0, 0 }, cExtent);
 
-      ctx->flushCommandList(nullptr, nullptr);
+      ctx->flushCommandList(nullptr, cStatus);
     });
 
     uint64_t seq = m_workerCsThread->dispatchChunk(std::move(download));
     m_workerCsThread->synchronize(seq);
-    workerDevice->waitForIdle();
+    auto t0 = dxvk::high_resolution_clock::now();
+    workerDevice->waitForSubmission(&submitStatus);
+    auto t1 = dxvk::high_resolution_clock::now();
 
     // CPU hop between the two devices' host-visible allocations.
     memcpy(m_primaryStaging->mapPtr(0), m_workerStaging->mapPtr(0), imageBytes);
+    auto t2 = dxvk::high_resolution_clock::now();
 
-    // GPU0: primary host buffer -> primary image. Goes through normal EmitCs
-    // so it is ordered after the application's own clear in the same stream.
+    static uint32_t s_compositeCount = 0;
+    if ((s_compositeCount++ % 60) == 0) {
+      Logger::info(str::format("composite: wait ",
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
+        "us memcpy ",
+        std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(), "us"));
+    }
+
+    // GPU0: primary host buffer -> the D3D11 back buffer image.
     EmitCs([
-      cImage  = PrimaryImage,
+      cImage  = DstImage,
       cBuffer = m_primaryStaging,
       cExtent = extent
     ] (DxvkContext* ctx) {
@@ -1085,7 +1109,6 @@ namespace dxvk {
         VK_FORMAT_R8G8B8A8_UNORM);
     });
   }
-
 
   void D3D11ImmediateContext::TrackTextureSequenceNumber(
           D3D11CommonTexture*         pResource,

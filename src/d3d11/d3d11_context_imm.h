@@ -133,6 +133,8 @@ namespace dxvk {
 
     Rc<sync::Fence>         m_stagingBufferFence;
 
+    Rc<DxvkImage>           m_workerFrameImage;
+
     VkDeviceSize            m_discardMemoryCounter = 0u;
     VkDeviceSize            m_discardMemoryOnFlush = 0u;
 
@@ -195,8 +197,10 @@ namespace dxvk {
 
     void EmitWorkerClearRenderTarget(
       const DxvkAttachment&             Attachment,
-      const VkClearValue&               ClearValue,
-      const Rc<DxvkImage>&              PrimaryImage);
+      const VkClearValue&               ClearValue);
+
+    void CompositeWorkerOutput(
+      const Rc<DxvkImage>&              DstImage);
 
     void TrackTextureSequenceNumber(
             D3D11CommonTexture*         pResource,

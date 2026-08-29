@@ -391,6 +391,9 @@ namespace dxvk {
     immediateContext->EndFrame(m_latency);
     immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
 
+    immediateContext->CompositeWorkerOutput(
+      GetCommonTexture(m_backBuffers[0].ptr())->GetImage());
+
     m_presenter->setSyncInterval(SyncInterval);
 
     // Presentation semaphores and WSI swap chain image
