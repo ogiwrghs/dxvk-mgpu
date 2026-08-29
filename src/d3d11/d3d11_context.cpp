@@ -3619,15 +3619,42 @@ namespace dxvk {
           m_state.lazy.shadersDirty.set(ShaderStage);
       }
 
+      // Mirror onto the worker GPU before the primary EmitCs moves out
+      // of the locals. DxvkShader carries no device state -- it holds
+      // IR plus metadata, and DXVK does not use VkShaderModule at all
+      // (see the note above DxvkShaderStageInfo) -- so the same shader
+      // object binds correctly on both devices. Copying the Rc costs
+      // one atomic increment, not a shader copy.
+      //
+      // The ICB slice is a genuine per-device buffer and is NOT
+      // mirrored: it only exists for shaders with constant arrays
+      // large enough to require lowering, which nothing under test
+      // currently produces. Binding the primary device's slice on the
+      // worker would be a cross-device resource reference, so the
+      // worker gets an empty slice and that path stays unmirrored
+      // until there is a workload that exercises it.
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cShader = shader
+        ] (DxvkContext* ctx) mutable {
+          constexpr VkShaderStageFlagBits stage = GetShaderStage(ShaderStage);
+
+          uint32_t slotId = D3D11ShaderResourceMapping::computeCbvBinding(ShaderStage,
+            D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT);
+
+          ctx->bindShader<stage>(
+            Forwarder::move(cShader));
+          ctx->bindUniformBuffer(stage, slotId, DxvkBufferSlice());
+        });
+      }
+
       EmitCs([
         cBuffer = std::move(buffer),
         cShader = std::move(shader)
       ] (DxvkContext* ctx) mutable {
         constexpr VkShaderStageFlagBits stage = GetShaderStage(ShaderStage);
-
         uint32_t slotId = D3D11ShaderResourceMapping::computeCbvBinding(ShaderStage,
           D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT);
-
         ctx->bindShader<stage>(
           Forwarder::move(cShader));
         ctx->bindUniformBuffer(stage, slotId,
@@ -3645,13 +3672,27 @@ namespace dxvk {
 
       EmitCs([] (DxvkContext* ctx) {
         constexpr VkShaderStageFlagBits stage = GetShaderStage(ShaderStage);
-
         uint32_t slotId = D3D11ShaderResourceMapping::computeCbvBinding(ShaderStage,
           D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT);
-
         ctx->bindShader<stage>(nullptr);
         ctx->bindUniformBuffer(stage, slotId, DxvkBufferSlice());
       });
+
+      // Unbinds carry no resources, so the worker gets the identical
+      // command. Mirrored unconditionally for the same reason empty
+      // framebuffer binds are: divergent state between the two
+      // contexts turns every later bug into a two-part question.
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
+          constexpr VkShaderStageFlagBits stage = GetShaderStage(ShaderStage);
+
+          uint32_t slotId = D3D11ShaderResourceMapping::computeCbvBinding(ShaderStage,
+            D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT);
+
+          ctx->bindShader<stage>(nullptr);
+          ctx->bindUniformBuffer(stage, slotId, DxvkBufferSlice());
+        });
+      }
     }
 
     // On graphics, UAVs are available to all stages, but we treat them as part
@@ -3789,12 +3830,32 @@ namespace dxvk {
           Forwarder::move(cBufferSlice),
           cStride);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cSlotId       = Slot,
+          cBufferSlice  = pBuffer->GetWorkerBufferSlice(Offset),
+          cStride       = Stride
+        ] (DxvkContext* ctx) mutable {
+          ctx->bindVertexBuffer(cSlotId,
+            Forwarder::move(cBufferSlice),
+            cStride);
+        });
+      }
     } else {
       EmitCs([
         cSlotId       = Slot
       ] (DxvkContext* ctx) {
         ctx->bindVertexBuffer(cSlotId, DxvkBufferSlice(), 0);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cSlotId       = Slot
+        ] (DxvkContext* ctx) {
+          ctx->bindVertexBuffer(cSlotId, DxvkBufferSlice(), 0);
+        });
+      }
     }
   }
   
@@ -3818,6 +3879,20 @@ namespace dxvk {
         ctx->bindVertexBufferRange(cSlotId,
           cBufferOffset, cBufferLength, cStride);
       });
+
+      // Range rebinds carry no resource handle, only numbers, so the
+      // worker takes the identical command.
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cSlotId       = Slot,
+          cBufferOffset = offset,
+          cBufferLength = length,
+          cStride       = Stride
+        ] (DxvkContext* ctx) mutable {
+          ctx->bindVertexBufferRange(cSlotId,
+            cBufferOffset, cBufferLength, cStride);
+        });
+      }
     }
   }
 
@@ -3840,12 +3915,31 @@ namespace dxvk {
           Forwarder::move(cBufferSlice),
           cIndexType);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cBufferSlice  = pBuffer->GetWorkerBufferSlice(Offset),
+          cIndexType    = indexType
+        ] (DxvkContext* ctx) mutable {
+          ctx->bindIndexBuffer(
+            Forwarder::move(cBufferSlice),
+            cIndexType);
+        });
+      }
     } else {
       EmitCs([
         cIndexType    = indexType
       ] (DxvkContext* ctx) {
         ctx->bindIndexBuffer(DxvkBufferSlice(), cIndexType);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cIndexType    = indexType
+        ] (DxvkContext* ctx) {
+          ctx->bindIndexBuffer(DxvkBufferSlice(), cIndexType);
+        });
+      }
     }
   }
 
@@ -3872,6 +3966,18 @@ namespace dxvk {
           cBufferOffset, cBufferLength,
           cIndexType);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cBufferOffset = offset,
+          cBufferLength = length,
+          cIndexType    = indexType
+        ] (DxvkContext* ctx) mutable {
+          ctx->bindIndexBufferRange(
+            cBufferOffset, cBufferLength,
+            cIndexType);
+        });
+      }
     }
   }
 

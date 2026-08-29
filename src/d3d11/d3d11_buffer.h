@@ -87,6 +87,39 @@ namespace dxvk {
       return m_buffer;
     }
 
+    Rc<DxvkBuffer> GetWorkerBuffer() const {
+      return m_workerBuffer;
+    }
+
+    // Worker-device counterpart of GetBufferSlice(). Returns an empty
+    // slice when this buffer has no mirror -- imported and sparse
+    // buffers are deliberately not mirrored (see D3D11Buffer's
+    // constructor), so callers must tolerate a null worker side rather
+    // than assume every D3D11Buffer has one.
+    DxvkBufferSlice GetWorkerBufferSlice() const {
+      return m_workerBuffer != nullptr
+        ? DxvkBufferSlice(m_workerBuffer, 0, m_desc.ByteWidth)
+        : DxvkBufferSlice();
+    }
+
+    DxvkBufferSlice GetWorkerBufferSlice(VkDeviceSize offset) const {
+      if (m_workerBuffer == nullptr)
+        return DxvkBufferSlice();
+
+      VkDeviceSize size = m_desc.ByteWidth;
+      offset = std::min(offset, size);
+      return DxvkBufferSlice(m_workerBuffer, offset, size - offset);
+    }
+
+    DxvkBufferSlice GetWorkerBufferSlice(VkDeviceSize offset, VkDeviceSize length) const {
+      if (m_workerBuffer == nullptr)
+        return DxvkBufferSlice();
+
+      VkDeviceSize size = m_desc.ByteWidth;
+      offset = std::min(offset, size);
+      return DxvkBufferSlice(m_workerBuffer, offset, std::min(length, size - offset));
+    }
+
     Rc<DxvkSparsePageAllocator> GetSparseAllocator() const {
       return m_sparseAllocator;
     }
