@@ -80,6 +80,7 @@ namespace dxvk {
     ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
     SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
     SynchronizeDevice();
+    DestroySharedHostStaging();
   }
   
   
@@ -1013,6 +1014,191 @@ namespace dxvk {
     m_workerFrameImage = Attachment.view->image();
   }
 
+  bool D3D11ImmediateContext::CreateSharedHostStaging(VkDeviceSize Size) {
+    Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
+
+    if (workerDevice == nullptr)
+      return false;
+
+    DestroySharedHostStaging();
+
+    auto workerVk  = workerDevice->vkd();
+    auto primaryVk = m_device->vkd();
+    auto vki       = m_device->vki();
+
+    // Both devices impose their own alignment requirement on an imported host
+    // pointer; the allocation has to satisfy the stricter of the two.
+    VkDeviceSize alignment = 1u;
+
+    for (VkPhysicalDevice phys : { m_device->adapter()->handle(),
+                                   workerDevice->adapter()->handle() }) {
+      VkPhysicalDeviceExternalMemoryHostPropertiesEXT hostProps =
+        { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT };
+      VkPhysicalDeviceProperties2 props =
+        { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+      props.pNext = &hostProps;
+
+      vki->vkGetPhysicalDeviceProperties2(phys, &props);
+      alignment = std::max(alignment, hostProps.minImportedHostPointerAlignment);
+    }
+
+    // The imported range must be a whole number of alignment units.
+    VkDeviceSize allocSize = align(Size, alignment);
+
+    m_sharedHostMem = _aligned_malloc(allocSize, alignment);
+
+    if (!m_sharedHostMem) {
+      Logger::err("D3D11: failed to allocate shared host staging memory");
+      return false;
+    }
+
+    m_sharedHostSize = allocSize;
+
+    // Import the same pages into each device in turn.
+    struct { Rc<DxvkDevice> dev; VkBuffer* buf; VkDeviceMemory* mem; } targets[] = {
+      { workerDevice, &m_workerVkBuffer,  &m_workerVkMemory  },
+      { m_device,     &m_primaryVkBuffer, &m_primaryVkMemory },
+    };
+
+    for (auto& t : targets) {
+      auto vk = t.dev->vkd();
+
+      VkExternalMemoryBufferCreateInfo extBufferInfo =
+        { VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO };
+      extBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+
+      VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+      bufferInfo.pNext       = &extBufferInfo;
+      bufferInfo.size        = allocSize;
+      bufferInfo.usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                             | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+      if (vk->vkCreateBuffer(t.dev->handle(), &bufferInfo, nullptr, t.buf) != VK_SUCCESS) {
+        Logger::err("D3D11: vkCreateBuffer failed for shared host staging");
+        DestroySharedHostStaging();
+        return false;
+      }
+
+      // Ask which memory types can accept this particular host pointer.
+      VkMemoryHostPointerPropertiesEXT ptrProps =
+        { VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT };
+
+      if (vk->vkGetMemoryHostPointerPropertiesEXT(t.dev->handle(),
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+            m_sharedHostMem, &ptrProps) != VK_SUCCESS) {
+        Logger::err("D3D11: vkGetMemoryHostPointerPropertiesEXT failed");
+        DestroySharedHostStaging();
+        return false;
+      }
+
+      if (!ptrProps.memoryTypeBits) {
+        Logger::err("D3D11: no memory type accepts the host pointer");
+        DestroySharedHostStaging();
+        return false;
+      }
+
+      // Any type in the mask is host memory by construction, so the lowest
+      // set bit is as good as any.
+      uint32_t typeIndex = 0u;
+      while (!(ptrProps.memoryTypeBits & (1u << typeIndex)))
+        typeIndex++;
+
+      VkImportMemoryHostPointerInfoEXT importInfo =
+        { VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
+      importInfo.handleType   = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+      importInfo.pHostPointer = m_sharedHostMem;
+
+      VkMemoryAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+      allocInfo.pNext           = &importInfo;
+      allocInfo.allocationSize  = allocSize;
+      allocInfo.memoryTypeIndex = typeIndex;
+
+      if (vk->vkAllocateMemory(t.dev->handle(), &allocInfo, nullptr, t.mem) != VK_SUCCESS) {
+        Logger::err("D3D11: vkAllocateMemory failed importing host pointer");
+        DestroySharedHostStaging();
+        return false;
+      }
+
+      if (vk->vkBindBufferMemory(t.dev->handle(), *t.buf, *t.mem, 0) != VK_SUCCESS) {
+        Logger::err("D3D11: vkBindBufferMemory failed for shared host staging");
+        DestroySharedHostStaging();
+        return false;
+      }
+    }
+
+    // Wrap both raw buffers so the existing copy helpers can take them.
+    DxvkBufferCreateInfo dxvkInfo = { };
+    dxvkInfo.size      = allocSize;
+    dxvkInfo.usage     = VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                       | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    dxvkInfo.stages    = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    dxvkInfo.access    = VK_ACCESS_TRANSFER_READ_BIT
+                       | VK_ACCESS_TRANSFER_WRITE_BIT;
+    dxvkInfo.debugName = "mgpu shared host staging";
+
+    const VkMemoryPropertyFlags hostFlags =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+    DxvkBufferImportInfo workerImport = { };
+    workerImport.buffer = m_workerVkBuffer;
+    workerImport.offset = 0;
+    workerImport.mapPtr = m_sharedHostMem;
+
+    DxvkBufferImportInfo primaryImport = { };
+    primaryImport.buffer = m_primaryVkBuffer;
+    primaryImport.offset = 0;
+    primaryImport.mapPtr = m_sharedHostMem;
+
+    m_workerStaging  = workerDevice->importBuffer(dxvkInfo, workerImport,  hostFlags);
+    m_primaryStaging = m_device->importBuffer(dxvkInfo, primaryImport, hostFlags);
+
+    Logger::info(str::format("D3D11: shared host staging ", allocSize,
+      " bytes, alignment ", alignment, " -- memcpy eliminated"));
+
+    return true;
+  }
+
+
+  void D3D11ImmediateContext::DestroySharedHostStaging() {
+    m_workerStaging  = nullptr;
+    m_primaryStaging = nullptr;
+
+    Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
+
+    if (workerDevice != nullptr) {
+      // The worker device has its own CS thread and is not covered by the
+      // primary device's synchronisation, so make sure GPU1 is done before
+      // freeing memory it may still be reading from or writing to.
+      workerDevice->waitForIdle();
+
+      auto vk = workerDevice->vkd();
+
+      if (m_workerVkBuffer)
+        vk->vkDestroyBuffer(workerDevice->handle(), m_workerVkBuffer, nullptr);
+      if (m_workerVkMemory)
+        vk->vkFreeMemory(workerDevice->handle(), m_workerVkMemory, nullptr);
+    }
+
+    auto vk = m_device->vkd();
+
+    if (m_primaryVkBuffer)
+      vk->vkDestroyBuffer(m_device->handle(), m_primaryVkBuffer, nullptr);
+    if (m_primaryVkMemory)
+      vk->vkFreeMemory(m_device->handle(), m_primaryVkMemory, nullptr);
+
+    m_workerVkBuffer  = VK_NULL_HANDLE;
+    m_workerVkMemory  = VK_NULL_HANDLE;
+    m_primaryVkBuffer = VK_NULL_HANDLE;
+    m_primaryVkMemory = VK_NULL_HANDLE;
+
+    if (m_sharedHostMem) {
+      _aligned_free(m_sharedHostMem);
+      m_sharedHostMem  = nullptr;
+      m_sharedHostSize = 0u;
+    }
+  }
 
   void D3D11ImmediateContext::CompositeWorkerOutput(
     const Rc<DxvkImage>&        DstImage) {
@@ -1020,6 +1206,14 @@ namespace dxvk {
       return;
 
     Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
+
+    static bool s_checked = false;
+    if (!s_checked) {
+      s_checked = true;
+      Logger::info(str::format("extmem_host fn ptr: worker=",
+        workerDevice->vkd()->vkGetMemoryHostPointerPropertiesEXT != nullptr,
+        " primary=", m_device->vkd()->vkGetMemoryHostPointerPropertiesEXT != nullptr));
+    }    
 
     VkExtent3D   extent     = m_workerFrameImage->info().extent;
     VkDeviceSize imageBytes = VkDeviceSize(extent.width) * extent.height * 4u;
@@ -1030,25 +1224,10 @@ namespace dxvk {
     }
 
     if (m_stagingSize < imageBytes) {
-      DxvkBufferCreateInfo info = { };
-      info.size      = imageBytes;
-      info.usage     = VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                     | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-      info.stages    = VK_PIPELINE_STAGE_TRANSFER_BIT;
-      info.access    = VK_ACCESS_TRANSFER_WRITE_BIT
-                     | VK_ACCESS_TRANSFER_READ_BIT;
-      info.debugName = "mgpu composite staging";
+      if (!CreateSharedHostStaging(imageBytes))
+        return;
 
-      const VkMemoryPropertyFlags hostFlags =
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-
-      m_workerStaging  = workerDevice->createBuffer(info, hostFlags);
-      m_primaryStaging = m_device->createBuffer(info, hostFlags);
-      m_stagingSize    = imageBytes;
-
-      Logger::info(str::format("D3D11ImmediateContext: composite staging ",
-        imageBytes, " bytes (", extent.width, "x", extent.height, ")"));
+      m_stagingSize = imageBytes;
     }
 
     // GPU1: worker image -> worker host buffer, then flush and wait on
@@ -1081,16 +1260,13 @@ namespace dxvk {
     workerDevice->waitForSubmission(&submitStatus);
     auto t1 = dxvk::high_resolution_clock::now();
 
-    // CPU hop between the two devices' host-visible allocations.
-    memcpy(m_primaryStaging->mapPtr(0), m_workerStaging->mapPtr(0), imageBytes);
-    auto t2 = dxvk::high_resolution_clock::now();
+    // No copy here any more: both devices are bound to the same host pages,
+    // so whatever GPU1 wrote is already visible to GPU0.
 
     static uint32_t s_compositeCount = 0;
     if ((s_compositeCount++ % 60) == 0) {
       Logger::info(str::format("composite: wait ",
-        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(),
-        "us memcpy ",
-        std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count(), "us"));
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(), "us"));
     }
 
     // GPU0: primary host buffer -> the D3D11 back buffer image.

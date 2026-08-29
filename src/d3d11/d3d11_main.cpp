@@ -4,6 +4,9 @@
 
 #include "../dxvk/dxvk_instance.h"
 
+#include "../dxvk/dxvk_extension_provider.h"
+#include "../vulkan/vulkan_util.h"
+
 #include "d3d11_device.h"
 #include "d3d11_enums.h"
 #include "d3d11_interop.h"
@@ -65,7 +68,16 @@ extern "C" {
     }
 
     try {
+      // Request VK_EXT_external_memory_host on both devices so the multi-GPU
+      // composite path can import a single host allocation into each of them,
+      // instead of memcpy'ing between two separate staging buffers. Opaque
+      // external memory is not an option here: the two cards report different
+      // deviceUUIDs, which the Vulkan identity rules forbid for opaque import.
+      DxvkExtensionList mgpuExtensions;
+      mgpuExtensions.push_back(vk::makeExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME));
+
       // Create Vulkan device so we have up-to-date features / properties
+      dxvkAdapter->enableExtensions(mgpuExtensions);
       Rc<DxvkDevice> dxvkDevice = dxvkAdapter->createDevice();
 
       // Find a second, independent GPU to act as the tiled-rendering worker.
@@ -84,6 +96,7 @@ extern "C" {
       }
       if (workerAdapter != nullptr) {
         Logger::info("D3D11InternalCreateDevice: Found second GPU, creating worker device");
+        workerAdapter->enableExtensions(mgpuExtensions);
         workerDevice = workerAdapter->createDevice();
       } else {
         Logger::info("D3D11InternalCreateDevice: No second GPU found, running single-GPU");

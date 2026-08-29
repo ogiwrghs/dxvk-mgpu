@@ -119,6 +119,20 @@ namespace dxvk {
     std::unique_ptr<DxvkCsThread> m_workerCsThread;
     Rc<DxvkBuffer>          m_workerStaging;
     Rc<DxvkBuffer>          m_primaryStaging;
+
+    // Raw Vulkan objects backing the shared host staging allocation. These
+    // deliberately bypass DxvkMemoryAllocator: one plain system-RAM block is
+    // imported into both devices via VK_EXT_external_memory_host, so GPU1
+    // writes and GPU0 reads the same physical pages and no CPU copy is needed.
+    // Because they are outside DXVK's lifetime tracking, they must be freed
+    // by hand in DestroySharedHostStaging().
+    void*                   m_sharedHostMem   = nullptr;
+    VkDeviceSize            m_sharedHostSize  = 0u;
+    VkBuffer                m_workerVkBuffer  = VK_NULL_HANDLE;
+    VkDeviceMemory          m_workerVkMemory  = VK_NULL_HANDLE;
+    VkBuffer                m_primaryVkBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory          m_primaryVkMemory = VK_NULL_HANDLE;
+
     VkDeviceSize            m_stagingSize = 0u;
     uint64_t                m_csSeqNum = 0ull;
 
@@ -201,6 +215,11 @@ namespace dxvk {
 
     void CompositeWorkerOutput(
       const Rc<DxvkImage>&              DstImage);
+
+    bool CreateSharedHostStaging(
+            VkDeviceSize                Size);
+
+    void DestroySharedHostStaging();
 
     void TrackTextureSequenceNumber(
             D3D11CommonTexture*         pResource,
