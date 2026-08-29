@@ -117,6 +117,29 @@ namespace dxvk {
     
     DxvkCsThread            m_csThread;
     std::unique_ptr<DxvkCsThread> m_workerCsThread;
+    DxvkCsChunkRef          m_workerCsChunk;
+    bool                    m_workerFlushDebug = false;
+    uint32_t                m_workerFlushCalls = 0u;
+    uint32_t                m_workerFlushEmpty = 0u;
+
+    // Composite cost accumulators. Spot-sampling one composite in
+    // sixty proved actively misleading: consecutive identical runs
+    // reported 3us and 252us for the same workload, which invites
+    // reading noise as a result. These aggregate every composite so
+    // the numbers describe the run rather than one arbitrary frame.
+    // Split into the two blocking phases because they fail
+    // differently: sync waits for the worker CS thread to reach the
+    // chunk, submit waits for GPU1 to finish executing it, and a
+    // stall in one looks like speed in the other.
+    uint32_t                m_compositeCount    = 0u;
+    uint64_t                m_compositeSyncSum  = 0ull;
+    uint64_t                m_compositeSyncMin  = ~0ull;
+    uint64_t                m_compositeSyncMax  = 0ull;
+    uint64_t                m_compositeSubSum   = 0ull;
+    uint64_t                m_compositeSubMin   = ~0ull;
+    uint64_t                m_compositeSubMax   = 0ull;
+
+    void LogCompositeStats();
     Rc<DxvkBuffer>          m_workerStaging;
     Rc<DxvkBuffer>          m_primaryStaging;
 
@@ -208,6 +231,30 @@ namespace dxvk {
             UINT                        MapFlags);
     
     void EmitCsChunk(DxvkCsChunkRef&& chunk);
+
+    // Worker-side equivalent of EmitCs. The worker's first mirrored
+    // operations (clear, framebuffer bind) each allocated and
+    // dispatched their own single-command chunk, which is fine at two
+    // calls per frame but would become one allocation and one dispatch
+    // per state change once draws are mirrored -- an order of
+    // magnitude more chunk traffic than the primary path, which
+    // batches into m_csChunk and only dispatches when it fills.
+    // This batches the same way. Note the worker chunk deliberately
+    // does not participate in ConsiderFlush or sequence number
+    // tracking, matching the standalone nature of the worker pipeline.
+    template<typename Cmd>
+    void EmitWorkerCs(Cmd&& command) {
+      if (!m_workerCsThread)
+        return;
+
+      if (unlikely(!m_workerCsChunk->push(command))) {
+        m_workerCsThread->dispatchChunk(std::move(m_workerCsChunk));
+        m_workerCsChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+        m_workerCsChunk->push(command);
+      }
+    }
+
+    void FlushWorkerCsChunk();
 
     void EmitWorkerClearRenderTarget(
       const DxvkAttachment&             Attachment,

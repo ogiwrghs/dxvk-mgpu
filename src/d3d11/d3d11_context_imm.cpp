@@ -4,6 +4,7 @@
 #include "d3d11_fence.h"
 #include "d3d11_texture.h"
 
+#include "../util/util_env.h"
 #include "../util/util_win32_compat.h"
 
 constexpr static uint32_t MinFlushIntervalUs = 750;
@@ -66,7 +67,11 @@ namespace dxvk {
 
       // Stall so the command list is live before any real work lands.
       m_workerCsThread->synchronize(initSeq);
-
+      // Batched chunk for mirrored work, allocated only when a worker
+      // exists so that EmitWorkerCs's null-thread guard is the single
+      // condition protecting it.
+      m_workerCsChunk = pParent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+      m_workerFlushDebug = env::getEnvVar("DXVK_MGPU_DEBUG_FLUSH") == "1";
       Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
     }
   }
@@ -80,6 +85,10 @@ namespace dxvk {
     ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
     SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
     SynchronizeDevice();
+    LogCompositeStats();
+    // Dispatch anything still batched before the worker device is
+    // idled and its buffers torn down.
+    FlushWorkerCsChunk();
     DestroySharedHostStaging();
   }
   
@@ -982,6 +991,35 @@ namespace dxvk {
 
   
 
+  void D3D11ImmediateContext::FlushWorkerCsChunk() {
+    if (!m_workerCsThread)
+      return;
+
+    bool isEmpty = m_workerCsChunk->empty();
+
+    // Opt-in diagnostic. An empty worker chunk means the composite is
+    // reading a target nothing was dispatched to, which looks like a
+    // very fast composite rather than like a bug -- the same shape of
+    // false success as the deferred clears that never reached GPU1 and
+    // the submission wait that never waited. Off by default; enable
+    // with DXVK_MGPU_DEBUG_FLUSH=1.
+    if (unlikely(m_workerFlushDebug)) {
+      m_workerFlushCalls++;
+      m_workerFlushEmpty += isEmpty ? 1u : 0u;
+
+      if ((m_workerFlushCalls % 60u) == 0u) {
+        Logger::info(str::format("workerflush: calls ", m_workerFlushCalls,
+          " empty ", m_workerFlushEmpty));
+      }
+    }
+
+    if (isEmpty)
+      return;
+
+    m_workerCsThread->dispatchChunk(std::move(m_workerCsChunk));
+    m_workerCsChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+  }
+
     void D3D11ImmediateContext::EmitWorkerClearRenderTarget(
     const DxvkAttachment&       Attachment,
     const VkClearValue&         ClearValue) {
@@ -994,15 +1032,13 @@ namespace dxvk {
     workerClear.color.float32[1] = 1.0f;
     workerClear.color.float32[2] = 0.0f;
     workerClear.color.float32[3] = 1.0f;
-    DxvkCsChunkRef chunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
-    chunk->push([
+    EmitWorkerCs([
       cAttachment = Attachment,
       cClearValue = workerClear
     ] (DxvkContext* ctx) {
       ctx->clearRenderTarget(cAttachment,
         VK_IMAGE_ASPECT_COLOR_BIT, cClearValue, 0u);
     });
-    m_workerCsThread->dispatchChunk(std::move(chunk));
 
     // Fall back to updating the frame image here too: -clearonly style
     // paths call ClearRenderTargetView on an already-bound RTV without
@@ -1027,13 +1063,11 @@ namespace dxvk {
     if (Targets.color[0].view != nullptr)
       m_workerFrameImage = Targets.color[0].view->image();
 
-    DxvkCsChunkRef chunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
-    chunk->push([
+    EmitWorkerCs([
       cTargets = std::move(Targets)
     ] (DxvkContext* ctx) mutable {
       ctx->bindRenderTargets(std::move(cTargets), 0u);
     });
-    m_workerCsThread->dispatchChunk(std::move(chunk));
   }
 
   bool D3D11ImmediateContext::CreateSharedHostStaging(VkDeviceSize Size) {
@@ -1222,8 +1256,29 @@ namespace dxvk {
     }
   }
 
+  void D3D11ImmediateContext::LogCompositeStats() {
+    if (!m_compositeCount)
+      return;
+
+    Logger::info(str::format("composite stats over ", m_compositeCount, " composites:"));
+    Logger::info(str::format("  cs sync:  min ", m_compositeSyncMin,
+      "us  avg ", m_compositeSyncSum / m_compositeCount,
+      "us  max ", m_compositeSyncMax, "us"));
+    Logger::info(str::format("  gpu wait: min ", m_compositeSubMin,
+      "us  avg ", m_compositeSubSum / m_compositeCount,
+      "us  max ", m_compositeSubMax, "us"));
+  }
+
+
   void D3D11ImmediateContext::CompositeWorkerOutput(
     const Rc<DxvkImage>&        DstImage) {
+    // Anything still batched must reach GPU1 before we read its image
+    // back, or the composite copies a target whose mirrored work is
+    // still sitting in an un-dispatched chunk. Doing this here rather
+    // than at the call site keeps the guarantee next to the read that
+    // depends on it.
+    FlushWorkerCsChunk();
+
     if (!m_workerCsThread || m_workerFrameImage == nullptr || DstImage == nullptr)
       return;
 
@@ -1277,19 +1332,25 @@ namespace dxvk {
     });
 
     uint64_t seq = m_workerCsThread->dispatchChunk(std::move(download));
-    m_workerCsThread->synchronize(seq);
+
     auto t0 = dxvk::high_resolution_clock::now();
-    workerDevice->waitForSubmission(&submitStatus);
+    m_workerCsThread->synchronize(seq);
     auto t1 = dxvk::high_resolution_clock::now();
+    workerDevice->waitForSubmission(&submitStatus);
+    auto t2 = dxvk::high_resolution_clock::now();
 
     // No copy here any more: both devices are bound to the same host pages,
     // so whatever GPU1 wrote is already visible to GPU0.
+    uint64_t syncUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    uint64_t subUs  = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
 
-    static uint32_t s_compositeCount = 0;
-    if ((s_compositeCount++ % 60) == 0) {
-      Logger::info(str::format("composite: wait ",
-        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count(), "us"));
-    }
+    m_compositeCount++;
+    m_compositeSyncSum += syncUs;
+    m_compositeSyncMin  = std::min(m_compositeSyncMin, syncUs);
+    m_compositeSyncMax  = std::max(m_compositeSyncMax, syncUs);
+    m_compositeSubSum  += subUs;
+    m_compositeSubMin   = std::min(m_compositeSubMin, subUs);
+    m_compositeSubMax   = std::max(m_compositeSubMax, subUs);
 
     // GPU0: primary host buffer -> the D3D11 back buffer image.
     EmitCs([
