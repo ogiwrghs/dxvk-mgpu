@@ -189,6 +189,10 @@ namespace dxvk {
             UINT                        MapFlags);
     
     void EmitCsChunk(DxvkCsChunkRef&& chunk);
+    
+     void EmitWorkerClearRenderTarget(
+      const DxvkAttachment&       Attachment,
+      const VkClearValue&         ClearValue);
 
     void TrackTextureSequenceNumber(
             D3D11CommonTexture*         pResource,

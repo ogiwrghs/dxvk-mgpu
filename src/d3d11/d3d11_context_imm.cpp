@@ -959,6 +959,36 @@ namespace dxvk {
     m_csSeqNum = m_csThread.dispatchChunk(std::move(chunk));
   }
 
+  
+
+  void D3D11ImmediateContext::EmitWorkerClearRenderTarget(
+    const DxvkAttachment&       Attachment,
+    const VkClearValue&         ClearValue) {
+    if (!m_workerCsThread)
+      return;
+
+    // Standalone one-off chunk. This deliberately does not join the
+    // primary command stream: it does not update m_csSeqNum and is not
+    // covered by flush or sequence-number tracking, matching the worker
+    // CS thread's standalone design. The chunk pool on D3D11Device is
+    // plain CPU-side command storage with no GPU affinity, so sharing it
+    // across both CS threads is safe.
+    DxvkCsChunkRef chunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+
+    chunk->push([
+      cAttachment = Attachment,
+      cClearValue = ClearValue
+    ] (DxvkContext* ctx) {
+      ctx->clearRenderTarget(cAttachment,
+        VK_IMAGE_ASPECT_COLOR_BIT, cClearValue, 0u);
+    });
+
+        static std::atomic<uint32_t> s_workerClearCount{0u};
+    Logger::info(str::format("D3D11ImmediateContext: Worker clear #", ++s_workerClearCount));
+
+    m_workerCsThread->dispatchChunk(std::move(chunk));
+  }
+
 
   void D3D11ImmediateContext::TrackTextureSequenceNumber(
           D3D11CommonTexture*         pResource,

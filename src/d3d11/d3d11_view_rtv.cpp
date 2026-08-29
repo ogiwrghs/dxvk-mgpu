@@ -124,6 +124,16 @@ namespace dxvk {
     if (texture) {
       // Simply create view for existing image
       m_view = texture->GetImage()->createView(viewInfo);
+
+      // Mirror the view on the worker GPU, if a worker image exists
+      // for this texture. Buffer-backed RTVs (the else branch below)
+      // are intentionally not mirrored, matching the buffer/texture
+      // import-path exclusions elsewhere.
+      Rc<DxvkImage> workerImage = texture->GetWorkerImage();
+      if (workerImage != nullptr) {
+        m_workerView = workerImage->createView(viewInfo);
+        Logger::info("D3D11RenderTargetView: Created worker view");
+      }
     } else {
       // If we're creating a buffer RTV, we need to explicitly
       // create a 1D image that we can actually render to

@@ -249,6 +249,10 @@ namespace dxvk {
     Rc<DxvkImage> GetImage() const {
       return m_image;
     }
+
+    Rc<DxvkImage> GetWorkerImage() const {
+      return m_workerImage;
+    }
     
     /**
      * \brief Mapped subresource buffer

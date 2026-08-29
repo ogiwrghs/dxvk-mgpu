@@ -462,6 +462,21 @@ namespace dxvk {
       ctx->clearRenderTarget(cAttachment,
         VK_IMAGE_ASPECT_COLOR_BIT, cClearValue, 0u);
     });
+
+        // Mirror the clear onto the worker GPU. Immediate context only:
+    // deferred contexts have no worker CS thread, and the branch is
+    // discarded at compile time for them.
+    if constexpr (!IsDeferred) {
+      Rc<DxvkImageView> workerView = rtv->GetWorkerImageView();
+
+      if (workerView != nullptr) {
+        DxvkAttachment workerAttachment = {};
+        workerAttachment.view = workerView;
+
+        GetTypedContext()->EmitWorkerClearRenderTarget(workerAttachment,
+          ConvertColorValue(ColorRGBA, workerView->formatInfo()));
+      }
+    }
   }
 
 
