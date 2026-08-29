@@ -42,10 +42,30 @@ namespace dxvk {
     // worker GPU, if one exists. This is a standalone pipeline:
     // it does not participate in sequence number tracking,
     // flush tracking, or any of the machinery above.
+    
     Rc<DxvkDevice> workerDevice = pParent->GetWorkerDXVKDevice();
     if (workerDevice != nullptr) {
       m_workerCsThread = std::make_unique<DxvkCsThread>(
         workerDevice, workerDevice->createContext());
+
+      // Prime the worker context exactly as the primary one is primed
+      // above. Without a command list attached, the first operation
+      // that actually needs to record a barrier (e.g. flushing a
+      // deferred clear) dereferences a null m_cmd and crashes.
+      DxvkCsChunkRef initChunk = pParent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+
+      initChunk->push([
+        cWorkerDevice        = workerDevice,
+        cBarrierControlFlags = pParent->GetOptionsBarrierControlFlags()
+      ] (DxvkContext* ctx) {
+        ctx->beginRecording(cWorkerDevice->createCommandList());
+        ctx->setBarrierControl(cBarrierControlFlags);
+      });
+
+      uint64_t initSeq = m_workerCsThread->dispatchChunk(std::move(initChunk));
+
+      // Stall so the command list is live before any real work lands.
+      m_workerCsThread->synchronize(initSeq);
 
       Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
     }
@@ -983,10 +1003,69 @@ namespace dxvk {
         VK_IMAGE_ASPECT_COLOR_BIT, cClearValue, 0u);
     });
 
-        static std::atomic<uint32_t> s_workerClearCount{0u};
-    Logger::info(str::format("D3D11ImmediateContext: Worker clear #", ++s_workerClearCount));
+    static std::atomic<uint32_t> s_workerClearCount{0u};
+    uint32_t clearIndex = ++s_workerClearCount;
+    Logger::info(str::format("D3D11ImmediateContext: Worker clear #", clearIndex));
 
     m_workerCsThread->dispatchChunk(std::move(chunk));
+
+    // One-shot readback diagnostic: after a few clears have landed,
+    // copy one pixel of the worker image back to host memory and log
+    // it, to confirm the clear actually executed on GPU1 rather than
+    // just being accepted by the CS thread.
+    if (clearIndex == 10) {
+      Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
+
+      // image() returns a raw DxvkImage*; assign to an Rc so the lambda
+      // capture holds a reference and keeps the image alive.
+      Rc<DxvkImage> workerImage = Attachment.view->image();
+
+      DxvkBufferCreateInfo stagingInfo = {};
+      stagingInfo.size      = 256;
+      stagingInfo.usage     = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      stagingInfo.stages    = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      stagingInfo.access    = VK_ACCESS_TRANSFER_WRITE_BIT;
+      stagingInfo.debugName = "worker readback staging";
+
+      Rc<DxvkBuffer> stagingBuffer = workerDevice->createBuffer(stagingInfo,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+      DxvkCsChunkRef readbackChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+
+      readbackChunk->push([
+        cStagingBuffer = stagingBuffer,
+        cWorkerImage   = workerImage
+      ] (DxvkContext* ctx) {
+        VkImageSubresourceLayers subresource = {};
+        subresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+        subresource.mipLevel       = 0;
+        subresource.baseArrayLayer = 0;
+        subresource.layerCount     = 1;
+
+        ctx->copyImageToBuffer(
+          cStagingBuffer, 0, 0, 0,
+          VK_FORMAT_R8G8B8A8_UNORM,
+          cWorkerImage, subresource,
+          VkOffset3D{ 0, 0, 0 },
+          VkExtent3D{ 1, 1, 1 });
+
+        // dispatchChunk only guarantees the CS thread recorded these
+        // commands; the GPU has not necessarily run them. Flush so the
+        // copy is actually submitted before we wait and map.
+        ctx->flushCommandList(nullptr, nullptr);
+      });
+
+      uint64_t seq = m_workerCsThread->dispatchChunk(std::move(readbackChunk));
+      m_workerCsThread->synchronize(seq);
+
+      // Wait for GPU1 to finish executing the submitted work.
+      workerDevice->waitForIdle();
+
+      uint8_t* pixel = reinterpret_cast<uint8_t*>(stagingBuffer->mapPtr(0));
+      Logger::info(str::format(
+        "D3D11ImmediateContext: Worker readback pixel R=", (int)pixel[0],
+        " G=", (int)pixel[1], " B=", (int)pixel[2], " A=", (int)pixel[3]));
+    }
   }
 
 
