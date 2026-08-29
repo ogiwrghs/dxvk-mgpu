@@ -104,6 +104,14 @@ namespace dxvk {
 
     // Create the underlying image view object
     m_view = GetCommonTexture(pResource)->GetImage()->createView(viewInfo);
+
+    // Mirror the view on the worker GPU, if a worker image exists
+    // for this texture. Same pattern as D3D11RenderTargetView.
+    Rc<DxvkImage> workerImage = GetCommonTexture(pResource)->GetWorkerImage();
+    if (workerImage != nullptr) {
+      m_workerView = workerImage->createView(viewInfo);
+      Logger::info("D3D11DepthStencilView: Created worker view");
+    }
   }
   
   

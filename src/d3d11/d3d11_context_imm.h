@@ -213,6 +213,9 @@ namespace dxvk {
       const DxvkAttachment&             Attachment,
       const VkClearValue&               ClearValue);
 
+    void EmitWorkerBindFramebuffer(
+            DxvkRenderTargets&&         Targets);
+
     void CompositeWorkerOutput(
       const Rc<DxvkImage>&              DstImage);
 

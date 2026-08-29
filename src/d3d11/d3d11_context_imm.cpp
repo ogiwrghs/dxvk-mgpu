@@ -987,7 +987,6 @@ namespace dxvk {
     const VkClearValue&         ClearValue) {
     if (!m_workerCsThread)
       return;
-
     // TEST ONLY: force the worker clear to green so GPU1's pixels are
     // visually distinguishable from GPU0's on screen.
     VkClearValue workerClear = { };
@@ -995,9 +994,7 @@ namespace dxvk {
     workerClear.color.float32[1] = 1.0f;
     workerClear.color.float32[2] = 0.0f;
     workerClear.color.float32[3] = 1.0f;
-
     DxvkCsChunkRef chunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
-
     chunk->push([
       cAttachment = Attachment,
       cClearValue = workerClear
@@ -1005,13 +1002,38 @@ namespace dxvk {
       ctx->clearRenderTarget(cAttachment,
         VK_IMAGE_ASPECT_COLOR_BIT, cClearValue, 0u);
     });
-
     m_workerCsThread->dispatchChunk(std::move(chunk));
 
-    // Remember which worker image holds this frame's output so that
-    // Present knows what to composite. No transfer happens here any
-    // more -- that is once per frame, not once per clear.
+    // Fall back to updating the frame image here too: -clearonly style
+    // paths call ClearRenderTargetView on an already-bound RTV without
+    // an intervening OMSetRenderTargets, so BindFramebuffer() never
+    // fires and EmitWorkerBindFramebuffer() never runs. Once real draws
+    // exist this becomes redundant with the bind-path update, which is
+    // harmless -- both agree on the same image.
     m_workerFrameImage = Attachment.view->image();
+  }
+
+
+  void D3D11ImmediateContext::EmitWorkerBindFramebuffer(
+          DxvkRenderTargets&&         Targets) {
+    if (!m_workerCsThread)
+      return;
+
+    // Remember which worker image holds this frame's output so that
+    // Present knows what to composite. Only updated when this bind
+    // actually provides a color target -- an unbind (Targets.color[0]
+    // null) must not erase the last known frame image, or a mid-frame
+    // unbind would blank the composite.
+    if (Targets.color[0].view != nullptr)
+      m_workerFrameImage = Targets.color[0].view->image();
+
+    DxvkCsChunkRef chunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+    chunk->push([
+      cTargets = std::move(Targets)
+    ] (DxvkContext* ctx) mutable {
+      ctx->bindRenderTargets(std::move(cTargets), 0u);
+    });
+    m_workerCsThread->dispatchChunk(std::move(chunk));
   }
 
   bool D3D11ImmediateContext::CreateSharedHostStaging(VkDeviceSize Size) {

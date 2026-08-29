@@ -3702,6 +3702,7 @@ namespace dxvk {
       { VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORMAT_EXT,
         m_device->features().extDepthBiasControl.depthBiasExact };
     DxvkRenderTargets attachments;
+    DxvkRenderTargets workerAttachments;
     uint32_t sampleCount = 0;
 
     // D3D11 doesn't have the concept of a framebuffer object,
@@ -3712,6 +3713,11 @@ namespace dxvk {
         attachments.color[i].view = m_state.om.rtvs[i]->GetImageView();
         attachments.color[i].shadow = m_state.om.rtvs[i]->GetBufferView();
         sampleCount = m_state.om.rtvs[i]->GetSampleCount();
+
+        // Worker-side mirror. Buffer-backed RTVs have no worker view
+        // (see D3D11RenderTargetView) and are left as a gap here.
+        if constexpr (!IsDeferred)
+          workerAttachments.color[i].view = m_state.om.rtvs[i]->GetWorkerImageView();
       }
     }
 
@@ -3721,6 +3727,9 @@ namespace dxvk {
 
       if (m_device->features().extDepthBiasControl.leastRepresentableValueForceUnormRepresentation)
         depthBiasRepresentation.depthBiasRepresentation = FormatToDepthBiasRepresentation(m_state.om.dsv->GetViewFormat());
+
+      if constexpr (!IsDeferred)
+        workerAttachments.depth.view = m_state.om.dsv->GetWorkerImageView();
     }
 
     // Create and bind the framebuffer object to the context
@@ -3731,6 +3740,15 @@ namespace dxvk {
       ctx->setDepthBiasRepresentation(cRepresentation);
       ctx->bindRenderTargets(Forwarder::move(cAttachments), 0u);
     });
+
+    // Mirror the framebuffer bind onto the worker GPU. Immediate
+    // context only; deferred contexts have no worker CS thread and
+    // the branch above already left workerAttachments empty for them.
+    // Always dispatched, including empty binds, so the worker context
+    // never holds a stale framebuffer relative to the primary one.
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerBindFramebuffer(std::move(workerAttachments));
+    }
 
     // If necessary, update push constant for the sample count
     if (m_state.om.sampleCount != sampleCount) {
