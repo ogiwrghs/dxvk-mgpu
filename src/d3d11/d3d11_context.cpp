@@ -467,14 +467,16 @@ namespace dxvk {
     // deferred contexts have no worker CS thread, and the branch is
     // discarded at compile time for them.
     if constexpr (!IsDeferred) {
-      Rc<DxvkImageView> workerView = rtv->GetWorkerImageView();
+      Rc<DxvkImageView> workerView  = rtv->GetWorkerImageView();
+      Rc<DxvkImageView> primaryView = rtv->GetImageView();
 
-      if (workerView != nullptr) {
+      if (workerView != nullptr && primaryView != nullptr) {
         DxvkAttachment workerAttachment = {};
         workerAttachment.view = workerView;
 
         GetTypedContext()->EmitWorkerClearRenderTarget(workerAttachment,
-          ConvertColorValue(ColorRGBA, workerView->formatInfo()));
+          ConvertColorValue(ColorRGBA, workerView->formatInfo()),
+          primaryView->image());
       }
     }
   }

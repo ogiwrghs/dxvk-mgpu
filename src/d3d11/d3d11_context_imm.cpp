@@ -983,89 +983,107 @@ namespace dxvk {
 
   void D3D11ImmediateContext::EmitWorkerClearRenderTarget(
     const DxvkAttachment&       Attachment,
-    const VkClearValue&         ClearValue) {
+    const VkClearValue&         ClearValue,
+    const Rc<DxvkImage>&        PrimaryImage) {
     if (!m_workerCsThread)
       return;
 
-    // Standalone one-off chunk. This deliberately does not join the
-    // primary command stream: it does not update m_csSeqNum and is not
-    // covered by flush or sequence-number tracking, matching the worker
-    // CS thread's standalone design. The chunk pool on D3D11Device is
-    // plain CPU-side command storage with no GPU affinity, so sharing it
-    // across both CS threads is safe.
+    Rc<DxvkImage>  workerImage  = Attachment.view->image();
+    Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
+
+    // TEST ONLY: force the worker clear to green so GPU1's pixels are
+    // visually distinguishable from GPU0's on screen. Not permanent.
+    VkClearValue workerClear = { };
+    workerClear.color.float32[0] = 0.0f;
+    workerClear.color.float32[1] = 1.0f;
+    workerClear.color.float32[2] = 0.0f;
+    workerClear.color.float32[3] = 1.0f;
+
     DxvkCsChunkRef chunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
 
     chunk->push([
       cAttachment = Attachment,
-      cClearValue = ClearValue
+      cClearValue = workerClear
     ] (DxvkContext* ctx) {
       ctx->clearRenderTarget(cAttachment,
         VK_IMAGE_ASPECT_COLOR_BIT, cClearValue, 0u);
     });
 
-    static std::atomic<uint32_t> s_workerClearCount{0u};
-    uint32_t clearIndex = ++s_workerClearCount;
-    Logger::info(str::format("D3D11ImmediateContext: Worker clear #", clearIndex));
-
     m_workerCsThread->dispatchChunk(std::move(chunk));
 
-    // One-shot readback diagnostic: after a few clears have landed,
-    // copy one pixel of the worker image back to host memory and log
-    // it, to confirm the clear actually executed on GPU1 rather than
-    // just being accepted by the CS thread.
-    if (clearIndex == 10) {
-      Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
+    // ---- cross-device transfer -------------------------------------------
+    // Deliberately the dumb version: full frame, hard stall, done inline in
+    // the clear path. Opaque external memory is not usable here (the two
+    // cards have different deviceUUIDs), so pixels round-trip through host
+    // memory with one memcpy between two host-visible buffers.
 
-      // image() returns a raw DxvkImage*; assign to an Rc so the lambda
-      // capture holds a reference and keeps the image alive.
-      Rc<DxvkImage> workerImage = Attachment.view->image();
+    VkExtent3D   extent     = workerImage->info().extent;
+    VkDeviceSize imageBytes = VkDeviceSize(extent.width) * extent.height * 4u;
 
-      DxvkBufferCreateInfo stagingInfo = {};
-      stagingInfo.size      = 256;
-      stagingInfo.usage     = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-      stagingInfo.stages    = VK_PIPELINE_STAGE_TRANSFER_BIT;
-      stagingInfo.access    = VK_ACCESS_TRANSFER_WRITE_BIT;
-      stagingInfo.debugName = "worker readback staging";
+    if (m_stagingSize < imageBytes) {
+      DxvkBufferCreateInfo info = { };
+      info.size      = imageBytes;
+      info.usage     = VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                     | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+      info.stages    = VK_PIPELINE_STAGE_TRANSFER_BIT;
+      info.access    = VK_ACCESS_TRANSFER_WRITE_BIT
+                     | VK_ACCESS_TRANSFER_READ_BIT;
+      info.debugName = "mgpu composite staging";
 
-      Rc<DxvkBuffer> stagingBuffer = workerDevice->createBuffer(stagingInfo,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+      const VkMemoryPropertyFlags hostFlags =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-      DxvkCsChunkRef readbackChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+      m_workerStaging  = workerDevice->createBuffer(info, hostFlags);
+      m_primaryStaging = m_device->createBuffer(info, hostFlags);
+      m_stagingSize    = imageBytes;
 
-      readbackChunk->push([
-        cStagingBuffer = stagingBuffer,
-        cWorkerImage   = workerImage
-      ] (DxvkContext* ctx) {
-        VkImageSubresourceLayers subresource = {};
-        subresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-        subresource.mipLevel       = 0;
-        subresource.baseArrayLayer = 0;
-        subresource.layerCount     = 1;
-
-        ctx->copyImageToBuffer(
-          cStagingBuffer, 0, 0, 0,
-          VK_FORMAT_R8G8B8A8_UNORM,
-          cWorkerImage, subresource,
-          VkOffset3D{ 0, 0, 0 },
-          VkExtent3D{ 1, 1, 1 });
-
-        // dispatchChunk only guarantees the CS thread recorded these
-        // commands; the GPU has not necessarily run them. Flush so the
-        // copy is actually submitted before we wait and map.
-        ctx->flushCommandList(nullptr, nullptr);
-      });
-
-      uint64_t seq = m_workerCsThread->dispatchChunk(std::move(readbackChunk));
-      m_workerCsThread->synchronize(seq);
-
-      // Wait for GPU1 to finish executing the submitted work.
-      workerDevice->waitForIdle();
-
-      uint8_t* pixel = reinterpret_cast<uint8_t*>(stagingBuffer->mapPtr(0));
-      Logger::info(str::format(
-        "D3D11ImmediateContext: Worker readback pixel R=", (int)pixel[0],
-        " G=", (int)pixel[1], " B=", (int)pixel[2], " A=", (int)pixel[3]));
+      Logger::info(str::format("D3D11ImmediateContext: composite staging ",
+        imageBytes, " bytes (", extent.width, "x", extent.height, ")"));
     }
+
+    // GPU1: worker image -> worker host buffer
+    DxvkCsChunkRef download = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+
+    download->push([
+      cBuffer = m_workerStaging,
+      cImage  = workerImage,
+      cExtent = extent
+    ] (DxvkContext* ctx) {
+      VkImageSubresourceLayers sub = { };
+      sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      sub.layerCount = 1;
+
+      ctx->copyImageToBuffer(cBuffer, 0, 0, 0,
+        VK_FORMAT_R8G8B8A8_UNORM, cImage, sub,
+        VkOffset3D{ 0, 0, 0 }, cExtent);
+
+      ctx->flushCommandList(nullptr, nullptr);
+    });
+
+    uint64_t seq = m_workerCsThread->dispatchChunk(std::move(download));
+    m_workerCsThread->synchronize(seq);
+    workerDevice->waitForIdle();
+
+    // CPU hop between the two devices' host-visible allocations.
+    memcpy(m_primaryStaging->mapPtr(0), m_workerStaging->mapPtr(0), imageBytes);
+
+    // GPU0: primary host buffer -> primary image. Goes through normal EmitCs
+    // so it is ordered after the application's own clear in the same stream.
+    EmitCs([
+      cImage  = PrimaryImage,
+      cBuffer = m_primaryStaging,
+      cExtent = extent
+    ] (DxvkContext* ctx) {
+      VkImageSubresourceLayers sub = { };
+      sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      sub.layerCount = 1;
+
+      ctx->copyBufferToImage(cImage, sub,
+        VkOffset3D{ 0, 0, 0 }, cExtent,
+        cBuffer, 0, 0, 0,
+        VK_FORMAT_R8G8B8A8_UNORM);
+    });
   }
 
 

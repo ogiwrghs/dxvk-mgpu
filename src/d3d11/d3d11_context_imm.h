@@ -117,6 +117,9 @@ namespace dxvk {
     
     DxvkCsThread            m_csThread;
     std::unique_ptr<DxvkCsThread> m_workerCsThread;
+    Rc<DxvkBuffer>          m_workerStaging;
+    Rc<DxvkBuffer>          m_primaryStaging;
+    VkDeviceSize            m_stagingSize = 0u;
     uint64_t                m_csSeqNum = 0ull;
 
     uint32_t                m_mappedImageCount = 0u;
@@ -192,7 +195,8 @@ namespace dxvk {
 
     void EmitWorkerClearRenderTarget(
       const DxvkAttachment&             Attachment,
-      const VkClearValue&               ClearValue);
+      const VkClearValue&               ClearValue,
+      const Rc<DxvkImage>&              PrimaryImage);
 
     void TrackTextureSequenceNumber(
             D3D11CommonTexture*         pResource,
