@@ -61,6 +61,10 @@ namespace dxvk {
       return m_imageView;
     }
 
+    Rc<DxvkImageView> GetWorkerImageView() const {
+      return m_workerImageView;
+    }
+
     D3D10ShaderResourceView* GetD3D10Iface() {
       return &m_d3d10;
     }
@@ -87,6 +91,7 @@ namespace dxvk {
     D3D11_VK_VIEW_INFO                m_info;
     Rc<DxvkBufferView>                m_bufferView;
     Rc<DxvkImageView>                 m_imageView;
+    Rc<DxvkImageView>                 m_workerImageView;
     D3D10ShaderResourceView           m_d3d10;
 
     D3DDestructionNotifier            m_destructionNotifier;

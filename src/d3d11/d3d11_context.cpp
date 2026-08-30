@@ -4158,6 +4158,17 @@ namespace dxvk {
         ctx->bindResourceSampler(cStage, cSlotId,
           Forwarder::move(cSampler));
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cSlotId   = slotId,
+          cStage    = GetShaderStage(ShaderStage),
+          cSampler  = pSampler->GetWorkerDXVKSampler()
+        ] (DxvkContext* ctx) mutable {
+          ctx->bindResourceSampler(cStage, cSlotId,
+            Forwarder::move(cSampler));
+        });
+      }
     } else {
       EmitCs([
         cSlotId   = slotId,
@@ -4165,8 +4176,18 @@ namespace dxvk {
       ] (DxvkContext* ctx) {
         ctx->bindResourceSampler(cStage, cSlotId, nullptr);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cSlotId   = slotId,
+          cStage    = GetShaderStage(ShaderStage)
+        ] (DxvkContext* ctx) {
+          ctx->bindResourceSampler(cStage, cSlotId, nullptr);
+        });
+      }
     }
   }
+  
 
 
   template<typename ContextType>
@@ -4186,6 +4207,17 @@ namespace dxvk {
           ctx->bindResourceImageView(cStage, cSlotId,
             Forwarder::move(cView));
         });
+
+        if constexpr (!IsDeferred) {
+          GetTypedContext()->EmitWorkerCs([
+            cSlotId = slotId,
+            cStage  = GetShaderStage(ShaderStage),
+            cView   = pResource->GetWorkerImageView()
+          ] (DxvkContext* ctx) mutable {
+            ctx->bindResourceImageView(cStage, cSlotId,
+              Forwarder::move(cView));
+          });
+        }
       } else {
         EmitCs([
           cSlotId = slotId,
@@ -4195,6 +4227,18 @@ namespace dxvk {
           ctx->bindResourceBufferView(cStage, cSlotId,
             Forwarder::move(cView));
         });
+
+        // Buffer SRVs have no worker view -- the buffer view path is
+        // not mirrored, matching the RTV exclusion. Bind null on the
+        // worker rather than leaving a stale view in the slot.
+        if constexpr (!IsDeferred) {
+          GetTypedContext()->EmitWorkerCs([
+            cSlotId = slotId,
+            cStage  = GetShaderStage(ShaderStage)
+          ] (DxvkContext* ctx) {
+            ctx->bindResourceBufferView(cStage, cSlotId, nullptr);
+          });
+        }
       }
     } else {
       EmitCs([
@@ -4203,6 +4247,15 @@ namespace dxvk {
       ] (DxvkContext* ctx) {
         ctx->bindResourceImageView(cStage, cSlotId, nullptr);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cSlotId = slotId,
+          cStage  = GetShaderStage(ShaderStage)
+        ] (DxvkContext* ctx) {
+          ctx->bindResourceImageView(cStage, cSlotId, nullptr);
+        });
+      }
     }
   }
 

@@ -59,6 +59,15 @@ namespace dxvk {
       info.borderColor.float32[i] = desc.BorderColor[i];
 
     m_sampler = device->GetDXVKDevice()->createSampler(info);
+
+    // A VkSampler belongs to the device that created it, so unlike
+    // DxvkShader this genuinely needs a second object. The key is a
+    // plain description with no device state, so the same one produces
+    // an equivalent sampler on the worker.
+    Rc<DxvkDevice> workerDevice = device->GetWorkerDXVKDevice();
+
+    if (workerDevice != nullptr)
+      m_workerSampler = workerDevice->createSampler(info);
   }
 
 

@@ -33,6 +33,10 @@ namespace dxvk {
       return m_sampler;
     }
 
+    Rc<DxvkSampler> GetWorkerDXVKSampler() const {
+      return m_workerSampler;
+    }
+
     D3D10SamplerState* GetD3D10Iface() {
       return &m_d3d10;
     }
@@ -48,6 +52,7 @@ namespace dxvk {
     
     D3D11_SAMPLER_DESC m_desc;
     Rc<DxvkSampler>    m_sampler;
+    Rc<DxvkSampler>    m_workerSampler;
     D3D10SamplerState  m_d3d10;
 
     std::atomic<uint32_t> m_refCount = { 0u };

@@ -178,6 +178,15 @@ namespace dxvk {
 
       // Create the underlying image view object
       m_imageView = texture->GetImage()->createView(viewInfo);
+
+      // Mirror on the worker GPU, same pattern as the RTV and DSV.
+      // Buffer-backed SRVs take the other branch and are not mirrored.
+      Rc<DxvkImage> workerImage = texture->GetWorkerImage();
+
+      if (workerImage != nullptr) {
+        m_workerImageView = workerImage->createView(viewInfo);
+        Logger::info("D3D11ShaderResourceView: Created worker view");
+      }
     }
   }
   
@@ -189,6 +198,7 @@ namespace dxvk {
     m_resource = nullptr;
 
     m_imageView = nullptr;
+    m_workerImageView = nullptr;
     m_bufferView = nullptr;
   }
   
