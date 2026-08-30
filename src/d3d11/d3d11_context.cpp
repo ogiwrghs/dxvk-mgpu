@@ -3434,6 +3434,20 @@ namespace dxvk {
         ctx->setMultisampleState(cMsState);
         ctx->setLogicOpState(cLoState);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cBlendState = m_state.om.cbState->GetBlendState(),
+          cMsState    = m_state.om.cbState->GetMsState(m_state.om.sampleMask),
+          cLoState    = m_state.om.cbState->GetLoState()
+        ] (DxvkContext* ctx) {
+          for (uint32_t i = 0; i < cBlendState.size(); i++)
+            ctx->setBlendMode(i, cBlendState[i]);
+
+          ctx->setMultisampleState(cMsState);
+          ctx->setLogicOpState(cLoState);
+        });
+      }
     } else {
       EmitCs([
         cSampleMask = m_state.om.sampleMask
@@ -3446,7 +3460,21 @@ namespace dxvk {
         ctx->setMultisampleState(InitDefaultMultisampleState(cSampleMask));
         ctx->setLogicOpState(InitDefaultLogicOpState());
       });
-    }
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cSampleMask = m_state.om.sampleMask
+        ] (DxvkContext* ctx) {
+          DxvkBlendMode cbState = InitDefaultBlendState();
+
+          for (uint32_t i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+            ctx->setBlendMode(i, cbState);
+
+          ctx->setMultisampleState(InitDefaultMultisampleState(cSampleMask));
+          ctx->setLogicOpState(InitDefaultLogicOpState());
+        });
+      }
+    };
   }
 
 
@@ -3459,6 +3487,16 @@ namespace dxvk {
     ] (DxvkContext* ctx) {
       ctx->setBlendConstants(cBlendConstants);
     });
+
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerCs([
+        cBlendConstants = DxvkBlendConstants {
+          m_state.om.blendFactor[0], m_state.om.blendFactor[1],
+          m_state.om.blendFactor[2], m_state.om.blendFactor[3] }
+      ] (DxvkContext* ctx) {
+        ctx->setBlendConstants(cBlendConstants);
+      });
+    }
   }
 
 
@@ -3470,10 +3508,24 @@ namespace dxvk {
       ] (DxvkContext* ctx) {
         ctx->setDepthStencilState(cState);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cState = m_state.om.dsState->GetState()
+        ] (DxvkContext* ctx) {
+          ctx->setDepthStencilState(cState);
+        });
+      }
     } else {
       EmitCs([] (DxvkContext* ctx) {
         ctx->setDepthStencilState(InitDefaultDepthStencilState());
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
+          ctx->setDepthStencilState(InitDefaultDepthStencilState());
+        });
+      }
     }
   }
   
@@ -3485,6 +3537,14 @@ namespace dxvk {
     ] (DxvkContext* ctx) {
       ctx->setStencilReference(cStencilRef);
     });
+
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerCs([
+        cStencilRef = m_state.om.stencilRef
+      ] (DxvkContext* ctx) {
+        ctx->setStencilReference(cStencilRef);
+      });
+    }
   }
   
   
@@ -3498,11 +3558,28 @@ namespace dxvk {
         ctx->setRasterizerState(cState);
         ctx->setDepthBias(cDepthBias);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cState      = m_state.rs.state->GetState(),
+          cDepthBias  = m_state.rs.state->GetDepthBias()
+        ] (DxvkContext* ctx) {
+          ctx->setRasterizerState(cState);
+          ctx->setDepthBias(cDepthBias);
+        });
+      }
     } else {
       EmitCs([] (DxvkContext* ctx) {
         ctx->setRasterizerState(InitDefaultRasterizerState());
         ctx->setDepthBias(DxvkDepthBias());
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
+          ctx->setRasterizerState(InitDefaultRasterizerState());
+          ctx->setDepthBias(DxvkDepthBias());
+        });
+      }
     }
   }
 
@@ -3527,6 +3604,15 @@ namespace dxvk {
       ctx->setSpecConstants(VK_PIPELINE_BIND_POINT_GRAPHICS,
         0u, sizeof(cSpecData), &cSpecData);
     });
+
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerCs([
+        cSpecData = specData
+      ] (DxvkContext* ctx) {
+        ctx->setSpecConstants(VK_PIPELINE_BIND_POINT_GRAPHICS,
+          0u, sizeof(cSpecData), &cSpecData);
+      });
+    }
   }
 
 
@@ -3572,6 +3658,50 @@ namespace dxvk {
             uint32_t(std::max(sr.top, sr.bottom) - sr.top) };
         }
       }
+
+      // Same reasoning as ApplyInputLayout: the primary path uses
+      // EmitCsCmd's inline chunk storage, which EmitWorkerCs has no
+      // equivalent for, so the worker gets the viewports by value.
+      // Recomputed rather than read back out of m_csData so this does
+      // not depend on the chunk's internal layout. Bounded at
+      // D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE.
+      if constexpr (!IsDeferred) {
+        std::array<DxvkViewport,
+          D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> workerViewports = { };
+
+        for (uint32_t i = 0; i < viewportCount; i++) {
+          const auto& vp = m_state.rs.viewports[i];
+
+          auto& dst = workerViewports[i];
+          dst.viewport.x = vp.TopLeftX;
+          dst.viewport.y = vp.Height + vp.TopLeftY;
+          dst.viewport.width = vp.Width;
+          dst.viewport.height = -vp.Height;
+          dst.viewport.minDepth = vp.MinDepth;
+          dst.viewport.maxDepth = vp.MaxDepth;
+
+          if (!enableScissorTest) {
+            dst.scissor.offset = VkOffset2D { 0, 0 };
+            dst.scissor.extent = VkExtent2D {
+              D3D11_VIEWPORT_BOUNDS_MAX,
+              D3D11_VIEWPORT_BOUNDS_MAX };
+          } else if (i < m_state.rs.numScissors) {
+            const auto& sr = m_state.rs.scissors[i];
+
+            dst.scissor.offset = VkOffset2D { sr.left, sr.top };
+            dst.scissor.extent = VkExtent2D {
+              uint32_t(std::max(sr.left, sr.right) - sr.left),
+              uint32_t(std::max(sr.top, sr.bottom) - sr.top) };
+          }
+        }
+
+        GetTypedContext()->EmitWorkerCs([
+          cViewports = workerViewports,
+          cCount     = viewportCount
+        ] (DxvkContext* ctx) {
+          ctx->setViewports(cCount, &cViewports[0]);
+        });
+      }
     } else {
       // The backend can't handle a viewport count of zero,
       // so we should at least specify one empty viewport
@@ -3579,6 +3709,13 @@ namespace dxvk {
         DxvkViewport viewport = { };
         ctx->setViewports(1, &viewport);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
+          DxvkViewport viewport = { };
+          ctx->setViewports(1, &viewport);
+        });
+      }
     }
   }
 
