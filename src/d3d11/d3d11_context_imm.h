@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 #include "../util/util_time.h"
 
 #include "../util/sync/sync_signal.h"
@@ -138,6 +139,16 @@ namespace dxvk {
     uint64_t                m_compositeSubSum   = 0ull;
     uint64_t                m_compositeSubMin   = ~0ull;
     uint64_t                m_compositeSubMax   = 0ull;
+
+    // Per-composite samples, kept so the summary can report the shape
+    // of the distribution rather than just its endpoints. min/avg/max
+    // cannot distinguish a few warm-up outliers from a periodic spike
+    // from a uniformly heavy tail, and those have completely different
+    // causes. Capped so a long session cannot grow this without bound.
+    static constexpr size_t MaxCompositeSamples = 100000u;
+
+    std::vector<uint32_t>   m_compositeSyncLog;
+    std::vector<uint32_t>   m_compositeSubLog;
 
     void LogCompositeStats();
     Rc<DxvkBuffer>          m_workerStaging;

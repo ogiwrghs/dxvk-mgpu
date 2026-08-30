@@ -1260,6 +1260,49 @@ namespace dxvk {
     if (!m_compositeCount)
       return;
 
+    auto report = [] (const char* name, const std::vector<uint32_t>& samples) {
+      if (samples.empty())
+        return;
+
+      // Where the worst sample happened separates warm-up from steady
+      // state: an early index means compilation or first-touch cost,
+      // a late or evenly spread one means something recurring.
+      size_t maxIndex = 0;
+      uint64_t sum = 0;
+
+      for (size_t i = 0; i < samples.size(); i++) {
+        sum += samples[i];
+
+        if (samples[i] > samples[maxIndex])
+          maxIndex = i;
+      }
+
+      std::vector<uint32_t> sorted = samples;
+      std::sort(sorted.begin(), sorted.end());
+
+      auto pct = [&sorted] (double p) {
+        size_t idx = size_t(p * double(sorted.size() - 1));
+        return sorted[idx];
+      };
+
+      // Count how much of the total time lives in the worst 1%. If the
+      // tail dominates the sum, the average is describing a workload
+      // that mostly does not happen.
+      uint64_t tailSum = 0;
+      size_t tailStart = sorted.size() - std::max<size_t>(1u, sorted.size() / 100u);
+
+      for (size_t i = tailStart; i < sorted.size(); i++)
+        tailSum += sorted[i];
+
+      Logger::info(str::format("  ", name,
+        ": p50 ", pct(0.50),
+        "us  p90 ", pct(0.90),
+        "us  p99 ", pct(0.99),
+        "us  max ", sorted.back(),
+        "us @sample ", maxIndex,
+        "  top1% holds ", sum ? (tailSum * 100u) / sum : 0u, "% of total"));
+    };
+
     Logger::info(str::format("composite stats over ", m_compositeCount, " composites:"));
     Logger::info(str::format("  cs sync:  min ", m_compositeSyncMin,
       "us  avg ", m_compositeSyncSum / m_compositeCount,
@@ -1267,6 +1310,8 @@ namespace dxvk {
     Logger::info(str::format("  gpu wait: min ", m_compositeSubMin,
       "us  avg ", m_compositeSubSum / m_compositeCount,
       "us  max ", m_compositeSubMax, "us"));
+    report("cs sync ", m_compositeSyncLog);
+    report("gpu wait", m_compositeSubLog);
   }
 
 
@@ -1351,6 +1396,11 @@ namespace dxvk {
     m_compositeSubSum  += subUs;
     m_compositeSubMin   = std::min(m_compositeSubMin, subUs);
     m_compositeSubMax   = std::max(m_compositeSubMax, subUs);
+
+    if (m_compositeSyncLog.size() < MaxCompositeSamples) {
+      m_compositeSyncLog.push_back(uint32_t(syncUs));
+      m_compositeSubLog.push_back(uint32_t(subUs));
+    }
 
     // GPU0: primary host buffer -> the D3D11 back buffer image.
     EmitCs([
