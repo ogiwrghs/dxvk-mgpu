@@ -3726,6 +3726,24 @@ namespace dxvk {
     if (unlikely(HasDirtyGraphicsBindings()))
       ApplyDirtyGraphicsBindings();
 
+    // Mirror the draw onto the worker GPU. Done before the primary
+    // path because that has an early return in its batching branch.
+    //
+    // The primary batches consecutive draws into one command via
+    // pushData; the worker takes one command per draw instead, since
+    // EmitWorkerCs has no pushData equivalent. That is a per-draw
+    // command rather than a per-draw dispatch -- EmitWorkerCs still
+    // accumulates into m_workerCsChunk -- so the cost is chunk space,
+    // not submissions. Worth revisiting if draw-heavy workloads show
+    // the worker chunk filling much faster than the primary.
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerCs([
+        cDraw = draw
+      ] (DxvkContext* ctx) {
+        ctx->draw(1u, &cDraw);
+      });
+    }
+
     // Batch consecutive draws if there are no state changes
     if (m_csDataType == D3D11CmdType::Draw) {
       auto* drawInfo = m_csChunk->pushData(m_csData, 1u);
@@ -3750,6 +3768,15 @@ namespace dxvk {
     const VkDrawIndexedIndirectCommand&     draw) {
     if (unlikely(HasDirtyGraphicsBindings()))
       ApplyDirtyGraphicsBindings();
+
+    // Batch consecutive draws if there are no state changes
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerCs([
+        cDraw = draw
+      ] (DxvkContext* ctx) {
+        ctx->drawIndexed(1u, &cDraw);
+      });
+    }
 
     // Batch consecutive draws if there are no state changes
     if (m_csDataType == D3D11CmdType::DrawIndexed) {
