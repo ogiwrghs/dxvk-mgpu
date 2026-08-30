@@ -725,6 +725,29 @@ namespace dxvk {
       ctx->clearRenderTarget(cAttachment,
         cAspectMask, cClearValue, 0u);
     });
+
+    // Mirror onto the worker. Without this the worker's depth buffer
+    // is never initialised, so with a LESS depth test every fragment
+    // is rejected and mirrored draws produce nothing -- while the
+    // colour clear, which needs no pipeline, still works. That
+    // asymmetry is exactly what the black output looked like.
+    if constexpr (!IsDeferred) {
+      Rc<DxvkImageView> workerView = dsv->GetWorkerImageView();
+
+      if (workerView != nullptr) {
+        DxvkAttachment workerAttachment = {};
+        workerAttachment.view = workerView;
+
+        GetTypedContext()->EmitWorkerCs([
+          cClearValue = clearValue,
+          cAspectMask = aspectMask,
+          cAttachment = std::move(workerAttachment)
+        ] (DxvkContext* ctx) {
+          ctx->clearRenderTarget(cAttachment,
+            cAspectMask, cClearValue, 0u);
+        });
+      }
+    }
   }
 
 

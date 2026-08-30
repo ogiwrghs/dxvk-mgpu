@@ -120,6 +120,7 @@ namespace dxvk {
     std::unique_ptr<DxvkCsThread> m_workerCsThread;
     DxvkCsChunkRef          m_workerCsChunk;
     bool                    m_workerFlushDebug = false;
+    bool                    m_workerDrawDebug = false;
     uint32_t                m_workerFlushCalls = 0u;
     uint32_t                m_workerFlushEmpty = 0u;
 

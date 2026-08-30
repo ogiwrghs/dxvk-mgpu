@@ -6789,6 +6789,18 @@ namespace dxvk {
     m_state.gp.pipeline = newPipeline;
 
     if (unlikely(!newPipeline)) {
+      // Failing here makes the draw a silent no-op, which looks exactly
+      // like a draw that rendered nothing. Log the first few so the two
+      // can be told apart. Costs nothing unless it actually fails.
+      static std::atomic<uint32_t> s_lookupFail = { 0u };
+      uint32_t n = ++s_lookupFail;
+
+      if (n <= 5u) {
+        Logger::warn(str::format("updateGraphicsPipeline: lookup failed #", n,
+          " vs=", (m_state.gp.shaders.vs != nullptr),
+          " fs=", (m_state.gp.shaders.fs != nullptr)));
+      }
+
       m_state.gp.flags = DxvkGraphicsPipelineFlags();
       return false;
     }
@@ -6837,8 +6849,17 @@ namespace dxvk {
     // Retrieve and bind actual Vulkan pipeline handle
     auto pipelineInfo = m_state.gp.pipeline->getPipelineHandle(m_state.gp.state);
 
-    if (unlikely(!pipelineInfo.handle))
+    if (unlikely(!pipelineInfo.handle)) {
+      // Same silent-no-op path as the lookup failure above, one stage
+      // later.
+      static std::atomic<uint32_t> s_handleFail = { 0u };
+      uint32_t n = ++s_handleFail;
+
+      if (n <= 5u)
+        Logger::warn(str::format("updateGraphicsPipelineState: null handle #", n));
+
       return false;
+    }
 
     m_cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
       VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineInfo.handle);
@@ -8413,6 +8434,14 @@ namespace dxvk {
     if (m_descriptorState.hasDirtyResources(VK_SHADER_STAGE_ALL_GRAPHICS)
      || unlikely(m_flags.all(DxvkContextFlag::GpIndependentSets, DxvkContextFlag::GpDirtySpecDataBlock))) {
       if (unlikely(!this->updateGraphicsShaderResources())) {
+        {
+          // Third silent failure path in this function.
+          static std::atomic<uint32_t> s_resFail = { 0u };
+          uint32_t n = ++s_resFail;
+
+          if (n <= 5u)
+            Logger::warn(str::format("updateGraphicsShaderResources failed #", n));
+        }
         // This can only happen if we were inside a secondary command buffer.
         // Technically it would be sufficient to only restart the secondary
         // command buffer, but this should almost never happen in practice

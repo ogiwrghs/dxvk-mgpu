@@ -72,6 +72,7 @@ namespace dxvk {
       // condition protecting it.
       m_workerCsChunk = pParent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
       m_workerFlushDebug = env::getEnvVar("DXVK_MGPU_DEBUG_FLUSH") == "1";
+      m_workerDrawDebug  = env::getEnvVar("DXVK_MGPU_DEBUG_DRAW") == "1";
       Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
     }
   }
@@ -1060,6 +1061,28 @@ namespace dxvk {
     // actually provides a color target -- an unbind (Targets.color[0]
     // null) must not erase the last known frame image, or a mid-frame
     // unbind would blank the composite.
+    // Opt-in: confirm the worker receives usable attachments. A null
+    // colour view here would explain draws that execute but produce no
+    // pixels. Enable with DXVK_MGPU_DEBUG_DRAW=1.
+    if (unlikely(m_workerDrawDebug)) {
+      static uint32_t s_bindCount = 0;
+
+      if (s_bindCount++ < 6u) {
+        auto& c0 = Targets.color[0];
+
+        if (c0.view != nullptr) {
+          VkExtent3D e = c0.view->image()->info().extent;
+          Logger::info(str::format("worker bindFB #", s_bindCount,
+            ": colour ", e.width, "x", e.height,
+            " depth ", (Targets.depth.view != nullptr ? "yes" : "no")));
+        } else {
+          Logger::info(str::format("worker bindFB #", s_bindCount,
+            ": colour NULL depth ",
+            (Targets.depth.view != nullptr ? "yes" : "no")));
+        }
+      }
+    }
+
     if (Targets.color[0].view != nullptr)
       m_workerFrameImage = Targets.color[0].view->image();
 
@@ -1383,6 +1406,32 @@ namespace dxvk {
     auto t1 = dxvk::high_resolution_clock::now();
     workerDevice->waitForSubmission(&submitStatus);
     auto t2 = dxvk::high_resolution_clock::now();
+
+    // Opt-in: sample a few pixels of what GPU1 actually produced. The
+    // data is already in shared host memory here, so the only cost is
+    // the read and the log line. Several positions rather than one, so
+    // a cleared background can be told apart from geometry covering
+    // part of the frame. Enable with DXVK_MGPU_DEBUG_DRAW=1.
+    if (unlikely(m_workerDrawDebug)) {
+      static uint32_t s_readbackCount = 0;
+
+      if ((s_readbackCount++ % 120u) == 0u && m_sharedHostMem) {
+        const uint8_t* px = reinterpret_cast<const uint8_t*>(m_sharedHostMem);
+        uint32_t w = extent.width;
+        uint32_t h = extent.height;
+
+        auto sample = [px, w] (uint32_t x, uint32_t y) {
+          size_t o = (size_t(y) * w + x) * 4u;
+          return str::format("[", uint32_t(px[o]), ",", uint32_t(px[o + 1]),
+            ",", uint32_t(px[o + 2]), ",", uint32_t(px[o + 3]), "]");
+        };
+
+        Logger::info(str::format("worker image ", w, "x", h,
+          " centre ", sample(w / 2u, h / 2u),
+          " topleft ", sample(w / 8u, h / 8u),
+          " corner ", sample(2u, 2u)));
+      }
+    }
 
     // No copy here any more: both devices are bound to the same host pages,
     // so whatever GPU1 wrote is already visible to GPU0.
