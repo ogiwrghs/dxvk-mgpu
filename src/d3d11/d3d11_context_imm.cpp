@@ -73,6 +73,7 @@ namespace dxvk {
       m_workerCsChunk = pParent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
       m_workerFlushDebug = env::getEnvVar("DXVK_MGPU_DEBUG_FLUSH") == "1";
       m_workerDrawDebug  = env::getEnvVar("DXVK_MGPU_DEBUG_DRAW") == "1";
+      m_workerMapDebug   = env::getEnvVar("DXVK_MGPU_DEBUG_MAP") == "1";
       Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
     }
   }
@@ -87,6 +88,7 @@ namespace dxvk {
     SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
     SynchronizeDevice();
     LogCompositeStats();
+    LogMapStats();
     // Dispatch anything still batched before the worker device is
     // idled and its buffers torn down.
     FlushWorkerCsChunk();
@@ -365,6 +367,38 @@ namespace dxvk {
         UnmapImage(GetCommonTexture(pResource), Subresource);
       }
     }
+
+    // Push the just-written contents to the worker's copy of the
+    // buffer. Upstream Unmap is a no-op for buffers because the GPU
+    // reads the host-visible allocation directly; the worker has its
+    // own device-local buffer, so the bytes have to be staged and
+    // uploaded. This is the straightforward version, kept deliberately
+    // simple to measure before deciding whether shared host memory is
+    // worth the complexity.
+    if (unlikely(m_mappedWorkerBuffer != nullptr
+              && reinterpret_cast<ID3D11Resource*>(m_mappedWorkerBuffer) == pResource)) {
+      D3D10DeviceLock lock = LockContext();
+
+      Rc<DxvkBuffer> workerBuffer = m_mappedWorkerBuffer->GetWorkerBuffer();
+
+      if (workerBuffer != nullptr) {
+        DxvkBufferSlice staging = AllocStagingBuffer(m_mappedWorkerSize);
+        std::memcpy(staging.mapPtr(0), m_mappedWorkerPtr, m_mappedWorkerSize);
+
+        EmitWorkerCs([
+          cBuffer  = std::move(workerBuffer),
+          cStaging = std::move(staging),
+          cSize    = m_mappedWorkerSize
+        ] (DxvkContext* ctx) {
+          ctx->uploadBuffer(cBuffer, 0u,
+            cStaging.buffer(), cStaging.offset(), cSize);
+        });
+      }
+
+      m_mappedWorkerBuffer = nullptr;
+      m_mappedWorkerPtr    = nullptr;
+      m_mappedWorkerSize   = 0u;
+    }
   }
 
 
@@ -384,6 +418,25 @@ namespace dxvk {
 
     VkDeviceSize bufferSize = pResource->Desc()->ByteWidth;
 
+    if (unlikely(m_workerMapDebug)) {
+      switch (MapType) {
+        case D3D11_MAP_WRITE_DISCARD:
+          m_mapDiscardCount++;
+          m_mapDiscardBytes += bufferSize;
+          break;
+
+        case D3D11_MAP_WRITE_NO_OVERWRITE:
+          m_mapNoOverwriteCount++;
+          m_mapNoOverwriteBytes += bufferSize;
+          break;
+
+        default:
+          m_mapOtherCount++;
+          m_mapOtherBytes += bufferSize;
+          break;
+      }
+    }
+
     if (likely(MapType == D3D11_MAP_WRITE_DISCARD)) {
       // Allocate a new backing slice for the buffer and set
       // it as the 'new' mapped slice. This assumes that the
@@ -392,6 +445,12 @@ namespace dxvk {
       pMappedResource->pData      = bufferSlice->mapPtr();
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
+
+      if (m_workerCsThread && pResource->GetWorkerBuffer() != nullptr) {
+        m_mappedWorkerBuffer = pResource;
+        m_mappedWorkerPtr    = bufferSlice->mapPtr();
+        m_mappedWorkerSize   = bufferSize;
+      }
       
       EmitCs([
         cBuffer      = pResource->GetBuffer(),
@@ -982,6 +1041,16 @@ namespace dxvk {
   }
 
 
+  bool D3D11ImmediateContext::InjectWorkerCsChunk(
+          DxvkCsChunkRef&&            Chunk) {
+    if (!m_workerCsThread)
+      return false;
+
+    m_workerCsThread->dispatchChunk(std::move(Chunk));
+    return true;
+  }
+
+
   void D3D11ImmediateContext::EmitCsChunk(DxvkCsChunkRef&& chunk) {
     // Flush init commands so that the CS thread
     // can processe them before the first use.
@@ -1026,13 +1095,10 @@ namespace dxvk {
     const VkClearValue&         ClearValue) {
     if (!m_workerCsThread)
       return;
-    // TEST ONLY: force the worker clear to green so GPU1's pixels are
-    // visually distinguishable from GPU0's on screen.
-    VkClearValue workerClear = { };
-    workerClear.color.float32[0] = 0.0f;
-    workerClear.color.float32[1] = 1.0f;
-    workerClear.color.float32[2] = 0.0f;
-    workerClear.color.float32[3] = 1.0f;
+    // Use the application's own clear colour. The green override made
+    // GPU1's output obvious while only clears were mirrored, but now
+    // that draws are mirrored too it hides whether they wrote anything.
+    VkClearValue workerClear = ClearValue;
     EmitWorkerCs([
       cAttachment = Attachment,
       cClearValue = workerClear
@@ -1278,7 +1344,40 @@ namespace dxvk {
       m_sharedHostSize = 0u;
     }
   }
+  void D3D11ImmediateContext::LogMapStats() {
+    if (!m_workerMapDebug || !m_mapFrames)
+      return;
 
+    uint32_t f = m_mapFrames;
+    uint64_t totalBytes = m_mapDiscardBytes + m_mapNoOverwriteBytes + m_mapOtherBytes;
+    uint32_t totalCount = m_mapDiscardCount + m_mapNoOverwriteCount + m_mapOtherCount;
+
+    Logger::info(str::format("buffer map traffic over ", f, " frames:"));
+    Logger::info(str::format("  discard:      ", m_mapDiscardCount,
+      " (", m_mapDiscardCount / f, "/frame)  ",
+      m_mapDiscardBytes / 1024u, " KiB  (",
+      m_mapDiscardBytes / f / 1024u, " KiB/frame)"));
+    Logger::info(str::format("  no_overwrite: ", m_mapNoOverwriteCount,
+      " (", m_mapNoOverwriteCount / f, "/frame)  ",
+      m_mapNoOverwriteBytes / 1024u, " KiB  (",
+      m_mapNoOverwriteBytes / f / 1024u, " KiB/frame)"));
+    Logger::info(str::format("  other:        ", m_mapOtherCount,
+      " (", m_mapOtherCount / f, "/frame)  ",
+      m_mapOtherBytes / 1024u, " KiB  (",
+      m_mapOtherBytes / f / 1024u, " KiB/frame)"));
+    Logger::info(str::format("  total:        ", totalCount,
+      " (", totalCount / f, "/frame)  ",
+      totalBytes / 1024u, " KiB  (",
+      totalBytes / f / 1024u, " KiB/frame)"));
+
+    // At PCIe 3.0 x8 (~7.9 GB/s) and x16 (~15.8 GB/s), what a full
+    // duplicate of this traffic would cost per frame if it had to
+    // cross the bus rather than being written once into shared pages.
+    uint64_t perFrame = totalBytes / f;
+    Logger::info(str::format("  duplicating this per frame: ",
+      (perFrame * 1000000ull) / (7900ull * 1024ull * 1024ull), " us at x8, ",
+      (perFrame * 1000000ull) / (15800ull * 1024ull * 1024ull), " us at x16"));
+  }
   void D3D11ImmediateContext::LogCompositeStats() {
     if (!m_compositeCount)
       return;
@@ -1345,7 +1444,14 @@ namespace dxvk {
     // still sitting in an un-dispatched chunk. Doing this here rather
     // than at the call site keeps the guarantee next to the read that
     // depends on it.
+    static uint32_t s_entry = 0;
+    bool tr = (s_entry++ < 12u);
+
+    if (tr) Logger::warn(str::format("composite entry ", s_entry, ": before flush"));
+
     FlushWorkerCsChunk();
+
+    if (tr) Logger::warn(str::format("composite entry ", s_entry, ": after flush"));
 
     if (!m_workerCsThread || m_workerFrameImage == nullptr || DstImage == nullptr)
       return;
@@ -1369,10 +1475,16 @@ namespace dxvk {
     }
 
     if (m_stagingSize < imageBytes) {
+      if (tr) Logger::warn(str::format("composite entry ", s_entry,
+        ": allocating staging ", imageBytes, " bytes for ",
+        extent.width, "x", extent.height));
+
       if (!CreateSharedHostStaging(imageBytes))
         return;
 
       m_stagingSize = imageBytes;
+
+      if (tr) Logger::warn(str::format("composite entry ", s_entry, ": staging ready"));
     }
 
     // GPU1: worker image -> worker host buffer, then flush and wait on
@@ -1388,24 +1500,42 @@ namespace dxvk {
       cExtent = extent,
       cStatus = &submitStatus
     ] (DxvkContext* ctx) {
+      static uint32_t s_exec = 0;
+      bool t = (s_exec++ < 10u);
+
+      if (t) Logger::warn(str::format("  worker chunk ", s_exec, ": entered"));
+
       VkImageSubresourceLayers sub = { };
       sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
       sub.layerCount = 1;
-
       ctx->copyImageToBuffer(cBuffer, 0, 0, 0,
         VK_FORMAT_R8G8B8A8_UNORM, cImage, sub,
         VkOffset3D{ 0, 0, 0 }, cExtent);
 
+      if (t) Logger::warn(str::format("  worker chunk ", s_exec, ": copy recorded"));
+
       ctx->flushCommandList(nullptr, cStatus);
+
+      if (t) Logger::warn(str::format("  worker chunk ", s_exec, ": flushed"));
     });
 
     uint64_t seq = m_workerCsThread->dispatchChunk(std::move(download));
 
+    static uint32_t s_phase = 0;
+    bool trace = (s_phase++ < 10u);
+
+    if (trace) Logger::warn(str::format("composite ", s_phase, ": dispatched seq=", seq));
+
     auto t0 = dxvk::high_resolution_clock::now();
     m_workerCsThread->synchronize(seq);
     auto t1 = dxvk::high_resolution_clock::now();
+
+    if (trace) Logger::warn(str::format("composite ", s_phase, ": synchronized"));
+
     workerDevice->waitForSubmission(&submitStatus);
     auto t2 = dxvk::high_resolution_clock::now();
+
+    if (trace) Logger::warn(str::format("composite ", s_phase, ": submission done"));
 
     // Opt-in: sample a few pixels of what GPU1 actually produced. The
     // data is already in shared host memory here, so the only cost is
@@ -1439,6 +1569,7 @@ namespace dxvk {
     uint64_t subUs  = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
 
     m_compositeCount++;
+    m_mapFrames++;
     m_compositeSyncSum += syncUs;
     m_compositeSyncMin  = std::min(m_compositeSyncMin, syncUs);
     m_compositeSyncMax  = std::max(m_compositeSyncMax, syncUs);

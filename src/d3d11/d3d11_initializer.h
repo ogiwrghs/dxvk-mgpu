@@ -44,6 +44,9 @@ namespace dxvk {
 
       if (!m_csChunk->empty())
         FlushCsChunkLocked();
+
+      if (m_workerDevice && !m_workerCsChunk->empty())
+        FlushWorkerCsChunkLocked();
     }
 
     void NotifyContextFlush();
@@ -70,17 +73,24 @@ namespace dxvk {
   private:
 
     dxvk::mutex       m_mutex;
-
     D3D11Device*      m_parent;
     Rc<DxvkDevice>    m_device;
-    
     DxvkStagingBuffer m_stagingBuffer;
     Rc<sync::Fence>   m_stagingSignal;
-
     size_t            m_transferCommands  = 0;
 
     dxvk::mutex       m_csMutex;
     DxvkCsChunkRef    m_csChunk;
+
+    // Worker-side upload path. Resource mirroring creates the objects
+    // on the second device but nothing ever filled them, so worker
+    // draws read empty memory. The staging buffer has to be a separate
+    // one because DxvkStagingBuffer is bound to its device; the data is
+    // packed once into the primary slice and memcpy'd across, since it
+    // is already in the right layout by then.
+    Rc<DxvkDevice>    m_workerDevice;
+    std::unique_ptr<DxvkStagingBuffer> m_workerStagingBuffer;
+    DxvkCsChunkRef    m_workerCsChunk;
 
     void InitDeviceLocalBuffer(
             D3D11Buffer*                pBuffer,
@@ -112,7 +122,22 @@ namespace dxvk {
 
     void FlushCsChunkLocked();
 
+    void FlushWorkerCsChunkLocked();
+
     void NotifyContextFlushLocked();
+
+    template<typename Cmd>
+    void EmitWorkerCs(Cmd&& command) {
+      if (!m_workerDevice)
+        return;
+
+      std::lock_guard<dxvk::mutex> lock(m_csMutex);
+
+      if (unlikely(!m_workerCsChunk->push(command))) {
+        FlushWorkerCsChunkLocked();
+        m_workerCsChunk->push(command);
+      }
+    }
 
     template<typename Cmd>
     void EmitCs(Cmd&& command) {

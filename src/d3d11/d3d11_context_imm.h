@@ -104,6 +104,16 @@ namespace dxvk {
             DxvkCsChunkRef&&            Chunk,
             bool                        Synchronize);
 
+    // Worker-side counterpart, used by D3D11Initializer to route
+    // resource uploads to the second device. Returns false if there is
+    // no worker, so callers can skip building the chunk entirely.
+    bool InjectWorkerCsChunk(
+            DxvkCsChunkRef&&            Chunk);
+
+    bool HasWorkerDevice() const {
+      return m_workerCsThread != nullptr;
+    }
+
     template<typename Fn>
     void InjectCs(
             DxvkCsQueue                 Queue,
@@ -121,6 +131,19 @@ namespace dxvk {
     DxvkCsChunkRef          m_workerCsChunk;
     bool                    m_workerFlushDebug = false;
     bool                    m_workerDrawDebug = false;
+    bool                    m_workerMapDebug = false;
+
+    // Per-frame Map traffic, used to size the constant/dynamic buffer
+    // mirroring problem before choosing how to solve it.
+    uint32_t                m_mapDiscardCount = 0u;
+    uint32_t                m_mapNoOverwriteCount = 0u;
+    uint32_t                m_mapOtherCount = 0u;
+    uint64_t                m_mapDiscardBytes = 0ull;
+    uint64_t                m_mapNoOverwriteBytes = 0ull;
+    uint64_t                m_mapOtherBytes = 0ull;
+    uint32_t                m_mapFrames = 0u;
+
+    void LogMapStats();
     uint32_t                m_workerFlushCalls = 0u;
     uint32_t                m_workerFlushEmpty = 0u;
 
@@ -172,6 +195,14 @@ namespace dxvk {
     uint64_t                m_csSeqNum = 0ull;
 
     uint32_t                m_mappedImageCount = 0u;
+
+    // Buffer currently mapped for writing, remembered so Unmap can
+    // push the same bytes to the worker device. Unmap does nothing for
+    // buffers upstream -- the GPU reads host-visible memory directly --
+    // so this is the only point at which the write is known complete.
+    D3D11Buffer*            m_mappedWorkerBuffer = nullptr;
+    void*                   m_mappedWorkerPtr = nullptr;
+    VkDeviceSize            m_mappedWorkerSize = 0u;
 
     Rc<sync::CallbackFence> m_submissionFence;
     uint64_t                m_submissionId = 0ull;

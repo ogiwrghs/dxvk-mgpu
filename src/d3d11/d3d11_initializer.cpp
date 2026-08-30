@@ -13,7 +13,18 @@ namespace dxvk {
     m_stagingBuffer(m_device, StagingBufferSize),
     m_stagingSignal(new sync::Fence(0)),
     m_csChunk(m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse)) {
+    // The worker device is constructed before D3D11Device in
+    // D3D11DXGIDevice's initialiser list, so it is already available
+    // here.
+    m_workerDevice = pParent->GetWorkerDXVKDevice();
 
+    if (m_workerDevice != nullptr) {
+      m_workerStagingBuffer = std::make_unique<DxvkStagingBuffer>(
+        m_workerDevice, StagingBufferSize);
+      m_workerCsChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+
+      Logger::info("D3D11Initializer: worker upload path enabled");
+    }
   }
 
   
@@ -135,6 +146,27 @@ namespace dxvk {
 
       m_transferCommands += 1;
 
+      // Mirror the upload onto the worker device. Its staging buffer is
+      // a separate allocation because DxvkStagingBuffer belongs to the
+      // device that created it, so the data is copied again from the
+      // application's memory rather than from the primary slice.
+      Rc<DxvkBuffer> workerBuffer = pBuffer->GetWorkerBuffer();
+
+      if (m_workerDevice != nullptr && workerBuffer != nullptr) {
+        auto workerSlice = m_workerStagingBuffer->alloc(workerBuffer->info().size);
+        std::memcpy(workerSlice.mapPtr(0), pInitialData->pSysMem, workerSlice.length());
+
+        EmitWorkerCs([
+          cBuffer       = std::move(workerBuffer),
+          cStagingSlice = std::move(workerSlice)
+        ] (DxvkContext* ctx) {
+          ctx->uploadBuffer(cBuffer, 0u,
+            cStagingSlice.buffer(),
+            cStagingSlice.offset(),
+            cStagingSlice.length());
+        });
+      }
+
       EmitCs([
         cBuffer       = buffer,
         cStagingSlice = std::move(stagingSlice)
@@ -230,6 +262,28 @@ namespace dxvk {
 
       // Upload all subresources of the image in one go
       if (pTexture->HasImage()) {
+        // Mirror onto the worker device first, while the primary slice
+        // is still valid. The data is already packed in the layout
+        // uploadImage expects, so it can be copied straight across
+        // rather than re-packed from the application's memory.
+        Rc<DxvkImage> workerImage = pTexture->GetWorkerImage();
+
+        if (m_workerDevice != nullptr && workerImage != nullptr) {
+          auto workerSlice = m_workerStagingBuffer->alloc(stagingSlice.length());
+          std::memcpy(workerSlice.mapPtr(0), stagingSlice.mapPtr(0), stagingSlice.length());
+
+          EmitWorkerCs([
+            cImage        = std::move(workerImage),
+            cStagingSlice = std::move(workerSlice),
+            cFormat       = packedFormat
+          ] (DxvkContext* ctx) {
+            ctx->uploadImage(cImage,
+              cStagingSlice.buffer(),
+              cStagingSlice.offset(),
+              CACHE_LINE_SIZE, cFormat);
+          });
+        }
+
         EmitCs([
           cImage        = std::move(image),
           cStagingSlice = std::move(stagingSlice),
@@ -248,6 +302,16 @@ namespace dxvk {
         // While the Microsoft docs state that resource contents are
         // undefined if no initial data is provided, some applications
         // expect a resource to be pre-cleared.
+        Rc<DxvkImage> workerImage = pTexture->GetWorkerImage();
+
+        if (m_workerDevice != nullptr && workerImage != nullptr) {
+          EmitWorkerCs([
+            cImage = std::move(workerImage)
+          ] (DxvkContext* ctx) {
+            ctx->initImage(cImage, VK_IMAGE_LAYOUT_UNDEFINED);
+          });
+        }
+
         EmitCs([
           cImage = std::move(image)
         ] (DxvkContext* ctx) {
@@ -415,6 +479,15 @@ namespace dxvk {
   void D3D11Initializer::FlushCsChunkLocked() {
     m_parent->GetContext()->InjectCsChunk(DxvkCsQueue::HighPriority, std::move(m_csChunk), false);
     m_csChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+  }
+
+
+  void D3D11Initializer::FlushWorkerCsChunkLocked() {
+    if (!m_workerDevice)
+      return;
+
+    m_parent->GetContext()->InjectWorkerCsChunk(std::move(m_workerCsChunk));
+    m_workerCsChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
   }
 
 
