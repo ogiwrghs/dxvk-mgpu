@@ -3323,7 +3323,6 @@ namespace dxvk {
     if (likely(m_state.ia.inputLayout != nullptr)) {
       uint32_t attributeCount = m_state.ia.inputLayout->GetAttributeCount();
       uint32_t bindingCount = m_state.ia.inputLayout->GetBindingCount();
-
       EmitCsCmd<DxvkVertexInput>(D3D11CmdType::None, attributeCount + bindingCount, [
         cAttributeCount   = attributeCount,
         cBindingCount     = bindingCount
@@ -3331,16 +3330,47 @@ namespace dxvk {
         ctx->setInputLayout(cAttributeCount, &layout[0],
           cBindingCount, &layout[cAttributeCount]);
       });
-
       for (uint32_t i = 0; i < attributeCount + bindingCount; i++)
         new (m_csData->at(i)) DxvkVertexInput(m_state.ia.inputLayout->GetInput(i));
+
+      // The primary path uses EmitCsCmd, which reserves inline storage
+      // in the chunk and fills it with placement new. EmitWorkerCs has
+      // no equivalent -- it is a plain push -- so rather than build a
+      // second pushCmd mechanism for the worker, the inputs are copied
+      // into the lambda by value. DxvkVertexInput is a small packed
+      // value type and the array is bounded at
+      // MaxNumVertexAttributes + MaxNumVertexBindings = 64, so this is
+      // a fixed, modest capture for a call that happens a handful of
+      // times per frame rather than per draw. Revisit if input layout
+      // changes ever become hot.
+      if constexpr (!IsDeferred) {
+        std::array<DxvkVertexInput, DxvkLimits::MaxNumVertexAttributes
+                                  + DxvkLimits::MaxNumVertexBindings> inputs = { };
+
+        for (uint32_t i = 0; i < attributeCount + bindingCount; i++)
+          inputs[i] = m_state.ia.inputLayout->GetInput(i);
+
+        GetTypedContext()->EmitWorkerCs([
+          cInputs         = inputs,
+          cAttributeCount = attributeCount,
+          cBindingCount   = bindingCount
+        ] (DxvkContext* ctx) {
+          ctx->setInputLayout(cAttributeCount, &cInputs[0],
+            cBindingCount, &cInputs[cAttributeCount]);
+        });
+      }
     } else {
       EmitCs([] (DxvkContext* ctx) {
         ctx->setInputLayout(0, nullptr, 0, nullptr);
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
+          ctx->setInputLayout(0, nullptr, 0, nullptr);
+        });
+      }
     }
   }
-
 
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::ApplyPrimitiveTopology() {
@@ -3379,6 +3409,14 @@ namespace dxvk {
     EmitCs([iaState] (DxvkContext* ctx) {
       ctx->setInputAssemblyState(iaState);
     });
+
+    // Pure value state, no resources: the worker takes the identical
+    // command.
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerCs([iaState] (DxvkContext* ctx) {
+        ctx->setInputAssemblyState(iaState);
+      });
+    }
   }
 
 
