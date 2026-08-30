@@ -4074,6 +4074,24 @@ namespace dxvk {
         ctx->bindUniformBuffer(cStage, cSlotId,
           Forwarder::move(cBufferSlice));
       });
+
+      // The worker binds its own mirror of the buffer. Note that the
+      // mirror's *contents* are not maintained: Map/Unmap writes reach
+      // the primary buffer only. That is harmless while the worker
+      // issues no draws, but constant buffers are rewritten every draw
+      // rather than once at load like vertex data, so this is the
+      // largest outstanding gap before mirrored draws can produce
+      // correct pixels.
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cSlotId      = slotId,
+          cStage       = GetShaderStage(ShaderStage),
+          cBufferSlice = pBuffer->GetWorkerBufferSlice(16 * Offset, 16 * Length)
+        ] (DxvkContext* ctx) mutable {
+          ctx->bindUniformBuffer(cStage, cSlotId,
+            Forwarder::move(cBufferSlice));
+        });
+      }
     } else {
       EmitCs([
         cSlotId      = slotId,
@@ -4081,6 +4099,15 @@ namespace dxvk {
       ] (DxvkContext* ctx) {
         ctx->bindUniformBuffer(cStage, cSlotId, DxvkBufferSlice());
       });
+
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cSlotId      = slotId,
+          cStage       = GetShaderStage(ShaderStage)
+        ] (DxvkContext* ctx) {
+          ctx->bindUniformBuffer(cStage, cSlotId, DxvkBufferSlice());
+        });
+      }
     }
   }
   
@@ -4101,6 +4128,17 @@ namespace dxvk {
     ] (DxvkContext* ctx) {
       ctx->bindUniformBufferRange(cStage, cSlotId, cOffset, cLength);
     });
+
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerCs([
+        cSlotId = slotId,
+        cStage  = GetShaderStage(ShaderStage),
+        cOffset = 16u * Offset,
+        cLength = 16u * Length
+      ] (DxvkContext* ctx) {
+        ctx->bindUniformBufferRange(cStage, cSlotId, cOffset, cLength);
+      });
+    }
   }
 
 
