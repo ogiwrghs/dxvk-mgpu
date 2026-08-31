@@ -73,8 +73,16 @@ extern "C" {
       // instead of memcpy'ing between two separate staging buffers. Opaque
       // external memory is not an option here: the two cards report different
       // deviceUUIDs, which the Vulkan identity rules forbid for opaque import.
+      // RenderDoc's Vulkan layer rejects vkCreateDevice when this extension
+      // is requested, which makes the fork uncapturable. Gated so a capture
+      // run can drop it; the composite is broken without it, but capturing
+      // is about what the worker draws, not how its pixels get home.
       DxvkExtensionList mgpuExtensions;
-      mgpuExtensions.push_back(vk::makeExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME));
+
+      if (env::getEnvVar("DXVK_MGPU_NO_EXTMEM") != "1")
+        mgpuExtensions.push_back(vk::makeExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME));
+      else
+        Logger::warn("MGPU: external_memory_host disabled by env var");
 
       // Create Vulkan device so we have up-to-date features / properties
       dxvkAdapter->enableExtensions(mgpuExtensions);

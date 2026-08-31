@@ -1149,8 +1149,17 @@ namespace dxvk {
       }
     }
 
-    if (Targets.color[0].view != nullptr)
+    if (Targets.color[0].view != nullptr) {
       m_workerFrameImage = Targets.color[0].view->image();
+
+      static uint32_t s_b = 0;
+
+      if (s_b++ < 8u) {
+        Logger::warn(str::format("BIND frame image = ",
+          reinterpret_cast<uintptr_t>(m_workerFrameImage.ptr()),
+          "  view = ", reinterpret_cast<uintptr_t>(Targets.color[0].view.ptr())));
+      }
+    }
 
     EmitWorkerCs([
       cTargets = std::move(Targets)
@@ -1465,6 +1474,15 @@ namespace dxvk {
         workerDevice->vkd()->vkGetMemoryHostPointerPropertiesEXT != nullptr,
         " primary=", m_device->vkd()->vkGetMemoryHostPointerPropertiesEXT != nullptr));
     }    
+
+    {
+      static uint32_t s_c = 0;
+
+      if (s_c++ < 8u) {
+        Logger::warn(str::format("COMPOSITE reading image = ",
+          reinterpret_cast<uintptr_t>(m_workerFrameImage.ptr())));
+      }
+    }
 
     VkExtent3D   extent     = m_workerFrameImage->info().extent;
     VkDeviceSize imageBytes = VkDeviceSize(extent.width) * extent.height * 4u;

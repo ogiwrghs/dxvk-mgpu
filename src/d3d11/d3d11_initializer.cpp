@@ -486,6 +486,11 @@ namespace dxvk {
     if (!m_workerDevice)
       return;
 
+    static uint32_t s_wf = 0;
+
+    if (s_wf++ < 8u)
+      Logger::warn(str::format("INIT worker flush #", s_wf));
+
     m_parent->GetContext()->InjectWorkerCsChunk(std::move(m_workerCsChunk));
     m_workerCsChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
   }

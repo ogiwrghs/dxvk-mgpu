@@ -661,6 +661,19 @@ namespace dxvk {
           VkExtent3D            srcExtent) {
     bool useFb = !formatsAreBufferCopyCompatible(srcImage->info().format, dstFormat);
 
+    {
+      static uint32_t s_c2b = 0;
+
+      if (s_c2b++ < 12u) {
+        Logger::warn(str::format("COPY2BUF dev=",
+          reinterpret_cast<uintptr_t>(m_device->handle()),
+          " image=", reinterpret_cast<uintptr_t>(srcImage.ptr()),
+          " drawsSoFar=", m_cmd->statCounters().getCtr(DxvkStatCounter::CmdDrawCalls),
+          " rpActive=", m_flags.test(DxvkContextFlag::GpRenderPassActive),
+          " useFb=", useFb));
+      }
+    }
+
     if (useFb) {
       copyImageToBufferCs(dstBuffer, dstOffset, rowAlignment, sliceAlignment,
         dstFormat ? dstFormat : srcImage->info().format,
@@ -1611,6 +1624,17 @@ namespace dxvk {
           uint32_t                  count,
     const T*                        draws) {
     if (this->commitGraphicsState<Indexed, false>()) {
+      {
+        static uint32_t s_dg = 0;
+
+        if (s_dg++ < 24u) {
+          Logger::warn(str::format("DRAWEMIT dev=",
+            reinterpret_cast<uintptr_t>(m_device->handle()),
+            " indexed=", Indexed, " count=", count,
+            " rpActive=", m_flags.test(DxvkContextFlag::GpRenderPassActive)));
+        }
+      }
+
       if (count == 1u) {
         // Most common case, just emit a single draw
         if constexpr (Indexed) {
@@ -6387,6 +6411,20 @@ namespace dxvk {
     const DxvkFramebufferInfo&  framebufferInfo,
           DxvkRenderPassOps&    ops) {
     const DxvkFramebufferSize fbSize = framebufferInfo.size();
+
+    {
+      static uint32_t s_rpb = 0;
+
+      if (s_rpb++ < 24u) {
+        const auto& ct0 = framebufferInfo.getColorTarget(0);
+
+        Logger::warn(str::format("RPBIND dev=",
+          reinterpret_cast<uintptr_t>(m_device->handle()),
+          " color0 image=", ct0.view != nullptr
+            ? reinterpret_cast<uintptr_t>(ct0.view->image()) : 0u,
+          " size=", fbSize.width, "x", fbSize.height));
+      }
+    }
 
     acquireRenderTargets(framebufferInfo, ops);
 

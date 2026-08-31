@@ -640,6 +640,16 @@ namespace dxvk {
 
     m_submissionQueue.submit(submitInfo, latencyInfo, status);
 
+    {
+      static uint32_t s_sub = 0;
+
+      if (s_sub++ < 40u) {
+        Logger::warn(str::format("SUBMIT dev=",
+          reinterpret_cast<uintptr_t>(this->handle()),
+          " draws=", commandList->statCounters().getCtr(DxvkStatCounter::CmdDrawCalls)));
+      }
+    }
+
     std::lock_guard<sync::Spinlock> statLock(m_statLock);
     m_statCounters.merge(commandList->statCounters());
   }
