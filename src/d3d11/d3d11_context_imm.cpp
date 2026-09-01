@@ -71,6 +71,9 @@ namespace dxvk {
       // exists so that EmitWorkerCs's null-thread guard is the single
       // condition protecting it.
       m_workerCsChunk = pParent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+      m_workerStagingBuffer = std::make_unique<DxvkStagingBuffer>(
+        workerDevice, 256ull << 10);
+
       m_workerFlushDebug = env::getEnvVar("DXVK_MGPU_DEBUG_FLUSH") == "1";
       m_workerDrawDebug  = env::getEnvVar("DXVK_MGPU_DEBUG_DRAW") == "1";
       m_workerMapDebug   = env::getEnvVar("DXVK_MGPU_DEBUG_MAP") == "1";
@@ -382,7 +385,7 @@ namespace dxvk {
       Rc<DxvkBuffer> workerBuffer = m_mappedWorkerBuffer->GetWorkerBuffer();
 
       if (workerBuffer != nullptr) {
-        DxvkBufferSlice staging = AllocStagingBuffer(m_mappedWorkerSize);
+        DxvkBufferSlice staging = m_workerStagingBuffer->alloc(m_mappedWorkerSize);
         std::memcpy(staging.mapPtr(0), m_mappedWorkerPtr, m_mappedWorkerSize);
 
         EmitWorkerCs([
@@ -1170,9 +1173,20 @@ namespace dxvk {
 
   bool D3D11ImmediateContext::CreateSharedHostStaging(VkDeviceSize Size) {
     Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
-
     if (workerDevice == nullptr)
       return false;
+
+    if (workerDevice->vkd()->vkGetMemoryHostPointerPropertiesEXT == nullptr
+     || m_device->vkd()->vkGetMemoryHostPointerPropertiesEXT == nullptr) {
+      static bool s_warned = false;
+
+      if (!s_warned) {
+        s_warned = true;
+        Logger::warn("MGPU: external_memory_host unavailable, composite disabled");
+      }
+
+      return false;
+    }
 
     DestroySharedHostStaging();
 

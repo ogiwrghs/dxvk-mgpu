@@ -215,6 +215,12 @@ namespace dxvk {
 
     Rc<DxvkImage>           m_workerFrameImage;
 
+    // Map/Unmap mirroring stages bytes for the worker's device-local
+    // copy. This has to be its own staging buffer: DxvkStagingBuffer
+    // is bound to the device that created it, so the primary's buffer
+    // is not a valid source for a copy recorded on the worker context.
+    std::unique_ptr<DxvkStagingBuffer> m_workerStagingBuffer;
+
     VkDeviceSize            m_discardMemoryCounter = 0u;
     VkDeviceSize            m_discardMemoryOnFlush = 0u;
 

@@ -4057,6 +4057,20 @@ namespace dxvk {
       });
 
       if constexpr (!IsDeferred) {
+        {
+          static uint32_t s_vb = 0;
+
+          if (s_vb++ < 12u) {
+            auto ws = pBuffer->GetWorkerBufferSlice(Offset);
+
+            Logger::warn(str::format("VBBIND slot=", Slot,
+              " workerBuf=", reinterpret_cast<uintptr_t>(pBuffer->GetWorkerBuffer().ptr()),
+              " sliceLen=", ws.length(),
+              " stride=", Stride,
+              " primaryLen=", pBuffer->GetBufferSlice(Offset).length()));
+          }
+        }
+
         GetTypedContext()->EmitWorkerCs([
           cSlotId       = Slot,
           cBufferSlice  = pBuffer->GetWorkerBufferSlice(Offset),
