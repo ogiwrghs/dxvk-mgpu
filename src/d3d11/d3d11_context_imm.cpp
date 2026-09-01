@@ -36,8 +36,6 @@ namespace dxvk {
     // Stall here so that external submissions to the
     // CS thread can actually access the command list
     SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
-    
-    ClearState();
 
     // Set up a second, independent CS thread + context on the
     // worker GPU, if one exists. This is a standalone pipeline:
@@ -79,6 +77,13 @@ namespace dxvk {
       m_workerMapDebug   = env::getEnvVar("DXVK_MGPU_DEBUG_MAP") == "1";
       Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
     }
+
+    // Deliberately after the worker context exists. ResetCommandListState
+    // mirrors the default render states onto the worker now, but a mirror
+    // dispatched while m_workerCsThread is still null is dropped by
+    // EmitWorkerCs's guard -- which is exactly what left the worker's
+    // pipeline state zeroed, colorWriteMask included.
+    ClearState();
   }
   
   D3D11ImmediateContext::~D3D11ImmediateContext() {

@@ -4,6 +4,8 @@
 #include <map>
 #include <vector>
 #include <utility>
+#include <iomanip>
+#include <sstream>
 
 #include "dxvk_device.h"
 #include "dxvk_context.h"
@@ -1627,11 +1629,27 @@ namespace dxvk {
       {
         static uint32_t s_dg = 0;
 
-        if (s_dg++ < 24u) {
+        if (s_dg++ < 64u) {
           Logger::warn(str::format("DRAWEMIT dev=",
             reinterpret_cast<uintptr_t>(m_device->handle()),
             " indexed=", Indexed, " count=", count,
-            " rpActive=", m_flags.test(DxvkContextFlag::GpRenderPassActive)));
+            " rpActive=", m_flags.test(DxvkContextFlag::GpRenderPassActive),
+            " gpStateHash=", m_state.gp.state.hash(),
+            " gpPipeline=", reinterpret_cast<uintptr_t>(m_state.gp.pipeline)));
+
+          // Dump the raw state bytes so the two devices can be diffed
+          // offline. The struct is packed and trivially copyable, so
+          // the bytes are the whole story.
+          auto raw = reinterpret_cast<const uint8_t*>(&m_state.gp.state);
+          std::stringstream hex;
+
+          for (size_t i = 0; i < sizeof(m_state.gp.state); i++)
+            hex << std::hex << std::setw(2) << std::setfill('0') << uint32_t(raw[i]);
+
+          Logger::warn(str::format("GPSTATE dev=",
+            reinterpret_cast<uintptr_t>(m_device->handle()),
+            " size=", sizeof(m_state.gp.state),
+            " bytes=", hex.str()));
         }
       }
 

@@ -3373,11 +3373,18 @@ namespace dxvk {
         for (uint32_t i = 0; i < attributeCount + bindingCount; i++)
           inputs[i] = m_state.ia.inputLayout->GetInput(i);
 
+        bool noLayout = env::getEnvVar("DXVK_MGPU_NO_LAYOUT") == "1";
+
         GetTypedContext()->EmitWorkerCs([
           cInputs         = inputs,
-          cAttributeCount = attributeCount,
-          cBindingCount   = bindingCount
+          cAttributeCount = noLayout ? 0u : attributeCount,
+          cBindingCount   = noLayout ? 0u : bindingCount
         ] (DxvkContext* ctx) {
+          if (!cAttributeCount && !cBindingCount) {
+            ctx->setInputLayout(0, nullptr, 0, nullptr);
+            return;
+          }
+
           ctx->setInputLayout(cAttributeCount, &cInputs[0],
             cBindingCount, &cInputs[cAttributeCount]);
         });
@@ -3459,6 +3466,14 @@ namespace dxvk {
       });
 
       if constexpr (!IsDeferred) {
+        {
+          static uint32_t s_bs = 0;
+
+          if (s_bs++ < 8u)
+            Logger::warn(str::format("BLENDMIRROR default #", s_bs,
+              " mask=", m_state.om.sampleMask));
+        }
+
         GetTypedContext()->EmitWorkerCs([
           cBlendState = m_state.om.cbState->GetBlendState(),
           cMsState    = m_state.om.cbState->GetMsState(m_state.om.sampleMask),
@@ -3485,6 +3500,14 @@ namespace dxvk {
       });
 
       if constexpr (!IsDeferred) {
+        {
+          static uint32_t s_bs = 0;
+
+          if (s_bs++ < 8u)
+            Logger::warn(str::format("BLENDMIRROR default #", s_bs,
+              " mask=", m_state.om.sampleMask));
+        }
+
         GetTypedContext()->EmitWorkerCs([
           cSampleMask = m_state.om.sampleMask
         ] (DxvkContext* ctx) {
@@ -5306,6 +5329,30 @@ namespace dxvk {
 
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::ResetCommandListState() {
+    // The worker needs the same defaults. Without this its pipeline
+    // state keeps the zeroes from DxvkGraphicsPipelineStateInfo's
+    // constructor -- including a zero colorWriteMask, which builds a
+    // valid pipeline that rasterizes and writes no channel at all.
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
+        ctx->setInputLayout(0, nullptr, 0, nullptr);
+        ctx->setInputAssemblyState(InitDefaultPrimitiveTopology());
+        ctx->setDepthStencilState(InitDefaultDepthStencilState());
+        ctx->setRasterizerState(InitDefaultRasterizerState());
+        ctx->setDepthBias(DxvkDepthBias());
+        ctx->setLogicOpState(InitDefaultLogicOpState());
+        ctx->setMultisampleState(InitDefaultMultisampleState(D3D11_DEFAULT_SAMPLE_MASK));
+
+        DxvkBlendMode cbState = InitDefaultBlendState();
+
+        for (uint32_t i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+          ctx->setBlendMode(i, cbState);
+
+        ctx->setBlendConstants(DxvkBlendConstants { 1.0f, 1.0f, 1.0f, 1.0f });
+        ctx->setStencilReference(D3D11_DEFAULT_STENCIL_REFERENCE);
+      });
+    }
+
     EmitCs([
       cUsedBindings  = GetMaxUsedBindings()
     ] (DxvkContext* ctx) {
