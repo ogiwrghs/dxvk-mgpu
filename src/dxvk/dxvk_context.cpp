@@ -6,6 +6,8 @@
 #include <utility>
 #include <iomanip>
 #include <sstream>
+#include <set>
+#include <mutex>
 
 #include "dxvk_device.h"
 #include "dxvk_context.h"
@@ -1626,6 +1628,32 @@ namespace dxvk {
           uint32_t                  count,
     const T*                        draws) {
     if (this->commitGraphicsState<Indexed, false>()) {
+      // The capped dump below only ever sees startup draws. This
+      // accumulates the distinct pipeline state hashes each device
+      // produces and reports the sets periodically, so a divergence
+      // during the actual scene becomes visible. Same technique that
+      // found the zeroed colorWriteMask, applied at steady state.
+      // Log the pipeline state hash only when it changes from the
+      // previous draw on this context. State changes are far rarer
+      // than draws, so this is a handful of lines per frame with no
+      // lock and no allocation in the draw path -- the earlier
+      // map-plus-mutex version hung the benchmark as the scene loaded.
+      {
+        size_t h = m_state.gp.state.hash();
+
+        if (h != m_lastLoggedGpHash) {
+          m_lastLoggedGpHash = h;
+
+          if (m_gpHashLogCount < 400u) {
+            m_gpHashLogCount++;
+
+            Logger::warn(str::format("GPHASH dev=",
+              reinterpret_cast<uintptr_t>(m_device->handle()),
+              " hash=", h));
+          }
+        }
+      }
+
       {
         static uint32_t s_dg = 0;
 

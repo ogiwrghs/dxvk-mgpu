@@ -1356,6 +1356,9 @@ namespace dxvk {
 
     DxvkContextFlags        m_flags;
     DxvkContextState        m_state;
+
+    size_t                  m_lastLoggedGpHash = 0;
+    uint32_t                m_gpHashLogCount   = 0;
     DxvkContextFeatures     m_features;
     DxvkDescriptorState     m_descriptorState;
 

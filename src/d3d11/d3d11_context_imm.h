@@ -216,6 +216,8 @@ namespace dxvk {
     Rc<sync::Fence>         m_stagingBufferFence;
 
     Rc<DxvkImage>           m_workerFrameImage;
+    Rc<DxvkImage>           m_workerLargestImage;
+    Rc<DxvkImageView>       m_workerFrameView;
 
     // Map/Unmap mirroring stages bytes for the worker's device-local
     // copy. This has to be its own staging buffer: DxvkStagingBuffer

@@ -1160,8 +1160,31 @@ namespace dxvk {
     }
 
     if (Targets.color[0].view != nullptr) {
-      m_workerFrameImage = Targets.color[0].view->image();
+      // Diagnostic: keep the biggest colour target the worker has ever
+      // bound. Superposition renders its scene at full resolution and
+      // presents into a smaller window, so the back buffer only ever
+      // receives a final scale-and-present blit. If the worker's scene
+      // targets are empty then that blit correctly copies nothing, and
+      // reading one directly says where the emptiness starts.
+      {
+        Rc<DxvkImage> candidate = Targets.color[0].view->image();
 
+        VkExtent3D ce = candidate->info().extent;
+        uint64_t   ca = uint64_t(ce.width) * ce.height;
+
+        uint64_t best = 0;
+
+        if (m_workerLargestImage != nullptr) {
+          VkExtent3D be = m_workerLargestImage->info().extent;
+          best = uint64_t(be.width) * be.height;
+        }
+
+        if (ca > best)
+          m_workerLargestImage = candidate;
+      }
+
+      m_workerFrameImage = Targets.color[0].view->image();
+      m_workerFrameView  = Targets.color[0].view;
       static uint32_t s_b = 0;
 
       if (s_b++ < 8u) {
@@ -1278,6 +1301,51 @@ namespace dxvk {
       uint32_t typeIndex = 0u;
       while (!(ptrProps.memoryTypeBits & (1u << typeIndex)))
         typeIndex++;
+
+      // That assumption is not what the spec promises. The mask may
+      // include types from heaps otherwise unusable for allocation,
+      // and nothing guarantees the one picked here is HOST_COHERENT.
+      // A non-coherent type needs vkInvalidateMappedMemoryRanges
+      // before every read; without it the CPU sees stale contents
+      // even though the GPU wrote, which is the symptom being chased.
+      {
+        const auto& memProps = t.dev->adapter()->memoryProperties();
+
+        VkMemoryPropertyFlags flags =
+          memProps.memoryTypes[typeIndex].propertyFlags;
+
+        Logger::warn(str::format("MEMTYPE dev=",
+          reinterpret_cast<uintptr_t>(t.dev->handle()),
+          " mask=", ptrProps.memoryTypeBits,
+          " chosen=", typeIndex,
+          " flags=", flags,
+          " coherent=", bool(flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+          " cached=", bool(flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)));
+      }
+
+      // That assumption is not what the spec promises. The mask may
+      // include types from heaps that are otherwise unusable, and
+      // nothing guarantees the one picked here is HOST_COHERENT. A
+      // non-coherent type would need vkInvalidateMappedMemoryRanges
+      // before every read, without which the CPU sees stale contents
+      // even though the GPU wrote -- which is exactly the symptom
+      // being chased. Log what was actually selected.
+      {
+        VkPhysicalDeviceMemoryProperties memProps = { };
+        t.dev->adapter()->vki()->vkGetPhysicalDeviceMemoryProperties(
+          t.dev->adapter()->handle(), &memProps);
+
+        VkMemoryPropertyFlags flags =
+          memProps.memoryTypes[typeIndex].propertyFlags;
+
+        Logger::warn(str::format("MEMTYPE dev=",
+          reinterpret_cast<uintptr_t>(t.dev->handle()),
+          " mask=", ptrProps.memoryTypeBits,
+          " chosen=", typeIndex,
+          " flags=", flags,
+          " coherent=", bool(flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+          " cached=", bool(flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)));
+      }
 
       VkImportMemoryHostPointerInfoEXT importInfo =
         { VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT };
@@ -1497,6 +1565,20 @@ namespace dxvk {
       return;
     }
 
+    // Diagnostic gate: read the worker's largest render target instead
+    // of the back buffer mirror. Superposition renders its scene at
+    // full resolution and presents into a smaller window, so the back
+    // buffer only receives a final scale-and-present blit. If the
+    // scene targets are empty too, the problem is upstream of the
+    // blit. The extent check below rejects this whenever the sizes
+    // differ, so the point is the readback, not the screen.
+    bool readLargest = env::getEnvVar("DXVK_MGPU_READ_LARGEST") == "1"
+                    && m_workerLargestImage != nullptr;
+
+    Rc<DxvkImage> readSource = readLargest
+      ? m_workerLargestImage
+      : SrcImage;
+
     Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
 
     static bool s_checked = false;
@@ -1512,16 +1594,22 @@ namespace dxvk {
 
       if (s_c++ < 8u) {
         Logger::warn(str::format("COMPOSITE reading image = ",
-          reinterpret_cast<uintptr_t>(SrcImage.ptr()),
+          reinterpret_cast<uintptr_t>(readSource.ptr()),
           "  lastBind = ",
           reinterpret_cast<uintptr_t>(m_workerFrameImage.ptr())));
       }
     }
 
-    VkExtent3D   extent     = SrcImage->info().extent;
+    VkExtent3D   extent     = readSource->info().extent;
     VkDeviceSize imageBytes = VkDeviceSize(extent.width) * extent.height * 4u;
 
-    if (extent != DstImage->info().extent) {
+    // With the diagnostic gate on, the source is deliberately a
+    // different size from the back buffer, so the mismatch is expected
+    // and the final copy to the swap chain is skipped instead. The
+    // readback still runs, which is the entire point.
+    bool extentMismatch = extent != DstImage->info().extent;
+
+    if (extentMismatch && !readLargest) {
       Logger::warn("D3D11: worker/primary extent mismatch, skipping composite");
       return;
     }
@@ -1548,7 +1636,9 @@ namespace dxvk {
 
     download->push([
       cBuffer = m_workerStaging,
-      cImage  = SrcImage,
+      cImage  = readSource,
+      cClearView = (env::getEnvVar("DXVK_MGPU_TEST_CLEAR") == "1"
+        ? m_workerFrameView : Rc<DxvkImageView>()),
       cExtent = extent,
       cStatus = &submitStatus
     ] (DxvkContext* ctx) {
@@ -1560,6 +1650,25 @@ namespace dxvk {
       VkImageSubresourceLayers sub = { };
       sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
       sub.layerCount = 1;
+
+      // Proven technique from 6d49763a: clearImageView opens a render
+      // pass and draws a triangle rather than deferring to loadOp, so
+      // a magenta result means GPU1 rasterises, produces fragments,
+      // writes them to the bound attachment, and the transfer carries
+      // them home. Only mirrored draws would then be at fault. Zeroes
+      // mean something more fundamental is wrong here than in the
+      // testbed, where this same path works.
+      if (cClearView != nullptr) {
+        VkClearValue magenta = { };
+        magenta.color.float32[0] = 1.0f;
+        magenta.color.float32[1] = 0.0f;
+        magenta.color.float32[2] = 1.0f;
+        magenta.color.float32[3] = 1.0f;
+
+        ctx->clearImageView(cClearView,
+          VkOffset3D{ 0, 0, 0 }, cExtent,
+          VK_IMAGE_ASPECT_COLOR_BIT, magenta);
+      }
 
       ctx->copyImageToBuffer(cBuffer, 0, 0, 0,
         VK_FORMAT_R8G8B8A8_UNORM, cImage, sub,
@@ -1671,6 +1780,9 @@ namespace dxvk {
     // wholesale overwrite. Generalises to checkerboard tiles once the
     // partial copy is proven; a single strip is far easier to confirm
     // by eye than a tile pattern.
+    if (extentMismatch)
+      return;
+
     bool splitComposite = env::getEnvVar("DXVK_MGPU_NO_SPLIT") != "1";
 
     EmitCs([
