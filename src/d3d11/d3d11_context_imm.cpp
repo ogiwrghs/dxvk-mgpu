@@ -1560,6 +1560,7 @@ namespace dxvk {
       VkImageSubresourceLayers sub = { };
       sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
       sub.layerCount = 1;
+
       ctx->copyImageToBuffer(cBuffer, 0, 0, 0,
         VK_FORMAT_R8G8B8A8_UNORM, cImage, sub,
         VkOffset3D{ 0, 0, 0 }, cExtent);
@@ -1570,6 +1571,20 @@ namespace dxvk {
 
       if (t) Logger::warn(str::format("  worker chunk ", s_exec, ": flushed"));
     });
+
+    // Transport test, temporary. Fill the shared pages with a byte the
+    // GPU would never produce, then read them back after the copy. If
+    // the poison survives, nothing wrote to the memory being read and
+    // the copy is landing elsewhere. If it comes back zeroed, the GPU
+    // did write, and it wrote zeroes.
+    bool poison = env::getEnvVar("DXVK_MGPU_TEST_POISON") == "1";
+
+    if (poison && m_sharedHostMem) {
+      static uint32_t s_poisonOnce = 0;
+
+      if (s_poisonOnce++ < 3u)
+        std::memset(m_sharedHostMem, 0xAB, size_t(imageBytes));
+    }
 
     uint64_t seq = m_workerCsThread->dispatchChunk(std::move(download));
 
@@ -1594,6 +1609,19 @@ namespace dxvk {
     // the read and the log line. Several positions rather than one, so
     // a cleared background can be told apart from geometry covering
     // part of the frame. Enable with DXVK_MGPU_DEBUG_DRAW=1.
+    if (poison && m_sharedHostMem) {
+      static uint32_t s_poison = 0;
+
+      if (s_poison++ < 8u) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(m_sharedHostMem);
+        size_t mid = size_t(imageBytes) / 2u;
+
+        Logger::warn(str::format("POISON first=", uint32_t(p[0]),
+          " mid=", uint32_t(p[mid]),
+          " last=", uint32_t(p[size_t(imageBytes) - 1u])));
+      }
+    }
+
     if (unlikely(m_workerDrawDebug)) {
       static uint32_t s_readbackCount = 0;
 
