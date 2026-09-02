@@ -3382,7 +3382,7 @@ namespace dxvk {
         for (uint32_t i = 0; i < attributeCount + bindingCount; i++)
           inputs[i] = m_state.ia.inputLayout->GetInput(i);
 
-        bool noLayout = env::getEnvVar("DXVK_MGPU_NO_LAYOUT") == "1";
+        bool noLayout = GetTypedContext()->NoLayout();
 
         GetTypedContext()->EmitWorkerCs([
           cInputs         = inputs,
@@ -3696,7 +3696,7 @@ namespace dxvk {
 
           if constexpr (!IsDeferred)
             splitFrame = GetTypedContext()->HasWorkerDevice()
-                      && env::getEnvVar("DXVK_MGPU_NO_SCISSOR") != "1";
+                      && !GetTypedContext()->NoScissor();
 
           dst->scissor.offset = VkOffset2D { 0, 0 };
           dst->scissor.extent = VkExtent2D {
@@ -3736,7 +3736,7 @@ namespace dxvk {
           dst.viewport.maxDepth = vp.MaxDepth;
 
           if (!enableScissorTest) {
-            int32_t splitY = env::getEnvVar("DXVK_MGPU_NO_SCISSOR") == "1"
+            int32_t splitY = GetTypedContext()->NoScissor()
                            ? 0 : int32_t(vp.Height * 0.5f);
 
             dst.scissor.offset = VkOffset2D { 0, splitY };

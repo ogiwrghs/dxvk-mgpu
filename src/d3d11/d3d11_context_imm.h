@@ -132,6 +132,8 @@ namespace dxvk {
     bool                    m_workerFlushDebug = false;
     bool                    m_workerDrawDebug = false;
     bool                    m_workerMapDebug = false;
+    bool                    m_noScissor = false;
+    bool                    m_noLayout = false;
 
     // Per-frame Map traffic, used to size the constant/dynamic buffer
     // mirroring problem before choosing how to solve it.
@@ -312,8 +314,13 @@ namespace dxvk {
     void EmitWorkerBindFramebuffer(
             DxvkRenderTargets&&         Targets);
 
+    bool NoScissor() const { return m_noScissor; }
+
+    bool NoLayout() const { return m_noLayout; }
+
     void CompositeWorkerOutput(
-      const Rc<DxvkImage>&              DstImage);
+      const Rc<DxvkImage>&              DstImage,
+      const Rc<DxvkImage>&              SrcImage);
 
     bool CreateSharedHostStaging(
             VkDeviceSize                Size);

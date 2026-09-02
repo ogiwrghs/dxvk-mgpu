@@ -392,8 +392,10 @@ namespace dxvk {
     immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
 
     if (env::getEnvVar("DXVK_MGPU_NO_COMPOSITE") != "1") {
+      auto backBufferTexture = GetCommonTexture(m_backBuffers[0].ptr());
       immediateContext->CompositeWorkerOutput(
-        GetCommonTexture(m_backBuffers[0].ptr())->GetImage());
+        backBufferTexture->GetImage(),
+        backBufferTexture->GetWorkerImage());
     }
 
     m_presenter->setSyncInterval(SyncInterval);

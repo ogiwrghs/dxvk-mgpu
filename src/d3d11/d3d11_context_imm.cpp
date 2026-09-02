@@ -75,6 +75,8 @@ namespace dxvk {
       m_workerFlushDebug = env::getEnvVar("DXVK_MGPU_DEBUG_FLUSH") == "1";
       m_workerDrawDebug  = env::getEnvVar("DXVK_MGPU_DEBUG_DRAW") == "1";
       m_workerMapDebug   = env::getEnvVar("DXVK_MGPU_DEBUG_MAP") == "1";
+      m_noScissor        = env::getEnvVar("DXVK_MGPU_NO_SCISSOR") == "1";
+      m_noLayout         = env::getEnvVar("DXVK_MGPU_NO_LAYOUT") == "1";
       Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
     }
 
@@ -1466,7 +1468,8 @@ namespace dxvk {
 
 
   void D3D11ImmediateContext::CompositeWorkerOutput(
-    const Rc<DxvkImage>&        DstImage) {
+    const Rc<DxvkImage>&        DstImage,
+    const Rc<DxvkImage>&        SrcImage) {
     // Anything still batched must reach GPU1 before we read its image
     // back, or the composite copies a target whose mirrored work is
     // still sitting in an un-dispatched chunk. Doing this here rather
@@ -1481,8 +1484,18 @@ namespace dxvk {
 
     if (tr) Logger::warn(str::format("composite entry ", s_entry, ": after flush"));
 
-    if (!m_workerCsThread || m_workerFrameImage == nullptr || DstImage == nullptr)
+    if (!m_workerCsThread || DstImage == nullptr)
       return;
+
+    if (SrcImage == nullptr) {
+      static uint32_t s_noSrc = 0;
+
+      if (s_noSrc++ < 4u) {
+        Logger::warn("D3D11: back buffer has no worker image, skipping composite");
+      }
+
+      return;
+    }
 
     Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
 
@@ -1499,11 +1512,13 @@ namespace dxvk {
 
       if (s_c++ < 8u) {
         Logger::warn(str::format("COMPOSITE reading image = ",
+          reinterpret_cast<uintptr_t>(SrcImage.ptr()),
+          "  lastBind = ",
           reinterpret_cast<uintptr_t>(m_workerFrameImage.ptr())));
       }
     }
 
-    VkExtent3D   extent     = m_workerFrameImage->info().extent;
+    VkExtent3D   extent     = SrcImage->info().extent;
     VkDeviceSize imageBytes = VkDeviceSize(extent.width) * extent.height * 4u;
 
     if (extent != DstImage->info().extent) {
@@ -1533,7 +1548,7 @@ namespace dxvk {
 
     download->push([
       cBuffer = m_workerStaging,
-      cImage  = m_workerFrameImage,
+      cImage  = SrcImage,
       cExtent = extent,
       cStatus = &submitStatus
     ] (DxvkContext* ctx) {
