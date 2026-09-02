@@ -3466,14 +3466,6 @@ namespace dxvk {
       });
 
       if constexpr (!IsDeferred) {
-        {
-          static uint32_t s_bs = 0;
-
-          if (s_bs++ < 8u)
-            Logger::warn(str::format("BLENDMIRROR default #", s_bs,
-              " mask=", m_state.om.sampleMask));
-        }
-
         GetTypedContext()->EmitWorkerCs([
           cBlendState = m_state.om.cbState->GetBlendState(),
           cMsState    = m_state.om.cbState->GetMsState(m_state.om.sampleMask),
@@ -3500,14 +3492,6 @@ namespace dxvk {
       });
 
       if constexpr (!IsDeferred) {
-        {
-          static uint32_t s_bs = 0;
-
-          if (s_bs++ < 8u)
-            Logger::warn(str::format("BLENDMIRROR default #", s_bs,
-              " mask=", m_state.om.sampleMask));
-        }
-
         GetTypedContext()->EmitWorkerCs([
           cSampleMask = m_state.om.sampleMask
         ] (DxvkContext* ctx) {
