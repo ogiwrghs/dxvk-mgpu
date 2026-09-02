@@ -1620,18 +1620,42 @@ namespace dxvk {
     }
 
     // GPU0: primary host buffer -> the D3D11 back buffer image.
+    //
+    // First step towards selective compositing: copy only the bottom
+    // half of GPU1's output instead of the whole frame. Everything
+    // GPU0 rendered in the top half survives, which is directly
+    // visible in Superposition -- its UI is currently erased by the
+    // wholesale overwrite. Generalises to checkerboard tiles once the
+    // partial copy is proven; a single strip is far easier to confirm
+    // by eye than a tile pattern.
+    bool splitComposite = env::getEnvVar("DXVK_MGPU_NO_SPLIT") != "1";
+
     EmitCs([
       cImage  = DstImage,
       cBuffer = m_primaryStaging,
-      cExtent = extent
+      cExtent = extent,
+      cSplit  = splitComposite
     ] (DxvkContext* ctx) {
       VkImageSubresourceLayers sub = { };
       sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
       sub.layerCount = 1;
 
+      if (!cSplit) {
+        ctx->copyBufferToImage(cImage, sub,
+          VkOffset3D{ 0, 0, 0 }, cExtent,
+          cBuffer, 0, 0, 0,
+          VK_FORMAT_R8G8B8A8_UNORM);
+        return;
+      }
+
+      uint32_t splitY = cExtent.height / 2u;
+
+      VkExtent3D half = { cExtent.width, cExtent.height - splitY, 1u };
+      VkDeviceSize srcOffset = VkDeviceSize(splitY) * cExtent.width * 4u;
+
       ctx->copyBufferToImage(cImage, sub,
-        VkOffset3D{ 0, 0, 0 }, cExtent,
-        cBuffer, 0, 0, 0,
+        VkOffset3D{ 0, int32_t(splitY), 0 }, half,
+        cBuffer, srcOffset, 0, 0,
         VK_FORMAT_R8G8B8A8_UNORM);
     });
   }
