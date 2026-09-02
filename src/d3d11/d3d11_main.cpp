@@ -93,10 +93,25 @@ extern "C" {
       // dxvkAdapter itself may not always resolve to index 0.
       Rc<DxvkAdapter> workerAdapter;
       Rc<DxvkDevice>  workerDevice;
-      for (uint32_t i = 0; ; i++) {
+
+      // Single-GPU baseline. Skipping adapter discovery leaves
+      // m_workerDevice null, which every mirror path already guards
+      // against, so nothing is created, mirrored, scissored or
+      // composited. Needed to have anything meaningful to compare
+      // optimisation work against: DXVK_MGPU_NO_COMPOSITE only
+      // disables the transfer, leaving mirroring and the scissor
+      // split in place.
+      bool mgpuDisabled = env::getEnvVar("DXVK_MGPU_DISABLE") == "1";
+
+      if (mgpuDisabled)
+        Logger::warn("MGPU: disabled by env var, running single-GPU");
+
+      for (uint32_t i = 0; !mgpuDisabled; i++) {
         Rc<DxvkAdapter> candidate = dxvkInstance->enumAdapters(i);
+
         if (candidate == nullptr)
           break;
+
         if (candidate != dxvkAdapter) {
           workerAdapter = candidate;
           break;

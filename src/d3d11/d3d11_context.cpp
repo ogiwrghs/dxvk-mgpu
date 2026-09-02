@@ -3679,10 +3679,21 @@ namespace dxvk {
           // worker the bottom. Same viewport on both -- only the
           // scissor differs, so the projection is untouched and each
           // device simply discards fragments outside its region.
+          //
+          // Guarded on there actually being a worker: with multi-GPU
+          // off the primary must still cover the whole frame, or the
+          // single-GPU baseline renders half a screen.
+          bool splitFrame = false;
+
+          if constexpr (!IsDeferred)
+            splitFrame = GetTypedContext()->HasWorkerDevice();
+
           dst->scissor.offset = VkOffset2D { 0, 0 };
           dst->scissor.extent = VkExtent2D {
             D3D11_VIEWPORT_BOUNDS_MAX,
-            uint32_t(std::max(1.0f, vp.Height * 0.5f)) };
+            splitFrame
+              ? uint32_t(std::max(1.0f, vp.Height * 0.5f))
+              : D3D11_VIEWPORT_BOUNDS_MAX };
         } else if (i < m_state.rs.numScissors) {
           const auto& sr = m_state.rs.scissors[i];
 
