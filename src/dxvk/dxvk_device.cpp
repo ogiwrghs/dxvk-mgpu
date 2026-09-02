@@ -1,3 +1,6 @@
+#include <map>
+#include <mutex>
+
 #include "dxvk_device.h"
 #include "dxvk_instance.h"
 #include "dxvk_latency_builtin.h"
@@ -647,6 +650,27 @@ namespace dxvk {
         Logger::warn(str::format("SUBMIT dev=",
           reinterpret_cast<uintptr_t>(this->handle()),
           " draws=", commandList->statCounters().getCtr(DxvkStatCounter::CmdDrawCalls)));
+      }
+
+      // Steady-state visibility: the capped log above is exhausted
+      // during startup, so it never shows the real workload. This
+      // accumulates per device and reports periodically at constant
+      // cost, which is what a 500-draw-per-frame scene needs.
+      static std::mutex          s_periodicMutex;
+      static std::map<uintptr_t, std::pair<uint64_t, uint64_t>> s_periodic;
+
+      uintptr_t dev = reinterpret_cast<uintptr_t>(this->handle());
+      uint64_t  drawsThis = commandList->statCounters().getCtr(DxvkStatCounter::CmdDrawCalls);
+
+      std::lock_guard<std::mutex> periodicLock(s_periodicMutex);
+      auto& entry = s_periodic[dev];
+      entry.first  += 1u;
+      entry.second += drawsThis;
+
+      if ((entry.first % 600u) == 0u) {
+        Logger::warn(str::format("SUBMITSUM dev=", dev,
+          " submissions=", entry.first,
+          " totalDraws=", entry.second));
       }
     }
 

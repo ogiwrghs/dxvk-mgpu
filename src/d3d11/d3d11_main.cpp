@@ -101,13 +101,31 @@ extern "C" {
       // optimisation work against: DXVK_MGPU_NO_COMPOSITE only
       // disables the transfer, leaving mirroring and the scissor
       // split in place.
-      bool mgpuDisabled = env::getEnvVar("DXVK_MGPU_DISABLE") == "1";
+      // Development convenience, not a rendering profile: Unigine's
+      // configuration launcher is a UI application that gains nothing
+      // from the split, and compositing into it leaves the window
+      // unreadable, so its own settings cannot be changed. Excluding
+      // it by name keeps the benchmark configurable while the
+      // composite is still wrong. This is exactly the per-application
+      // special-casing the project exists to avoid and has to go
+      // before any of this is real.
+      bool launcherExcluded = env::getExeName() == "launcher.exe";
 
-      if (mgpuDisabled)
+      bool mgpuDisabled = env::getEnvVar("DXVK_MGPU_DISABLE") == "1"
+                       || launcherExcluded;
+
+      if (launcherExcluded)
+        Logger::warn("MGPU: launcher.exe excluded by name, running single-GPU");
+      else if (mgpuDisabled)
         Logger::warn("MGPU: disabled by env var, running single-GPU");
 
       for (uint32_t i = 0; !mgpuDisabled; i++) {
         Rc<DxvkAdapter> candidate = dxvkInstance->enumAdapters(i);
+
+        Logger::warn(str::format("MGPU: candidate ", i, " = ",
+          reinterpret_cast<uintptr_t>(candidate.ptr()),
+          " primary = ", reinterpret_cast<uintptr_t>(dxvkAdapter.ptr()),
+          " instance = ", reinterpret_cast<uintptr_t>(dxvkInstance.ptr())));
 
         if (candidate == nullptr)
           break;
