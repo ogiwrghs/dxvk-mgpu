@@ -1289,6 +1289,12 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11Device::CreateDeferredContext(
           UINT                        ContextFlags,
           ID3D11DeviceContext**       ppDeferredContext) {
+    // Deferred contexts are not mirrored: every worker path is guarded
+    // by if constexpr (!IsDeferred). Anything an application renders
+    // through one is invisible to GPU1, so knowing whether they are in
+    // use at all decides whether that guard is a real gap.
+    Logger::warn("MGPU: CreateDeferredContext called");
+
     *ppDeferredContext = ref(new D3D11DeferredContext(this, m_dxvkDevice, ContextFlags));
     return S_OK;
   }

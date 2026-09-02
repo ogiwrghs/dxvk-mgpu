@@ -1582,7 +1582,7 @@ namespace dxvk {
     if (unlikely(m_workerDrawDebug)) {
       static uint32_t s_readbackCount = 0;
 
-      if ((s_readbackCount++ % 120u) == 0u && m_sharedHostMem) {
+      if ((s_readbackCount++ % 30u) == 0u && m_sharedHostMem) {
         const uint8_t* px = reinterpret_cast<const uint8_t*>(m_sharedHostMem);
         uint32_t w = extent.width;
         uint32_t h = extent.height;

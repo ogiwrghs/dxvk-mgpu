@@ -281,6 +281,8 @@ namespace dxvk {
           UINT                              CopyFlags) {
     D3D10DeviceLock lock = LockContext();
 
+
+    
     if (!pDstResource || !pSrcResource)
       return;
 
@@ -352,6 +354,8 @@ namespace dxvk {
           ID3D11Resource*                   pDstResource,
           ID3D11Resource*                   pSrcResource) {
     D3D10DeviceLock lock = LockContext();
+
+
 
     if (!pDstResource || !pSrcResource || (pDstResource == pSrcResource))
       return;
@@ -873,6 +877,8 @@ namespace dxvk {
           DXGI_FORMAT                       Format) {
     D3D10DeviceLock lock = LockContext();
 
+ 
+
     bool isSameSubresource = pDstResource   == pSrcResource
                           && DstSubresource == SrcSubresource;
 
@@ -1237,6 +1243,7 @@ namespace dxvk {
       return;
 
     AddCost(GpuCostEstimate::Dispatch);
+
 
     if (unlikely(HasDirtyComputeBindings()))
       ApplyDirtyComputeBindings();
@@ -2184,6 +2191,8 @@ namespace dxvk {
           ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
     const UINT*                             pUAVInitialCounts) {
     D3D10DeviceLock lock = LockContext();
+
+
 
     if (TestRtvUavHazards(0, nullptr, NumUAVs, ppUnorderedAccessViews))
       return;
@@ -3686,7 +3695,8 @@ namespace dxvk {
           bool splitFrame = false;
 
           if constexpr (!IsDeferred)
-            splitFrame = GetTypedContext()->HasWorkerDevice();
+            splitFrame = GetTypedContext()->HasWorkerDevice()
+                      && env::getEnvVar("DXVK_MGPU_NO_SCISSOR") != "1";
 
           dst->scissor.offset = VkOffset2D { 0, 0 };
           dst->scissor.extent = VkExtent2D {
@@ -3726,7 +3736,8 @@ namespace dxvk {
           dst.viewport.maxDepth = vp.MaxDepth;
 
           if (!enableScissorTest) {
-            int32_t splitY = int32_t(vp.Height * 0.5f);
+            int32_t splitY = env::getEnvVar("DXVK_MGPU_NO_SCISSOR") == "1"
+                           ? 0 : int32_t(vp.Height * 0.5f);
 
             dst.scissor.offset = VkOffset2D { 0, splitY };
             dst.scissor.extent = VkExtent2D {
@@ -4020,6 +4031,52 @@ namespace dxvk {
 
       if constexpr (!IsDeferred)
         workerAttachments.depth.view = m_state.om.dsv->GetWorkerImageView();
+    }
+
+    if constexpr (!IsDeferred) {
+      static uint32_t s_fb = 0;
+
+      if (s_fb++ < 40u) {
+        uint32_t primaryRtv = 0;
+        uint32_t workerRtv  = 0;
+
+        for (UINT i = 0; i < m_state.om.rtvs.size(); i++) {
+          if (attachments.color[i].view != nullptr)
+            primaryRtv++;
+
+          if (workerAttachments.color[i].view != nullptr)
+            workerRtv++;
+        }
+
+        Logger::warn(str::format("FBMIRROR #", s_fb,
+          " primaryRtv=", primaryRtv,
+          " workerRtv=", workerRtv,
+          " primaryDsv=", attachments.depth.view != nullptr,
+          " workerDsv=", workerAttachments.depth.view != nullptr));
+      }
+    }
+
+    if constexpr (!IsDeferred) {
+      static uint32_t s_fb = 0;
+
+      if (s_fb++ < 40u) {
+        uint32_t primaryRtv = 0;
+        uint32_t workerRtv  = 0;
+
+        for (UINT i = 0; i < m_state.om.rtvs.size(); i++) {
+          if (attachments.color[i].view != nullptr)
+            primaryRtv++;
+
+          if (workerAttachments.color[i].view != nullptr)
+            workerRtv++;
+        }
+
+        Logger::warn(str::format("FBMIRROR #", s_fb,
+          " primaryRtv=", primaryRtv,
+          " workerRtv=", workerRtv,
+          " primaryDsv=", attachments.depth.view != nullptr,
+          " workerDsv=", workerAttachments.depth.view != nullptr));
+      }
     }
 
     // Create and bind the framebuffer object to the context
