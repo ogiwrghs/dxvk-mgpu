@@ -3675,10 +3675,14 @@ namespace dxvk {
         dst->viewport.maxDepth = vp.MaxDepth;
 
         if (!enableScissorTest) {
+          // Split-frame rendering: the primary takes the top half, the
+          // worker the bottom. Same viewport on both -- only the
+          // scissor differs, so the projection is untouched and each
+          // device simply discards fragments outside its region.
           dst->scissor.offset = VkOffset2D { 0, 0 };
           dst->scissor.extent = VkExtent2D {
             D3D11_VIEWPORT_BOUNDS_MAX,
-            D3D11_VIEWPORT_BOUNDS_MAX };
+            uint32_t(std::max(1.0f, vp.Height * 0.5f)) };
         } else if (i < m_state.rs.numScissors) {
           const auto& sr = m_state.rs.scissors[i];
 
@@ -3711,7 +3715,9 @@ namespace dxvk {
           dst.viewport.maxDepth = vp.MaxDepth;
 
           if (!enableScissorTest) {
-            dst.scissor.offset = VkOffset2D { 0, 0 };
+            int32_t splitY = int32_t(vp.Height * 0.5f);
+
+            dst.scissor.offset = VkOffset2D { 0, splitY };
             dst.scissor.extent = VkExtent2D {
               D3D11_VIEWPORT_BOUNDS_MAX,
               D3D11_VIEWPORT_BOUNDS_MAX };
