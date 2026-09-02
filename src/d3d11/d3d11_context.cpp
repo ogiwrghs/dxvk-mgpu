@@ -4491,10 +4491,31 @@ namespace dxvk {
         });
 
         if constexpr (!IsDeferred) {
+          Rc<DxvkImageView> workerSrv = pResource->GetWorkerImageView();
+
+          // A null worker view here binds nothing and the shader
+          // samples nothing, with no error anywhere. That is
+          // indistinguishable from a correct bind until the output
+          // turns out empty, which is the failure being chased in
+          // Superposition's final blit.
+          if (workerSrv == nullptr) {
+            static uint32_t s_nullSrv = 0;
+
+            if (s_nullSrv++ < 24u) {
+              auto primaryView = pResource->GetImageView();
+
+              Logger::warn(str::format("SRVNULL slot=", slotId,
+                " primaryView=",
+                reinterpret_cast<uintptr_t>(primaryView.ptr()),
+                " primaryImage=", primaryView != nullptr
+                  ? reinterpret_cast<uintptr_t>(primaryView->image()) : 0u));
+            }
+          }
+
           GetTypedContext()->EmitWorkerCs([
             cSlotId = slotId,
             cStage  = GetShaderStage(ShaderStage),
-            cView   = pResource->GetWorkerImageView()
+            cView   = workerSrv
           ] (DxvkContext* ctx) mutable {
             ctx->bindResourceImageView(cStage, cSlotId,
               Forwarder::move(cView));
