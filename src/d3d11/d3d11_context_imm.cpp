@@ -891,6 +891,52 @@ namespace dxvk {
     }
 
     std::memcpy(reinterpret_cast<char*>(mapPtr) + Offset, pSrcData, Length);
+
+    // Mirror to the worker's copy of the buffer. This is the direct-map
+    // fast path UpdateSubresource takes for constant buffers, and the
+    // single most-called D3D11 entry point in Superposition by a wide
+    // margin (4.6M calls in one run) -- unmirrored, every constant
+    // buffer on the worker device held whatever it was created with.
+    // Zeroed view-projection matrices collapse every vertex to a point,
+    // the pipeline runs and matches on both devices, and no fragment is
+    // ever produced. That is the actual cause of the black composite.
+    //
+    // copyBuffer rather than uploadBuffer even on the DISCARD branch:
+    // uploadBuffer requires the region not be in use by the GPU, which
+    // the NO_OVERWRITE branch explicitly violates by design, and using
+    // one path for both keeps this simple until it is measured.
+    {
+      DxvkBufferSlice workerSlice = pDstBuffer->GetWorkerBufferSlice(Offset, Length);
+
+      {
+        static std::atomic<uint64_t> s_hit  = { 0u };
+        static std::atomic<uint64_t> s_miss = { 0u };
+
+        uint64_t n = workerSlice.defined() ? ++s_hit : ++s_miss;
+
+        if (n <= 2u || (n % 500000u) == 0u) {
+          Logger::warn(str::format("UMBMIRROR ",
+            workerSlice.defined() ? "hit=" : "miss=", n,
+            " offset=", Offset, " length=", Length));
+        }
+      }
+
+      if (workerSlice.defined()) {
+        DxvkBufferSlice staging = m_workerStagingBuffer->alloc(Length);
+        std::memcpy(staging.mapPtr(0), pSrcData, Length);
+
+        EmitWorkerCs([
+          cDst     = std::move(workerSlice),
+          cStaging = std::move(staging),
+          cSize    = VkDeviceSize(Length)
+        ] (DxvkContext* ctx) {
+          ctx->copyBuffer(
+            cDst.buffer(), cDst.offset(),
+            cStaging.buffer(), cStaging.offset(),
+            cSize);
+        });
+      }
+    }
   }
 
 
