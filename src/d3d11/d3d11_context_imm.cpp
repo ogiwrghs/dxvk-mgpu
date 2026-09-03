@@ -548,6 +548,26 @@ namespace dxvk {
           D3D11_MAPPED_SUBRESOURCE*   pMappedResource) {
     auto mapMode = pResource->GetMapMode();
 
+    // Counterpart to UPDATETEX. This path has no worker mirror either, so
+    // a texture written through Map/Unmap at runtime exists on GPU1 but
+    // holds stale contents from load time. Counting write maps separately
+    // from reads, since only writes leave the two devices out of step.
+    {
+      static std::atomic<uint64_t> s_mapImage = { 0u };
+
+      bool isWrite = MapType == D3D11_MAP_WRITE
+                  || MapType == D3D11_MAP_WRITE_DISCARD
+                  || MapType == D3D11_MAP_WRITE_NO_OVERWRITE
+                  || MapType == D3D11_MAP_READ_WRITE;
+
+      if (isWrite) {
+        uint64_t n = ++s_mapImage;
+
+        if (n <= 4u || (n % 2000u) == 0u)
+          Logger::warn(str::format("MAPIMAGEWRITE count=", n));
+      }
+    }
+
     if (pMappedResource)
       pMappedResource->pData = nullptr;
 
