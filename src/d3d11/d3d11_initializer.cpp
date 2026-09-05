@@ -128,7 +128,20 @@ namespace dxvk {
       ctx->copyBuffer(cIcbSlice.buffer(), cIcbSlice.offset(),
         cSrcSlice.buffer(), cSrcSlice.offset(), cIcbSlice.length());
     });
-
+    auto workerIcb = pShader->GetWorkerIcb();
+    if (m_workerDevice != nullptr && workerIcb.defined()) {
+      auto workerSrc = m_workerStagingBuffer->alloc(workerIcb.length());
+      std::memcpy(workerSrc.mapPtr(0), pIcbData, IcbSize);
+      if (IcbSize < workerIcb.length())
+        std::memset(workerSrc.mapPtr(IcbSize), 0, workerIcb.length() - IcbSize);
+      EmitWorkerCs([
+        cIcbSlice = std::move(workerIcb),
+        cSrcSlice = std::move(workerSrc)
+      ] (DxvkContext* ctx) {
+        ctx->copyBuffer(cIcbSlice.buffer(), cIcbSlice.offset(),
+          cSrcSlice.buffer(), cSrcSlice.offset(), cIcbSlice.length());
+      });
+    }
     ThrottleAllocationLocked();
   }
 

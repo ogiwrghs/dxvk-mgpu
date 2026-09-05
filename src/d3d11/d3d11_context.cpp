@@ -4048,11 +4048,14 @@ namespace dxvk {
       auto shader = pShaderModule->GetShader();
       if constexpr (!IsDeferred) {
         if (buffer.defined()) {
-          static std::atomic<uint64_t> s_icb = { 0u };
-          uint64_t n = ++s_icb;
-          if (n <= 4u || (n % 10000u) == 0u) {
-            Logger::warn(str::format("ICBMIRROR miss=", n,
-              " stage=", uint32_t(ShaderStage), " unmirrored"));
+          bool mirrored = pShaderModule->GetWorkerIcb().defined();
+          static std::atomic<uint64_t> s_hit  = { 0u };
+          static std::atomic<uint64_t> s_miss = { 0u };
+          uint64_t n = mirrored ? ++s_hit : ++s_miss;
+          if (n <= 4u || (n % 500u) == 0u) {
+            Logger::warn(str::format("ICBMIRROR ",
+              mirrored ? "hit=" : "miss=", n,
+              " stage=", uint32_t(ShaderStage)));
           }
         }
       }
@@ -4078,25 +4081,22 @@ namespace dxvk {
       // object binds correctly on both devices. Copying the Rc costs
       // one atomic increment, not a shader copy.
       //
-      // The ICB slice is a genuine per-device buffer and is NOT
-      // mirrored: it only exists for shaders with constant arrays
-      // large enough to require lowering, which nothing under test
-      // currently produces. Binding the primary device's slice on the
-      // worker would be a cross-device resource reference, so the
-      // worker gets an empty slice and that path stays unmirrored
-      // until there is a workload that exercises it.
+      // The ICB is a genuine per-device buffer. D3D11CommonShader
+      // creates a worker copy alongside the primary one and the
+      // initializer uploads the same bytes to both, so the worker
+      // binds its own slice here. Superposition's vertex shaders use
+      // it; the testbed does not.
       if constexpr (!IsDeferred) {
         GetTypedContext()->EmitWorkerCs([
-          cShader = shader
+          cShader = shader,
+          cBuffer = pShaderModule->GetWorkerIcb()
         ] (DxvkContext* ctx) mutable {
           constexpr VkShaderStageFlagBits stage = GetShaderStage(ShaderStage);
-
           uint32_t slotId = D3D11ShaderResourceMapping::computeCbvBinding(ShaderStage,
             D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT);
-
           ctx->bindShader<stage>(
             Forwarder::move(cShader));
-          ctx->bindUniformBuffer(stage, slotId, DxvkBufferSlice());
+          ctx->bindUniformBuffer(stage, slotId, Forwarder::move(cBuffer));
         });
       }
 

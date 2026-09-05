@@ -258,7 +258,9 @@ namespace dxvk {
       info.debugName = "Icb";
 
       m_buffer = pDevice->GetDXVKDevice()->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
+      Rc<DxvkDevice> workerDevice = pDevice->GetWorkerDXVKDevice();
+      if (workerDevice != nullptr)
+        m_workerBuffer = workerDevice->createBuffer(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
       pDevice->InitShaderIcb(this, icbSizeInBytes, Icb.data);
     }
 

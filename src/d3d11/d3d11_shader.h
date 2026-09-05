@@ -161,6 +161,11 @@ namespace dxvk {
         ? DxvkBufferSlice(m_buffer)
         : DxvkBufferSlice();
     }
+    DxvkBufferSlice GetWorkerIcb() const {
+      return m_workerBuffer != nullptr
+        ? DxvkBufferSlice(m_workerBuffer)
+        : DxvkBufferSlice();
+    }
     
     std::string GetName() const {
       return m_shader->debugName();
@@ -180,6 +185,7 @@ namespace dxvk {
 
     Rc<DxvkShader> m_shader;
     Rc<DxvkBuffer> m_buffer;
+    Rc<DxvkBuffer> m_workerBuffer;
 
     D3D11BindingMask    m_bindings = { };
     D3D11InterfaceInfo  m_interfaces = { };
