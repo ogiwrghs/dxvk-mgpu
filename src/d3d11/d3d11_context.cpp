@@ -924,6 +924,24 @@ namespace dxvk {
     (DxvkContext* ctx) {
       ctx->generateMipmaps(cDstImageView, VK_FILTER_LINEAR);
     });
+    if constexpr (!IsDeferred) {
+      Rc<DxvkImageView> workerView = view->GetWorkerImageView();
+      {
+        static std::atomic<uint64_t> s_hit  = { 0u };
+        static std::atomic<uint64_t> s_miss = { 0u };
+        uint64_t n = workerView != nullptr ? ++s_hit : ++s_miss;
+        if (n <= 2u || (n % 10000u) == 0u) {
+          Logger::warn(str::format("GENMIPSMIRROR ",
+            workerView != nullptr ? "hit=" : "miss=", n));
+        }
+      }
+      if (workerView != nullptr) {
+        GetTypedContext()->EmitWorkerCs([cDstImageView = std::move(workerView)]
+        (DxvkContext* ctx) {
+          ctx->generateMipmaps(cDstImageView, VK_FILTER_LINEAR);
+        });
+      }
+    }
   }
 
 
@@ -4028,6 +4046,16 @@ namespace dxvk {
     if (pShaderModule) {
       auto buffer = pShaderModule->GetIcb();
       auto shader = pShaderModule->GetShader();
+      if constexpr (!IsDeferred) {
+        if (buffer.defined()) {
+          static std::atomic<uint64_t> s_icb = { 0u };
+          uint64_t n = ++s_icb;
+          if (n <= 4u || (n % 10000u) == 0u) {
+            Logger::warn(str::format("ICBMIRROR miss=", n,
+              " stage=", uint32_t(ShaderStage), " unmirrored"));
+          }
+        }
+      }
 
       if (unlikely(shader->needsCompile()))
         m_device->requestCompileShader(shader);
