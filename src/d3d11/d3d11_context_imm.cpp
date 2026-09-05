@@ -77,6 +77,8 @@ namespace dxvk {
       m_workerMapDebug   = env::getEnvVar("DXVK_MGPU_DEBUG_MAP") == "1";
       m_noScissor        = env::getEnvVar("DXVK_MGPU_NO_SCISSOR") == "1";
       m_noLayout         = env::getEnvVar("DXVK_MGPU_NO_LAYOUT") == "1";
+      m_cbReadEnabled    = env::getEnvVar("DXVK_MGPU_TEST_CBREAD") == "1";
+      m_cbPoisonEnabled  = env::getEnvVar("DXVK_MGPU_TEST_CBPOISON") == "1";
       Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
     }
 
@@ -924,7 +926,19 @@ namespace dxvk {
       if (workerSlice.defined()) {
         DxvkBufferSlice staging = m_workerStagingBuffer->alloc(Length);
         std::memcpy(staging.mapPtr(0), pSrcData, Length);
-
+        if (m_cbReadEnabled && !m_cbReadValid && Length >= 16u) {
+          m_cbReadBuffer = workerSlice.buffer();
+          m_cbReadOffset = workerSlice.offset();
+          DxvkBufferSlice primarySlice = pDstBuffer->GetBufferSlice(Offset, Length);
+          m_cbReadPrimary       = primarySlice.buffer();
+          m_cbReadPrimaryOffset = primarySlice.offset();
+          std::memcpy(m_cbReadExpect, pSrcData, 16u);
+          m_cbReadValid  = true;
+          Logger::warn(str::format("CBREAD latched offset=", m_cbReadOffset,
+            " length=", Length,
+            " workerMap=", m_cbReadBuffer->mapPtr(0),
+            " primaryMap=", m_cbReadPrimary->mapPtr(0)));
+        }
         EmitWorkerCs([
           cDst     = std::move(workerSlice),
           cStaging = std::move(staging),
@@ -1776,8 +1790,39 @@ namespace dxvk {
 
     workerDevice->waitForSubmission(&submitStatus);
     auto t2 = dxvk::high_resolution_clock::now();
-
     if (trace) Logger::warn(str::format("composite ", s_phase, ": submission done"));
+    uint32_t cbReadIndex = m_cbReadValid ? m_cbReadCount++ : 0u;
+    if (m_cbReadEnabled && m_cbReadValid
+     && (cbReadIndex < 12u || (cbReadIndex % 30u) == 0u)) {
+      const uint8_t* wp = reinterpret_cast<const uint8_t*>(
+        m_cbReadBuffer->mapPtr(0));
+      const uint8_t* pp = reinterpret_cast<const uint8_t*>(
+        m_cbReadPrimary->mapPtr(0));
+      if (wp && pp) {
+        wp += m_cbReadOffset;
+        pp += m_cbReadPrimaryOffset;
+        std::string got;
+        std::string want;
+        for (uint32_t i = 0; i < 16u; i++) {
+          got  += str::format(uint32_t(wp[i]), " ");
+          want += str::format(uint32_t(pp[i]), " ");
+        }
+        bool ok = std::memcmp(wp, pp, 16u) == 0;
+        Logger::warn(str::format("CBREAD ", ok ? "match" : "MISMATCH",
+          " n=", cbReadIndex,
+          " workerMap=", m_cbReadBuffer->mapPtr(0),
+          " primaryMap=", m_cbReadPrimary->mapPtr(0),
+          " worker=[ ", got, "] primary=[ ", want, "]"));
+      } else {
+        Logger::warn(str::format("CBREAD skipped: mapPtr worker=",
+          wp != nullptr, " primary=", pp != nullptr));
+      }
+    }
+    if (m_cbPoisonEnabled && m_cbReadValid) {
+      uint8_t* poisonPtr = reinterpret_cast<uint8_t*>(m_cbReadBuffer->mapPtr(0));
+      if (poisonPtr)
+        std::memset(poisonPtr + m_cbReadOffset, 0xFF, 16u);
+    }
 
     // Opt-in: sample a few pixels of what GPU1 actually produced. The
     // data is already in shared host memory here, so the only cost is
@@ -1818,6 +1863,8 @@ namespace dxvk {
       }
     }
 
+    if (m_sharedHostMem && env::getEnvVar("DXVK_MGPU_TEST_IMGPOISON") == "1")
+      std::memset(m_sharedHostMem, 0xAB, size_t(imageBytes));
     // No copy here any more: both devices are bound to the same host pages,
     // so whatever GPU1 wrote is already visible to GPU0.
     uint64_t syncUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();

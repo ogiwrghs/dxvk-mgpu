@@ -206,6 +206,16 @@ namespace dxvk {
     void*                   m_mappedWorkerPtr = nullptr;
     VkDeviceSize            m_mappedWorkerSize = 0u;
 
+    Rc<DxvkBuffer>          m_cbReadBuffer = nullptr;
+    VkDeviceSize            m_cbReadOffset = 0u;
+    uint8_t                 m_cbReadExpect[16] = { };
+    bool                    m_cbReadValid = false;
+    bool                    m_cbReadEnabled = false;
+    uint32_t                m_cbReadCount = 0u;
+    Rc<DxvkBuffer>          m_cbReadPrimary = nullptr;
+    VkDeviceSize            m_cbReadPrimaryOffset = 0u;
+    bool                    m_cbPoisonEnabled = false;
+
     Rc<sync::CallbackFence> m_submissionFence;
     uint64_t                m_submissionId = 0ull;
     DxvkSubmitStatus        m_submitStatus;
