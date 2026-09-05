@@ -40,6 +40,13 @@ namespace dxvk {
 
   std::atomic<MgpuCallCounter*> MgpuCallCounter::s_head = { nullptr };
 
+  void MgpuDumpCallCounters() {
+    for (auto* c = MgpuCallCounter::s_head.load(); c; c = c->next) {
+      Logger::warn(str::format("MGPUCALLS ", c->name,
+        " count=", c->count.load()));
+    }
+  }
+
 }
 #include "d3d11_context_def.h"
 #include "d3d11_context_imm.h"
@@ -4952,6 +4959,43 @@ namespace dxvk {
       }
     });
 
+    if constexpr (!IsDeferred) {
+      DxvkBufferSlice workerDst = pDstBuffer->GetWorkerBufferSlice(DstOffset, ByteCount);
+      DxvkBufferSlice workerSrc = pSrcBuffer->GetWorkerBufferSlice(SrcOffset, ByteCount);
+      bool mirrored = workerDst.defined() && workerSrc.defined();
+      {
+        static std::atomic<uint64_t> s_hit  = { 0u };
+        static std::atomic<uint64_t> s_miss = { 0u };
+        uint64_t n = mirrored ? ++s_hit : ++s_miss;
+        if (n <= 2u || (n % 10000u) == 0u) {
+          Logger::warn(str::format("COPYBUFMIRROR ",
+            mirrored ? "hit=" : "miss=", n,
+            " bytes=", ByteCount));
+        }
+      }
+      if (mirrored) {
+        GetTypedContext()->EmitWorkerCs([
+          cDstBuffer = std::move(workerDst),
+          cSrcBuffer = std::move(workerSrc)
+        ] (DxvkContext* ctx) {
+          if (cDstBuffer.buffer() != cSrcBuffer.buffer()) {
+            ctx->copyBuffer(
+              cDstBuffer.buffer(),
+              cDstBuffer.offset(),
+              cSrcBuffer.buffer(),
+              cSrcBuffer.offset(),
+              cSrcBuffer.length());
+          } else {
+            ctx->copyBufferRegion(
+              cDstBuffer.buffer(),
+              cDstBuffer.offset(),
+              cSrcBuffer.offset(),
+              cSrcBuffer.length());
+          }
+        });
+      }
+    }
+
     if (pDstBuffer->HasSequenceNumber())
       GetTypedContext()->TrackBufferSequenceNumber(pDstBuffer);
     if (pSrcBuffer->HasSequenceNumber())
@@ -5055,7 +5099,51 @@ namespace dxvk {
             cSrcOffset, cExtent);
         }
       });
+      if constexpr (!IsDeferred) {
+        Rc<DxvkImage> workerDst = pDstTexture->GetWorkerImage();
+        Rc<DxvkImage> workerSrc = pSrcTexture->GetWorkerImage();
+        bool mirrored = workerDst != nullptr && workerSrc != nullptr;
+        {
+          static std::atomic<uint64_t> s_hit  = { 0u };
+          static std::atomic<uint64_t> s_miss = { 0u };
+          uint64_t n = mirrored ? ++s_hit : ++s_miss;
+          if (n <= 4u || (n % 10000u) == 0u) {
+            Logger::warn(str::format("COPYIMGMIRROR ",
+              mirrored ? "hit=" : "miss=", n,
+              " extent=", SrcExtent.width, "x", SrcExtent.height, "x", SrcExtent.depth,
+              " mip=", pSrcLayers->mipLevel, "->", pDstLayers->mipLevel));
+          }
+        }
+        if (mirrored) {
+          GetTypedContext()->EmitWorkerCs([
+            cDstImage  = std::move(workerDst),
+            cSrcImage  = std::move(workerSrc),
+            cDstLayers = *pDstLayers,
+            cSrcLayers = *pSrcLayers,
+            cDstOffset = DstOffset,
+            cSrcOffset = SrcOffset,
+            cExtent    = SrcExtent
+          ] (DxvkContext* ctx) {
+            if (cDstImage != cSrcImage || cDstLayers != cSrcLayers) {
+              ctx->copyImage(
+                cDstImage, cDstLayers, cDstOffset,
+                cSrcImage, cSrcLayers, cSrcOffset,
+                cExtent);
+            } else {
+              ctx->copyImageRegion(
+                cDstImage, cDstLayers, cDstOffset,
+                cSrcOffset, cExtent);
+            }
+          });
+        }
+      }
     } else {
+      if constexpr (!IsDeferred) {
+        static std::atomic<uint64_t> s_staging = { 0u };
+        uint64_t n = ++s_staging;
+        if (n <= 4u || (n % 10000u) == 0u)
+          Logger::warn(str::format("COPYIMGMIRROR staging=", n, " unmirrored"));
+      }
       // Since each subresource uses a dedicated buffer, we are going
       // to need one call per subresource for staging resource copies
       for (uint32_t i = 0; i < pDstLayers->layerCount; i++) {

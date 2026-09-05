@@ -1865,6 +1865,12 @@ namespace dxvk {
 
     if (m_sharedHostMem && env::getEnvVar("DXVK_MGPU_TEST_IMGPOISON") == "1")
       std::memset(m_sharedHostMem, 0xAB, size_t(imageBytes));
+    {
+      void MgpuDumpCallCounters();
+      static uint32_t s_censusTick = 0u;
+      if ((++s_censusTick % 3000u) == 0u)
+        MgpuDumpCallCounters();
+    }
     // No copy here any more: both devices are bound to the same host pages,
     // so whatever GPU1 wrote is already visible to GPU0.
     uint64_t syncUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
