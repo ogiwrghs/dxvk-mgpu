@@ -133,6 +133,7 @@ namespace dxvk {
     bool                    m_workerDrawDebug = false;
     bool                    m_workerMapDebug = false;
     bool                    m_noScissor = false;
+    VkExtent2D              m_presentExtent = { 0u, 0u };
     bool                    m_noLayout = false;
 
     // Per-frame Map traffic, used to size the constant/dynamic buffer
@@ -327,6 +328,7 @@ namespace dxvk {
             DxvkRenderTargets&&         Targets);
 
     bool NoScissor() const { return m_noScissor; }
+    VkExtent2D PresentExtent() const { return m_presentExtent; }
 
     bool NoLayout() const { return m_noLayout; }
 

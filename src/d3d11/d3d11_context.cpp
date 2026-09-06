@@ -3841,6 +3841,29 @@ namespace dxvk {
   void D3D11CommonContext<ContextType>::ApplyViewportState() {
     uint32_t viewportCount = m_state.rs.numViewports;
 
+    // Split-frame rendering only makes sense for passes whose pixels
+    // map onto the final frame. Shadow maps, reflection probes,
+    // persistent textures and anything else rendered off-screen have
+    // no relationship to the top or bottom of the screen, and
+    // scissoring them to half a viewport leaves each device with a
+    // half-empty resource. The viewport is the only state that is
+    // guaranteed current here -- render target binds and viewport
+    // changes arrive in either order -- so the test is on its shape:
+    // a viewport within 5% of the swapchain's aspect ratio is treated
+    // as screen-space. Before the first present nothing is split.
+    auto ViewportIsScreenSpace = [this] (const D3D11_VIEWPORT& vp) {
+      if constexpr (IsDeferred) {
+        return false;
+      } else {
+        VkExtent2D ref = GetTypedContext()->PresentExtent();
+        if (!ref.width || !ref.height || vp.Width <= 0.0f || vp.Height <= 0.0f)
+          return false;
+        float a = vp.Width / vp.Height;
+        float r = float(ref.width) / float(ref.height);
+        return std::abs(a - r) < 0.05f * r;
+      }
+    };
+
     if (likely(viewportCount)) {
       EmitCsCmd<DxvkViewport>(D3D11CmdType::None, viewportCount,
         [] (DxvkContext* ctx, const DxvkViewport* viewports, size_t count) {
@@ -3876,9 +3899,21 @@ namespace dxvk {
           // single-GPU baseline renders half a screen.
           bool splitFrame = false;
 
-          if constexpr (!IsDeferred)
+          if constexpr (!IsDeferred) {
             splitFrame = GetTypedContext()->HasWorkerDevice()
-                      && !GetTypedContext()->NoScissor();
+                      && !GetTypedContext()->NoScissor()
+                      && ViewportIsScreenSpace(vp);
+            {
+              static std::atomic<uint64_t> s_split = { 0u };
+              static std::atomic<uint64_t> s_full  = { 0u };
+              uint64_t n = splitFrame ? ++s_split : ++s_full;
+              if (n <= 8u || (n % 100000u) == 0u) {
+                Logger::warn(str::format("SPLITDECIDE ",
+                  splitFrame ? "split=" : "full=", n,
+                  " vp=", uint32_t(vp.Width), "x", uint32_t(vp.Height)));
+              }
+            }
+          }
 
           dst->scissor.offset = VkOffset2D { 0, 0 };
           dst->scissor.extent = VkExtent2D {
@@ -3918,8 +3953,9 @@ namespace dxvk {
           dst.viewport.maxDepth = vp.MaxDepth;
 
           if (!enableScissorTest) {
-            int32_t splitY = GetTypedContext()->NoScissor()
-                           ? 0 : int32_t(vp.Height * 0.5f);
+            bool workerSplit = !GetTypedContext()->NoScissor()
+                             && ViewportIsScreenSpace(vp);
+            int32_t splitY = workerSplit ? int32_t(vp.Height * 0.5f) : 0;
 
             dst.scissor.offset = VkOffset2D { 0, splitY };
             dst.scissor.extent = VkExtent2D {

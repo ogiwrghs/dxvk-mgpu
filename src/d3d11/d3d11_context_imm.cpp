@@ -1682,6 +1682,10 @@ namespace dxvk {
 
     VkExtent3D   extent     = readSource->info().extent;
     VkDeviceSize imageBytes = VkDeviceSize(extent.width) * extent.height * 4u;
+    if (m_presentExtent.width != extent.width || m_presentExtent.height != extent.height) {
+      m_presentExtent = VkExtent2D { extent.width, extent.height };
+      ApplyViewportState();
+    }
 
     // With the diagnostic gate on, the source is deliberately a
     // different size from the back buffer, so the mismatch is expected
