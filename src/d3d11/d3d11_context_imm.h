@@ -206,6 +206,7 @@ namespace dxvk {
     D3D11Buffer*            m_mappedWorkerBuffer = nullptr;
     void*                   m_mappedWorkerPtr = nullptr;
     VkDeviceSize            m_mappedWorkerSize = 0u;
+    bool                    m_mappedWorkerNoOverwrite = false;
 
     Rc<DxvkBuffer>          m_cbReadBuffer = nullptr;
     VkDeviceSize            m_cbReadOffset = 0u;

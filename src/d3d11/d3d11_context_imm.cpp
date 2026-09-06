@@ -397,19 +397,36 @@ namespace dxvk {
         DxvkBufferSlice staging = m_workerStagingBuffer->alloc(m_mappedWorkerSize);
         std::memcpy(staging.mapPtr(0), m_mappedWorkerPtr, m_mappedWorkerSize);
 
+        {
+          static std::atomic<uint64_t> s_discard = { 0u };
+          static std::atomic<uint64_t> s_noOvw   = { 0u };
+          uint64_t n = m_mappedWorkerNoOverwrite ? ++s_noOvw : ++s_discard;
+          uint64_t period = m_mappedWorkerNoOverwrite ? 500u : 100000u;
+          if (n <= 2u || (n % period) == 0u) {
+            Logger::warn(str::format("MAPMIRROR ",
+              m_mappedWorkerNoOverwrite ? "nooverwrite=" : "discard=", n,
+              " bytes=", m_mappedWorkerSize));
+          }
+        }
         EmitWorkerCs([
           cBuffer  = std::move(workerBuffer),
           cStaging = std::move(staging),
-          cSize    = m_mappedWorkerSize
+          cSize    = m_mappedWorkerSize,
+          cCopy    = m_mappedWorkerNoOverwrite
         ] (DxvkContext* ctx) {
-          ctx->uploadBuffer(cBuffer, 0u,
-            cStaging.buffer(), cStaging.offset(), cSize);
+          if (cCopy) {
+            ctx->copyBuffer(cBuffer, 0u,
+              cStaging.buffer(), cStaging.offset(), cSize);
+          } else {
+            ctx->uploadBuffer(cBuffer, 0u,
+              cStaging.buffer(), cStaging.offset(), cSize);
+          }
         });
       }
-
-      m_mappedWorkerBuffer = nullptr;
-      m_mappedWorkerPtr    = nullptr;
-      m_mappedWorkerSize   = 0u;
+      m_mappedWorkerBuffer      = nullptr;
+      m_mappedWorkerPtr         = nullptr;
+      m_mappedWorkerSize        = 0u;
+      m_mappedWorkerNoOverwrite = false;
     }
   }
 
@@ -459,9 +476,16 @@ namespace dxvk {
       pMappedResource->DepthPitch = bufferSize;
 
       if (m_workerCsThread && pResource->GetWorkerBuffer() != nullptr) {
-        m_mappedWorkerBuffer = pResource;
-        m_mappedWorkerPtr    = bufferSlice->mapPtr();
-        m_mappedWorkerSize   = bufferSize;
+        if (m_mappedWorkerBuffer != nullptr) {
+          static std::atomic<uint64_t> s_clobber = { 0u };
+          uint64_t n = ++s_clobber;
+          if (n <= 4u || (n % 10000u) == 0u)
+            Logger::warn(str::format("MAPMIRROR clobbered=", n));
+        }
+        m_mappedWorkerBuffer      = pResource;
+        m_mappedWorkerPtr         = bufferSlice->mapPtr();
+        m_mappedWorkerSize        = bufferSize;
+        m_mappedWorkerNoOverwrite = false;
       }
       
       EmitCs([
@@ -483,6 +507,18 @@ namespace dxvk {
       pMappedResource->pData      = pResource->GetMapPtr();
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
+      if (m_workerCsThread && pResource->GetWorkerBuffer() != nullptr) {
+        if (m_mappedWorkerBuffer != nullptr) {
+          static std::atomic<uint64_t> s_clobber = { 0u };
+          uint64_t n = ++s_clobber;
+          if (n <= 4u || (n % 10000u) == 0u)
+            Logger::warn(str::format("MAPMIRROR clobbered=", n));
+        }
+        m_mappedWorkerBuffer      = pResource;
+        m_mappedWorkerPtr         = pResource->GetMapPtr();
+        m_mappedWorkerSize        = bufferSize;
+        m_mappedWorkerNoOverwrite = true;
+      }
       return S_OK;
     } else {
       // Quantum Break likes using MAP_WRITE on resources which would force
