@@ -77,6 +77,7 @@ namespace dxvk {
       m_workerMapDebug   = env::getEnvVar("DXVK_MGPU_DEBUG_MAP") == "1";
       m_noScissor        = env::getEnvVar("DXVK_MGPU_NO_SCISSOR") == "1";
       m_noLayout         = env::getEnvVar("DXVK_MGPU_NO_LAYOUT") == "1";
+      m_noCompletionWait = env::getEnvVar("DXVK_MGPU_NO_COMPLETION_WAIT") == "1";
       m_cbReadEnabled    = env::getEnvVar("DXVK_MGPU_TEST_CBREAD") == "1";
       m_cbPoisonEnabled  = env::getEnvVar("DXVK_MGPU_TEST_CBPOISON") == "1";
       Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
@@ -1831,6 +1832,22 @@ namespace dxvk {
     workerDevice->waitForSubmission(&submitStatus);
     auto t2 = dxvk::high_resolution_clock::now();
     if (trace) Logger::warn(str::format("composite ", s_phase, ": submission done"));
+    // waitForSubmission only waits for the submission thread to hand
+    // the command list to the queue, not for GPU1 to execute it. The
+    // shared block is read on the CPU and by GPU0 immediately after
+    // this point, so the copy into it has to have actually completed.
+    // Wait on the buffer rather than the device: waitForIdle would
+    // also stall on every unrelated worker submission queued behind it.
+    if (!m_noCompletionWait)
+      workerDevice->waitForResource(*m_workerStaging, DxvkAccess::Write);
+    auto t2b = dxvk::high_resolution_clock::now();
+    if (trace) Logger::warn(str::format("composite ", s_phase, ": gpu complete"));
+    {
+      static uint32_t s_waitLog = 0;
+      uint64_t waitUs = std::chrono::duration_cast<std::chrono::microseconds>(t2b - t2).count();
+      if ((s_waitLog++ % 600u) == 0u)
+        Logger::warn(str::format("COMPLETIONWAIT ", waitUs, " us"));
+    }
     uint32_t cbReadIndex = m_cbReadValid ? m_cbReadCount++ : 0u;
     if (m_cbReadEnabled && m_cbReadValid
      && (cbReadIndex < 12u || (cbReadIndex % 30u) == 0u)) {
