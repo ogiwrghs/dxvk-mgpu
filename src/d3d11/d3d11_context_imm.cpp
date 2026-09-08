@@ -1943,7 +1943,17 @@ namespace dxvk {
     // so whatever GPU1 wrote is already visible to GPU0.
     uint64_t syncUs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
     uint64_t subUs  = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
-
+    uint64_t waitUs = std::chrono::duration_cast<std::chrono::microseconds>(t2b - t2).count();
+    {
+      static uint64_t s_accSync = 0, s_accSub = 0, s_accWait = 0;
+      static uint32_t s_accN = 0;
+      s_accSync += syncUs; s_accSub += subUs; s_accWait += waitUs;
+      if ((++s_accN % 600u) == 0u) {
+        Logger::warn(str::format("COMPOSITEPHASES avg over 600: cs sync ", s_accSync / 600u,
+          " us, submit ", s_accSub / 600u, " us, gpu wait ", s_accWait / 600u, " us"));
+        s_accSync = 0; s_accSub = 0; s_accWait = 0;
+      }
+    }
     m_compositeCount++;
     m_mapFrames++;
     m_compositeSyncSum += syncUs;
