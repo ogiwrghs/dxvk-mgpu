@@ -393,7 +393,7 @@ namespace dxvk {
 
     if (env::getEnvVar("DXVK_MGPU_NO_COMPOSITE") != "1") {
       auto backBufferTexture = GetCommonTexture(m_backBuffers[0].ptr());
-      if (env::getEnvVar("DXVK_MGPU_PIPELINE") == "1") {
+      if (env::getEnvVar("DXVK_MGPU_NO_PIPELINE") != "1") {
         immediateContext->CompositeWorkerOutputPipelined(
           backBufferTexture->GetImage(),
           backBufferTexture->GetWorkerImage());
