@@ -393,9 +393,15 @@ namespace dxvk {
 
     if (env::getEnvVar("DXVK_MGPU_NO_COMPOSITE") != "1") {
       auto backBufferTexture = GetCommonTexture(m_backBuffers[0].ptr());
-      immediateContext->CompositeWorkerOutput(
-        backBufferTexture->GetImage(),
-        backBufferTexture->GetWorkerImage());
+      if (env::getEnvVar("DXVK_MGPU_PIPELINE") == "1") {
+        immediateContext->CompositeWorkerOutputPipelined(
+          backBufferTexture->GetImage(),
+          backBufferTexture->GetWorkerImage());
+      } else {
+        immediateContext->CompositeWorkerOutput(
+          backBufferTexture->GetImage(),
+          backBufferTexture->GetWorkerImage());
+      }
     }
 
     m_presenter->setSyncInterval(SyncInterval);

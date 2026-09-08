@@ -1224,7 +1224,7 @@ namespace dxvk {
     if (isEmpty)
       return;
 
-    m_workerCsThread->dispatchChunk(std::move(m_workerCsChunk));
+    m_lastWorkerSeq = m_workerCsThread->dispatchChunk(std::move(m_workerCsChunk));
     m_workerCsChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
   }
 
@@ -1570,6 +1570,200 @@ namespace dxvk {
       m_sharedHostSize = 0u;
     }
   }
+  bool D3D11ImmediateContext::StealSharedBlock(SharedBlock& Block) {
+    Block.mem             = m_sharedHostMem;
+    Block.size            = m_sharedHostSize;
+    Block.workerVkBuffer  = m_workerVkBuffer;
+    Block.workerVkMemory  = m_workerVkMemory;
+    Block.primaryVkBuffer = m_primaryVkBuffer;
+    Block.primaryVkMemory = m_primaryVkMemory;
+    Block.worker          = std::move(m_workerStaging);
+    Block.primary         = std::move(m_primaryStaging);
+    m_sharedHostMem   = nullptr;
+    m_sharedHostSize  = 0u;
+    m_workerVkBuffer  = VK_NULL_HANDLE;
+    m_workerVkMemory  = VK_NULL_HANDLE;
+    m_primaryVkBuffer = VK_NULL_HANDLE;
+    m_primaryVkMemory = VK_NULL_HANDLE;
+    m_workerStaging   = nullptr;
+    m_primaryStaging  = nullptr;
+    return Block.mem != nullptr && Block.worker != nullptr && Block.primary != nullptr;
+  }
+
+
+  void D3D11ImmediateContext::ReleaseSharedBlock(SharedBlock& Block) {
+    if (Block.mem == nullptr)
+      return;
+    m_sharedHostMem   = Block.mem;
+    m_sharedHostSize  = Block.size;
+    m_workerVkBuffer  = Block.workerVkBuffer;
+    m_workerVkMemory  = Block.workerVkMemory;
+    m_primaryVkBuffer = Block.primaryVkBuffer;
+    m_primaryVkMemory = Block.primaryVkMemory;
+    m_workerStaging   = std::move(Block.worker);
+    m_primaryStaging  = std::move(Block.primary);
+    DestroySharedHostStaging();
+    Block = SharedBlock();
+  }
+
+
+  void D3D11ImmediateContext::ReleasePipeline() {
+    for (uint32_t i = 0; i < PipeBlocks; i++)
+      ReleaseSharedBlock(m_pipeBlocks[i]);
+    for (uint32_t i = 0; i < 2u; i++)
+      m_pipeImages[i] = nullptr;
+    m_pipeExtent = VkExtent3D { 0u, 0u, 0u };
+    m_pipeFrame  = 0u;
+    m_pipeValid  = false;
+  }
+
+
+  void D3D11ImmediateContext::CompositeWorkerOutputPipelined(
+    const Rc<DxvkImage>&        DstImage,
+    const Rc<DxvkImage>&        SrcImage) {
+    FlushWorkerCsChunk();
+
+    if (!m_workerCsThread || DstImage == nullptr || SrcImage == nullptr)
+      return;
+
+    Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
+    VkExtent3D extent = SrcImage->info().extent;
+
+    if (extent != DstImage->info().extent)
+      return;
+
+    VkDeviceSize imageBytes = VkDeviceSize(extent.width) * extent.height * 4u;
+
+    if (extent != m_pipeExtent) {
+      ReleasePipeline();
+
+      for (uint32_t i = 0; i < PipeBlocks; i++) {
+        if (!CreateSharedHostStaging(imageBytes) || !StealSharedBlock(m_pipeBlocks[i])) {
+          Logger::err("D3D11: pipelined composite: shared block allocation failed");
+          ReleasePipeline();
+          return;
+        }
+      }
+
+      DxvkImageCreateInfo info = DstImage->info();
+      info.usage  = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+      info.stages = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+      info.access = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+      info.viewFormatCount = 0u;
+      info.debugName = "mgpu pipeline";
+
+      for (uint32_t i = 0; i < 2u; i++)
+        m_pipeImages[i] = m_device->createImage(info, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+      m_pipeExtent = extent;
+      m_presentExtent = VkExtent2D { extent.width, extent.height };
+      ApplyViewportState();
+      Logger::info(str::format("D3D11: pipelined composite ready, ",
+        extent.width, "x", extent.height, ", ", PipeBlocks, " blocks"));
+    }
+
+    uint32_t cur     = m_pipeFrame % PipeBlocks;
+    uint32_t prev    = (m_pipeFrame + PipeBlocks - 1u) % PipeBlocks;
+    uint32_t curImg  = m_pipeFrame & 1u;
+    uint32_t prevImg = curImg ^ 1u;
+
+    VkImageSubresourceLayers sub = { };
+    sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    sub.layerCount = 1;
+
+    // 1. GPU0 saves the application's finished frame N before it is
+    //    overwritten below with frame N-1.
+    EmitCs([
+      cDst    = m_pipeImages[curImg],
+      cSrc    = DstImage,
+      cSub    = sub,
+      cExtent = extent
+    ] (DxvkContext* ctx) {
+      ctx->copyImage(cDst, cSub, VkOffset3D { 0, 0, 0 },
+        cSrc, cSub, VkOffset3D { 0, 0, 0 }, cExtent);
+    });
+
+    // 2. GPU0 last read block[cur] three frames ago. Cross-device, so
+    //    the ordering is a CPU wait; with three blocks it is normally
+    //    already satisfied.
+    m_device->waitForResource(*m_pipeBlocks[cur].primary, DxvkAccess::Read);
+
+    // 3. GPU1 copies its half of frame N into block[cur] and submits.
+    //    Nothing waits for it here.
+    EmitWorkerCs([
+      cBuffer = m_pipeBlocks[cur].worker,
+      cImage  = SrcImage,
+      cSub    = sub,
+      cExtent = extent
+    ] (DxvkContext* ctx) {
+      ctx->copyImageToBuffer(cBuffer, 0, 0, 0,
+        VK_FORMAT_R8G8B8A8_UNORM, cImage, cSub,
+        VkOffset3D { 0, 0, 0 }, cExtent);
+      ctx->flushCommandList(nullptr, nullptr);
+    });
+    FlushWorkerCsChunk();
+    m_pipeBlocks[cur].workerSeq = m_lastWorkerSeq;
+
+    // 4. Present frame N-1: restore GPU0's saved half, composite GPU1's
+    //    half from block[prev]. That copy was dispatched a frame ago;
+    //    make sure the worker CS thread has executed it, then wait for
+    //    the GPU write, which should already be complete.
+    if (m_pipeValid) {
+      auto t0 = dxvk::high_resolution_clock::now();
+      m_workerCsThread->synchronize(m_pipeBlocks[prev].workerSeq);
+      workerDevice->waitForResource(*m_pipeBlocks[prev].worker, DxvkAccess::Write);
+      auto t1 = dxvk::high_resolution_clock::now();
+      {
+        static uint64_t s_acc = 0; static uint32_t s_n = 0;
+        s_acc += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        if ((++s_n % 600u) == 0u) {
+          Logger::warn(str::format("PIPEWAIT avg over 600: ", s_acc / 600u, " us"));
+          s_acc = 0;
+        }
+      }
+
+      EmitCs([
+        cDst    = DstImage,
+        cSaved  = m_pipeImages[prevImg],
+        cBuffer = m_pipeBlocks[prev].primary,
+        cSub    = sub,
+        cExtent = extent
+      ] (DxvkContext* ctx) {
+        ctx->copyImage(cDst, cSub, VkOffset3D { 0, 0, 0 },
+          cSaved, cSub, VkOffset3D { 0, 0, 0 }, cExtent);
+        uint32_t splitY = cExtent.height / 2u;
+        VkExtent3D half = { cExtent.width, cExtent.height - splitY, 1u };
+        VkDeviceSize srcOffset = VkDeviceSize(splitY) * cExtent.width * 4u;
+        ctx->copyBufferToImage(cDst, cSub,
+          VkOffset3D { 0, int32_t(splitY), 0 }, half,
+          cBuffer, srcOffset, 0, 0,
+          VK_FORMAT_R8G8B8A8_UNORM);
+      });
+
+      if (unlikely(m_workerDrawDebug)) {
+        static uint32_t s_rb = 0;
+        if ((s_rb++ % 30u) == 0u) {
+          const uint8_t* px = reinterpret_cast<const uint8_t*>(m_pipeBlocks[prev].mem);
+          uint32_t w = extent.width;
+          uint32_t h = extent.height;
+          auto sample = [px, w] (uint32_t x, uint32_t y) {
+            size_t o = (size_t(y) * w + x) * 4u;
+            return str::format("[", uint32_t(px[o]), ",", uint32_t(px[o + 1]),
+              ",", uint32_t(px[o + 2]), ",", uint32_t(px[o + 3]), "]");
+          };
+          Logger::info(str::format("worker image ", w, "x", h,
+            " centre ", sample(w / 2u, h / 2u),
+            " topleft ", sample(w / 8u, h / 8u),
+            " corner ", sample(2u, 2u)));
+        }
+      }
+    }
+
+    m_pipeValid = true;
+    m_pipeFrame++;
+  }
+
+
   void D3D11ImmediateContext::LogMapStats() {
     if (!m_workerMapDebug || !m_mapFrames)
       return;

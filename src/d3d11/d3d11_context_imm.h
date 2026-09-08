@@ -198,6 +198,30 @@ namespace dxvk {
     VkDeviceMemory          m_primaryVkMemory = VK_NULL_HANDLE;
 
     VkDeviceSize            m_stagingSize = 0u;
+
+    // Frame-behind composite. GPU1's half of frame N lands in
+    // m_pipeBlocks[N % 3]; GPU0's own finished frame N is saved in
+    // m_pipeImages[N % 2]; the frame presented at Present N is N-1,
+    // reassembled from both. Three shared blocks so that GPU1's write
+    // into a block trails GPU0's last read of it by two frames.
+    struct SharedBlock {
+      void*                 mem             = nullptr;
+      VkDeviceSize          size            = 0u;
+      VkBuffer              workerVkBuffer  = VK_NULL_HANDLE;
+      VkDeviceMemory        workerVkMemory  = VK_NULL_HANDLE;
+      VkBuffer              primaryVkBuffer = VK_NULL_HANDLE;
+      VkDeviceMemory        primaryVkMemory = VK_NULL_HANDLE;
+      Rc<DxvkBuffer>        worker;
+      Rc<DxvkBuffer>        primary;
+      uint64_t              workerSeq       = 0u;
+    };
+    static constexpr uint32_t PipeBlocks = 3u;
+    std::array<SharedBlock, PipeBlocks> m_pipeBlocks;
+    std::array<Rc<DxvkImage>, 2>        m_pipeImages;
+    VkExtent3D              m_pipeExtent   = { 0u, 0u, 0u };
+    uint32_t                m_pipeFrame    = 0u;
+    bool                    m_pipeValid    = false;
+    uint64_t                m_lastWorkerSeq = 0u;
     uint64_t                m_csSeqNum = 0ull;
 
     uint32_t                m_mappedImageCount = 0u;
@@ -340,6 +364,12 @@ namespace dxvk {
       const Rc<DxvkImage>&              DstImage,
       const Rc<DxvkImage>&              SrcImage);
 
+    void CompositeWorkerOutputPipelined(
+      const Rc<DxvkImage>&        DstImage,
+      const Rc<DxvkImage>&        SrcImage);
+    bool StealSharedBlock(SharedBlock& Block);
+    void ReleaseSharedBlock(SharedBlock& Block);
+    void ReleasePipeline();
     bool CreateSharedHostStaging(
             VkDeviceSize                Size);
 
