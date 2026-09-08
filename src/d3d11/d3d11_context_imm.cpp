@@ -79,6 +79,7 @@ namespace dxvk {
       m_noLayout         = env::getEnvVar("DXVK_MGPU_NO_LAYOUT") == "1";
       m_noCompletionWait = env::getEnvVar("DXVK_MGPU_NO_COMPLETION_WAIT") == "1";
       m_mirrorNoOverwrite = env::getEnvVar("DXVK_MGPU_NO_MIRROR_NOOVERWRITE") != "1";
+      m_noWorkerFlush     = env::getEnvVar("DXVK_MGPU_NO_WORKER_FLUSH") == "1";
       m_cbReadEnabled    = env::getEnvVar("DXVK_MGPU_TEST_CBREAD") == "1";
       m_cbPoisonEnabled  = env::getEnvVar("DXVK_MGPU_TEST_CBPOISON") == "1";
       Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
@@ -2184,7 +2185,16 @@ namespace dxvk {
     });
 
     FlushCsChunk();
-
+    // Mirror the submission on the worker. Without this the worker
+    // chunk only reaches GPU1 at the composite, so GPU1 idles for the
+    // whole frame and then renders it from scratch while GPU0 waits
+    // (afc3e16b: 16800 primary submissions against 3600 worker).
+    if (m_workerCsThread && !m_noWorkerFlush) {
+      EmitWorkerCs([] (DxvkContext* ctx) {
+        ctx->flushCommandList(nullptr, nullptr);
+      });
+      FlushWorkerCsChunk();
+    }
     // Notify flush tracker about the flush
     m_flushSeqNum = m_csSeqNum;
     m_flushTracker.notifyFlush(m_flushSeqNum, submissionId);

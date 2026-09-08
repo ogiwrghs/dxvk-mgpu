@@ -135,6 +135,7 @@ namespace dxvk {
     bool                    m_noScissor = false;
     bool                    m_noCompletionWait = false;
     bool                    m_mirrorNoOverwrite = false;
+    bool                    m_noWorkerFlush = false;
     VkExtent2D              m_presentExtent = { 0u, 0u };
     bool                    m_noLayout = false;
 
