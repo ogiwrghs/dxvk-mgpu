@@ -70,7 +70,7 @@ namespace dxvk {
       // condition protecting it.
       m_workerCsChunk = pParent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
       m_workerStagingBuffer = std::make_unique<DxvkStagingBuffer>(
-        workerDevice, 256ull << 10);
+        workerDevice, 32ull << 20);
 
       m_workerFlushDebug = env::getEnvVar("DXVK_MGPU_DEBUG_FLUSH") == "1";
       m_workerDrawDebug  = env::getEnvVar("DXVK_MGPU_DEBUG_DRAW") == "1";
@@ -78,6 +78,7 @@ namespace dxvk {
       m_noScissor        = env::getEnvVar("DXVK_MGPU_NO_SCISSOR") == "1";
       m_noLayout         = env::getEnvVar("DXVK_MGPU_NO_LAYOUT") == "1";
       m_noCompletionWait = env::getEnvVar("DXVK_MGPU_NO_COMPLETION_WAIT") == "1";
+      m_mirrorNoOverwrite = env::getEnvVar("DXVK_MGPU_MIRROR_NOOVERWRITE") == "1";
       m_cbReadEnabled    = env::getEnvVar("DXVK_MGPU_TEST_CBREAD") == "1";
       m_cbPoisonEnabled  = env::getEnvVar("DXVK_MGPU_TEST_CBPOISON") == "1";
       Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
@@ -396,7 +397,16 @@ namespace dxvk {
 
       if (workerBuffer != nullptr) {
         DxvkBufferSlice staging = m_workerStagingBuffer->alloc(m_mappedWorkerSize);
+        auto tc0 = dxvk::high_resolution_clock::now();
         std::memcpy(staging.mapPtr(0), m_mappedWorkerPtr, m_mappedWorkerSize);
+        auto tc1 = dxvk::high_resolution_clock::now();
+        if (m_mappedWorkerSize >= 65536u) {
+          static uint32_t s_cpyLog = 0;
+          if ((s_cpyLog++ % 200u) == 0u) {
+            Logger::warn(str::format("MAPMIRROR memcpy ", m_mappedWorkerSize, " bytes in ",
+              std::chrono::duration_cast<std::chrono::microseconds>(tc1 - tc0).count(), " us"));
+          }
+        }
 
         {
           static std::atomic<uint64_t> s_discard = { 0u };
@@ -508,7 +518,7 @@ namespace dxvk {
       pMappedResource->pData      = pResource->GetMapPtr();
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
-      if (m_workerCsThread && pResource->GetWorkerBuffer() != nullptr) {
+      if (m_workerCsThread && m_mirrorNoOverwrite && pResource->GetWorkerBuffer() != nullptr) {
         if (m_mappedWorkerBuffer != nullptr) {
           static std::atomic<uint64_t> s_clobber = { 0u };
           uint64_t n = ++s_clobber;
