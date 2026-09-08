@@ -369,6 +369,12 @@ namespace dxvk {
     
     bool useCached = (m_parent->GetOptions()->cachedDynamicResources == ~0u)
                   || (m_parent->GetOptions()->cachedDynamicResources & m_desc.BindFlags);
+    // The worker mirror reads every host-visible buffer's mapping back
+    // on the CPU at Unmap. Write-combined memory reads at ~12 MB/s, so
+    // with a worker device present all host-visible buffers go in
+    // cached memory. The application's pointer is the same either way.
+    if (m_parent->GetWorkerDXVKDevice() != nullptr)
+      useCached = true;
 
     if ((memoryFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && useCached) {
       memoryFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;

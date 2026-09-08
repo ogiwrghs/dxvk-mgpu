@@ -80,6 +80,14 @@ namespace dxvk {
       memoryFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
       cachedDynamic = 0;
     }
+    // Same rule as D3D11Buffer::GetMemoryFlags: with a worker device the
+    // mirror reads every discarded slice back on the CPU, so the slices
+    // this cache hands out must not live in write-combined memory.
+    if (pParent->GetWorkerDXVKDevice() != nullptr) {
+      memoryFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+      memoryFlags |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+      cachedDynamic = 0;
+    }
 
     VkBufferUsageFlags bufferUsage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
 

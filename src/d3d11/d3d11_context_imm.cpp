@@ -78,7 +78,7 @@ namespace dxvk {
       m_noScissor        = env::getEnvVar("DXVK_MGPU_NO_SCISSOR") == "1";
       m_noLayout         = env::getEnvVar("DXVK_MGPU_NO_LAYOUT") == "1";
       m_noCompletionWait = env::getEnvVar("DXVK_MGPU_NO_COMPLETION_WAIT") == "1";
-      m_mirrorNoOverwrite = env::getEnvVar("DXVK_MGPU_MIRROR_NOOVERWRITE") == "1";
+      m_mirrorNoOverwrite = env::getEnvVar("DXVK_MGPU_NO_MIRROR_NOOVERWRITE") != "1";
       m_cbReadEnabled    = env::getEnvVar("DXVK_MGPU_TEST_CBREAD") == "1";
       m_cbPoisonEnabled  = env::getEnvVar("DXVK_MGPU_TEST_CBPOISON") == "1";
       Logger::info("D3D11ImmediateContext: Created worker CS thread and context");
