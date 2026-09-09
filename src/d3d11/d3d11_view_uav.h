@@ -70,6 +70,9 @@ namespace dxvk {
     Rc<DxvkImageView> GetWorkerImageView() const {
       return m_workerImageView;
     }
+    Rc<DxvkBufferView> GetWorkerCounterView() const {
+      return m_workerCounterView;
+    }
     
     static HRESULT GetDescFromResource(
             ID3D11Resource*                    pResource,
@@ -94,11 +97,13 @@ namespace dxvk {
     Rc<DxvkBufferView>                m_bufferView;
     Rc<DxvkImageView>                 m_imageView;
     Rc<DxvkBufferView>                m_counterView;
+    Rc<DxvkBufferView>                m_workerCounterView;
     Rc<DxvkBufferView>                m_workerBufferView;
     Rc<DxvkImageView>                 m_workerImageView;
     D3DDestructionNotifier            m_destructionNotifier;
 
-    Rc<DxvkBufferView> CreateCounterBufferView();
+    Rc<DxvkBufferView> CreateCounterBufferView(
+      const Rc<DxvkDevice>&           device);
     
   };
   

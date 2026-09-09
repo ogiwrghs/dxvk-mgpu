@@ -497,6 +497,31 @@ namespace dxvk {
         cSrcSlice.offset(),
         sizeof(uint32_t));
     });
+    if constexpr (!IsDeferred) {
+      DxvkBufferSlice workerDst = buf->GetWorkerBufferSlice(DstAlignedByteOffset);
+      Rc<DxvkBufferView> workerCtr = uav->GetWorkerCounterView();
+      bool mirrored = workerDst.defined() && workerCtr != nullptr;
+      {
+        static std::atomic<uint64_t> s_hit  = { 0u };
+        static std::atomic<uint64_t> s_miss = { 0u };
+        uint64_t n = mirrored ? ++s_hit : ++s_miss;
+        if (n <= 2u || (n % 10000u) == 0u)
+          Logger::warn(str::format("STRUCTCOUNTMIRROR ", mirrored ? "hit=" : "miss=", n));
+      }
+      if (mirrored) {
+        GetTypedContext()->EmitWorkerCs([
+          cDstSlice = std::move(workerDst),
+          cSrcSlice = DxvkBufferSlice(workerCtr)
+        ] (DxvkContext* ctx) {
+          ctx->copyBuffer(
+            cDstSlice.buffer(),
+            cDstSlice.offset(),
+            cSrcSlice.buffer(),
+            cSrcSlice.offset(),
+            sizeof(uint32_t));
+        });
+      }
+    }
 
     if (buf->HasSequenceNumber())
       GetTypedContext()->TrackBufferSequenceNumber(buf);
@@ -4897,23 +4922,23 @@ namespace dxvk {
               Logger::warn(str::format("UAVMIRROR buffer ",
                 workerUav != nullptr ? "hit=" : "miss=", n, " slot=", uavSlotId));
             }
-            if (pUav->HasCounter()) {
+            if (pUav->HasCounter() && pUav->GetWorkerCounterView() == nullptr) {
               uint64_t c = ++s_ctr;
               if (c <= 2u || (c % 100000u) == 0u)
-                Logger::warn(str::format("UAVMIRROR counter unmirrored=", c));
+                Logger::warn(str::format("UAVMIRROR counter miss=", c));
             }
           }
-          // The counter is a per-device buffer the worker does not
-          // have yet; bound null until CopyStructureCount is mirrored.
           GetTypedContext()->EmitWorkerCs([
             cUavSlotId    = uavSlotId,
             cCtrSlotId    = ctrSlotId,
             cStages       = stages,
-            cBufferView   = workerUav
+            cBufferView   = workerUav,
+            cCounterView  = pUav->GetWorkerCounterView()
           ] (DxvkContext* ctx) mutable {
             ctx->bindResourceBufferView(cStages, cUavSlotId,
               Forwarder::move(cBufferView));
-            ctx->bindResourceBufferView(cStages, cCtrSlotId, nullptr);
+            ctx->bindResourceBufferView(cStages, cCtrSlotId,
+              Forwarder::move(cCounterView));
           });
         }
       } else {
@@ -6891,6 +6916,18 @@ namespace dxvk {
       ctx->updateBuffer(cView->buffer(),
         cView->info().offset, sizeof(cCounter), &cCounter);
     });
+    if constexpr (!IsDeferred) {
+      Rc<DxvkBufferView> workerView = pUav->GetWorkerCounterView();
+      if (workerView != nullptr) {
+        GetTypedContext()->EmitWorkerCs([
+          cView    = std::move(workerView),
+          cCounter = CounterValue
+        ] (DxvkContext* ctx) {
+          ctx->updateBuffer(cView->buffer(),
+            cView->info().offset, sizeof(cCounter), &cCounter);
+        });
+      }
+    }
   }
 
 

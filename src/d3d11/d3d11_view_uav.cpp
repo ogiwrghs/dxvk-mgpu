@@ -46,7 +46,10 @@ namespace dxvk {
       }
       
       if (pDesc->Buffer.Flags & (D3D11_BUFFER_UAV_FLAG_APPEND | D3D11_BUFFER_UAV_FLAG_COUNTER))
-        m_counterView = CreateCounterBufferView();
+        m_counterView = CreateCounterBufferView(m_parent->GetDXVKDevice());
+        Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
+        if (workerDevice != nullptr)
+          m_workerCounterView = CreateCounterBufferView(workerDevice);
       
       // Populate view info struct
       m_info.Buffer.Offset = viewInfo.offset;
@@ -145,6 +148,7 @@ namespace dxvk {
     m_imageView = nullptr;
     m_workerBufferView = nullptr;
     m_workerImageView = nullptr;
+    m_workerCounterView = nullptr;
   }
   
   
@@ -453,9 +457,8 @@ namespace dxvk {
   }
 
 
-  Rc<DxvkBufferView> D3D11UnorderedAccessView::CreateCounterBufferView() {
-    Rc<DxvkDevice> device = m_parent->GetDXVKDevice();
-
+  Rc<DxvkBufferView> D3D11UnorderedAccessView::CreateCounterBufferView(
+    const Rc<DxvkDevice>&           device) {
     DxvkBufferCreateInfo info;
     info.size   = sizeof(uint32_t);
     info.usage  = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
