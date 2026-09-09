@@ -109,6 +109,7 @@ struct Config {
     int      msaa           = 1;      // scene target sample count
     bool     depthRead      = false;  // sample depth as SRV
     bool     compute        = false;  // CS writing a UAV, sampled in post
+    bool     indirect       = false;  // CS writes draw args; scene drawn indirect
     bool     copyRes        = false;  // CopyResource before the blit
     bool     copyRegion     = false;  // CopySubresourceRegion of a sub-rect
     bool     updateSub      = false;  // UpdateSubresource instead of Map
@@ -600,6 +601,7 @@ static void printUsage() {
         "  -msaa N         scene sample count, uses ResolveSubresource\n"
         "  -depthread      bind the depth buffer as an SRV in post\n"
         "  -compute        compute shader writing a UAV, sampled in post\n"
+        "  -indirect       compute writes draw args, scene drawn DrawIndexedInstancedIndirect\n"
         "  -copyres        CopyResource into a scratch texture before blit\n"
         "  -copyregion     CopySubresourceRegion of a sub-rect\n"
         "  -updatesub      constant buffer via UpdateSubresource, not Map\n");
@@ -640,6 +642,7 @@ static bool parseArgs(int argc, char** argv) {
         else if (a == "-quiet")      { g_cfg.quiet      = true; }
         else if (a == "-depthread")  { g_cfg.depthRead  = true; }
         else if (a == "-compute")    { g_cfg.compute    = true; }
+        else if (a == "-indirect")   { g_cfg.indirect   = true; }
         else if (a == "-copyres")    { g_cfg.copyRes    = true; }
         else if (a == "-copyregion") { g_cfg.copyRegion = true; }
         else if (a == "-updatesub")  { g_cfg.updateSub  = true; }
@@ -753,10 +756,10 @@ int main(int argc, char** argv) {
              (int)g_cfg.offscreen, (int)g_cfg.clearOnly, (int)g_cfg.vsync,
              (int)g_cfg.debugLayer, g_cfg.logCallFrames);
     LOG_INFO("features: renderscale=%.3f passes=%d pyramid=%d msaa=%d depthread=%d "
-             "compute=%d copyres=%d copyregion=%d updatesub=%d",
+             "compute=%d copyres=%d copyregion=%d updatesub=%d indirect=%d",
              g_cfg.renderScale, g_cfg.postPasses, g_cfg.pyramid, g_cfg.msaa,
              (int)g_cfg.depthRead, (int)g_cfg.compute, (int)g_cfg.copyRes,
-             (int)g_cfg.copyRegion, (int)g_cfg.updateSub);
+             (int)g_cfg.copyRegion, (int)g_cfg.updateSub, (int)g_cfg.indirect);
 
     const int renderW = (int)(g_cfg.width  * g_cfg.renderScale) & ~1;
     const int renderH = (int)(g_cfg.height * g_cfg.renderScale) & ~1;
@@ -1397,6 +1400,50 @@ int main(int argc, char** argv) {
     const UINT offset = 0;
     const UINT indexCount = (UINT)indices.size();
 
+    // -indirect: a compute shader writes the scene draw's arguments
+    // into a buffer every frame, and the draw reads them back with
+    // DrawIndexedInstancedIndirect. On a device where Dispatch is not
+    // mirrored the argument buffer never changes from its initial
+    // zeroes and the draw does nothing -- Fire Strike's physics test.
+    ID3D11ComputeShader*       argsCS  = nullptr;
+    ID3D11Buffer*              argsBuf = nullptr;
+    ID3D11UnorderedAccessView* argsUAV = nullptr;
+    if (g_cfg.indirect) {
+        char src[1024];
+        snprintf(src, sizeof(src),
+            "RWByteAddressBuffer gOut : register(u0);\n"
+            "[numthreads(1, 1, 1)]\n"
+            "void CSArgs(uint3 id : SV_DispatchThreadID) {\n"
+            "    gOut.Store(0, %uu);\n"
+            "    gOut.Store(4, %uu);\n"
+            "    gOut.Store(8, 0u);\n"
+            "    gOut.Store(12, 0u);\n"
+            "    gOut.Store(16, 0u);\n"
+            "}\n", indexCount, (unsigned)g_cfg.instances);
+        ID3DBlob* blob = compileShader(src, "CSArgs", "cs_5_0");
+        if (!blob) { g_log.close(); return 1; }
+        LOG_CALL("CreateComputeShader(args)");
+        hr = device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &argsCS);
+        blob->Release();
+        if (!checkHR(hr, "CreateComputeShader(args)")) return 1;
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 20;
+        bd.Usage     = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        LOG_CALL("CreateBuffer(INDIRECT ARGS, 20 bytes)");
+        hr = device->CreateBuffer(&bd, nullptr, &argsBuf);
+        if (!checkHR(hr, "CreateBuffer(indirect args)")) return 1;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format              = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension       = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.FirstElement = 0;
+        ud.Buffer.NumElements  = 5;
+        ud.Buffer.Flags        = D3D11_BUFFER_UAV_FLAG_RAW;
+        LOG_CALL("CreateUnorderedAccessView(args)");
+        hr = device->CreateUnorderedAccessView(argsBuf, &ud, &argsUAV);
+        if (!checkHR(hr, "CreateUnorderedAccessView(args)")) return 1;
+    }
     auto   runStart  = std::chrono::steady_clock::now();
     auto   lastStats = runStart;
     int    statFrames = 0;
@@ -1504,7 +1551,16 @@ int main(int argc, char** argv) {
 
             LOG_CALL("CSSetUnorderedAccessViews(0, 1, nullptr) [release UAV]");
             ctx->CSSetUnorderedAccessViews(0, 1, nullUAV1, nullptr);
-
+            ctx->CSSetShader(nullptr, nullptr, 0);
+        }
+        if (g_cfg.indirect && argsCS && argsUAV) {
+            LOG_CALL("CSSetShader(argsCS=%p)", (void*)argsCS);
+            ctx->CSSetShader(argsCS, nullptr, 0);
+            LOG_CALL("CSSetUnorderedAccessViews(0, 1, argsUAV=%p)", (void*)argsUAV);
+            ctx->CSSetUnorderedAccessViews(0, 1, &argsUAV, nullptr);
+            LOG_CALL("Dispatch(1, 1, 1) [indirect args]");
+            ctx->Dispatch(1, 1, 1);
+            ctx->CSSetUnorderedAccessViews(0, 1, nullUAV1, nullptr);
             ctx->CSSetShader(nullptr, nullptr, 0);
         }
 
@@ -1596,7 +1652,12 @@ int main(int argc, char** argv) {
 
             LOG_CALL("DrawIndexedInstanced(indexCount=%u, instances=%d, 0, 0, 0)",
                      indexCount, g_cfg.instances);
-            ctx->DrawIndexedInstanced(indexCount, (UINT)g_cfg.instances, 0, 0, 0);
+            if (g_cfg.indirect && argsBuf) {
+                LOG_CALL("DrawIndexedInstancedIndirect(argsBuf=%p, 0)", (void*)argsBuf);
+                ctx->DrawIndexedInstancedIndirect(argsBuf, 0);
+            } else {
+                ctx->DrawIndexedInstanced(indexCount, (UINT)g_cfg.instances, 0, 0, 0);
+            }
         }
 
         if (!g_running) break;
