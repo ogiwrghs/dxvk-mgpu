@@ -1264,6 +1264,12 @@ namespace dxvk {
     if (unlikely(HasDirtyGraphicsBindings()))
       ApplyDirtyGraphicsBindings();
 
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerCs([cOffset = AlignedByteOffsetForArgs]
+      (DxvkContext* ctx) {
+        ctx->drawIndexedIndirect(cOffset, 1u, 0u, true);
+      });
+    }
     // If possible, batch multiple indirect draw calls into one single multidraw call
     if (m_csDataType == D3D11CmdType::DrawIndirectIndexed) {
       auto cmdData = static_cast<D3D11CmdDrawIndirectData*>(m_csData->first());
@@ -1300,6 +1306,12 @@ namespace dxvk {
     if (unlikely(HasDirtyGraphicsBindings()))
       ApplyDirtyGraphicsBindings();
 
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerCs([cOffset = AlignedByteOffsetForArgs]
+      (DxvkContext* ctx) {
+        ctx->drawIndirect(cOffset, 1u, 0u, true);
+      });
+    }
     // If possible, batch multiple indirect draw calls into one single multidraw call
     if (m_csDataType == D3D11CmdType::DrawIndirect) {
       auto cmdData = static_cast<D3D11CmdDrawIndirectData*>(m_csData->first());
@@ -1348,6 +1360,20 @@ namespace dxvk {
         ThreadGroupCountY,
         ThreadGroupCountZ);
     });
+    if constexpr (!IsDeferred) {
+      {
+        static std::atomic<uint64_t> s_n = { 0u };
+        uint64_t n = ++s_n;
+        if (n <= 2u || (n % 100000u) == 0u)
+          Logger::warn(str::format("DISPATCHMIRROR n=", n));
+      }
+      GetTypedContext()->EmitWorkerCs([=] (DxvkContext* ctx) {
+        ctx->dispatch(
+          ThreadGroupCountX,
+          ThreadGroupCountY,
+          ThreadGroupCountZ);
+      });
+    }
   }
 
 
@@ -1368,6 +1394,12 @@ namespace dxvk {
     (DxvkContext* ctx) {
       ctx->dispatchIndirect(cOffset);
     });
+    if constexpr (!IsDeferred) {
+      GetTypedContext()->EmitWorkerCs([cOffset = AlignedByteOffsetForArgs]
+      (DxvkContext* ctx) {
+        ctx->dispatchIndirect(cOffset);
+      });
+    }
   }
 
 
@@ -4353,6 +4385,26 @@ namespace dxvk {
         Forwarder::move(cArgBuffer),
         Forwarder::move(cCntBuffer));
     });
+    if constexpr (!IsDeferred) {
+      DxvkBufferSlice workerArg = pBufferForArgs  ? pBufferForArgs->GetWorkerBufferSlice()  : DxvkBufferSlice();
+      DxvkBufferSlice workerCnt = pBufferForCount ? pBufferForCount->GetWorkerBufferSlice() : DxvkBufferSlice();
+      {
+        static std::atomic<uint64_t> s_hit  = { 0u };
+        static std::atomic<uint64_t> s_miss = { 0u };
+        bool ok = !pBufferForArgs || workerArg.defined();
+        uint64_t n = ok ? ++s_hit : ++s_miss;
+        if (n <= 2u || (n % 100000u) == 0u)
+          Logger::warn(str::format("DRAWBUFMIRROR ", ok ? "hit=" : "miss=", n));
+      }
+      GetTypedContext()->EmitWorkerCs([
+        cArgBuffer = std::move(workerArg),
+        cCntBuffer = std::move(workerCnt)
+      ] (DxvkContext* ctx) mutable {
+        ctx->bindDrawBuffers(
+          Forwarder::move(cArgBuffer),
+          Forwarder::move(cCntBuffer));
+      });
+    }
   }
 
 
@@ -4767,15 +4819,24 @@ namespace dxvk {
             Forwarder::move(cView));
         });
 
-        // Buffer SRVs have no worker view -- the buffer view path is
-        // not mirrored, matching the RTV exclusion. Bind null on the
-        // worker rather than leaving a stale view in the slot.
         if constexpr (!IsDeferred) {
+          Rc<DxvkBufferView> workerSrv = pResource->GetWorkerBufferView();
+          {
+            static std::atomic<uint64_t> s_hit  = { 0u };
+            static std::atomic<uint64_t> s_miss = { 0u };
+            uint64_t n = workerSrv != nullptr ? ++s_hit : ++s_miss;
+            if (n <= 2u || (n % 100000u) == 0u) {
+              Logger::warn(str::format("BUFSRVMIRROR ",
+                workerSrv != nullptr ? "hit=" : "miss=", n, " slot=", slotId));
+            }
+          }
           GetTypedContext()->EmitWorkerCs([
             cSlotId = slotId,
-            cStage  = GetShaderStage(ShaderStage)
-          ] (DxvkContext* ctx) {
-            ctx->bindResourceBufferView(cStage, cSlotId, nullptr);
+            cStage  = GetShaderStage(ShaderStage),
+            cView   = workerSrv
+          ] (DxvkContext* ctx) mutable {
+            ctx->bindResourceBufferView(cStage, cSlotId,
+              Forwarder::move(cView));
           });
         }
       }
@@ -4825,6 +4886,36 @@ namespace dxvk {
           ctx->bindResourceBufferView(cStages, cCtrSlotId,
             Forwarder::move(cCounterView));
         });
+        if constexpr (!IsDeferred) {
+          Rc<DxvkBufferView> workerUav = pUav->GetWorkerBufferView();
+          {
+            static std::atomic<uint64_t> s_hit  = { 0u };
+            static std::atomic<uint64_t> s_miss = { 0u };
+            static std::atomic<uint64_t> s_ctr  = { 0u };
+            uint64_t n = workerUav != nullptr ? ++s_hit : ++s_miss;
+            if (n <= 2u || (n % 100000u) == 0u) {
+              Logger::warn(str::format("UAVMIRROR buffer ",
+                workerUav != nullptr ? "hit=" : "miss=", n, " slot=", uavSlotId));
+            }
+            if (pUav->HasCounter()) {
+              uint64_t c = ++s_ctr;
+              if (c <= 2u || (c % 100000u) == 0u)
+                Logger::warn(str::format("UAVMIRROR counter unmirrored=", c));
+            }
+          }
+          // The counter is a per-device buffer the worker does not
+          // have yet; bound null until CopyStructureCount is mirrored.
+          GetTypedContext()->EmitWorkerCs([
+            cUavSlotId    = uavSlotId,
+            cCtrSlotId    = ctrSlotId,
+            cStages       = stages,
+            cBufferView   = workerUav
+          ] (DxvkContext* ctx) mutable {
+            ctx->bindResourceBufferView(cStages, cUavSlotId,
+              Forwarder::move(cBufferView));
+            ctx->bindResourceBufferView(cStages, cCtrSlotId, nullptr);
+          });
+        }
       } else {
         EmitCs([
           cUavSlotId    = uavSlotId,
@@ -4836,6 +4927,28 @@ namespace dxvk {
             Forwarder::move(cImageView));
           ctx->bindResourceBufferView(cStages, cCtrSlotId, nullptr);
         });
+        if constexpr (!IsDeferred) {
+          Rc<DxvkImageView> workerUav = pUav->GetWorkerImageView();
+          {
+            static std::atomic<uint64_t> s_hit  = { 0u };
+            static std::atomic<uint64_t> s_miss = { 0u };
+            uint64_t n = workerUav != nullptr ? ++s_hit : ++s_miss;
+            if (n <= 2u || (n % 100000u) == 0u) {
+              Logger::warn(str::format("UAVMIRROR image ",
+                workerUav != nullptr ? "hit=" : "miss=", n, " slot=", uavSlotId));
+            }
+          }
+          GetTypedContext()->EmitWorkerCs([
+            cUavSlotId    = uavSlotId,
+            cCtrSlotId    = ctrSlotId,
+            cStages       = stages,
+            cImageView    = workerUav
+          ] (DxvkContext* ctx) mutable {
+            ctx->bindResourceImageView(cStages, cUavSlotId,
+              Forwarder::move(cImageView));
+            ctx->bindResourceBufferView(cStages, cCtrSlotId, nullptr);
+          });
+        }
       }
     } else {
       EmitCs([
@@ -4846,6 +4959,16 @@ namespace dxvk {
         ctx->bindResourceImageView(cStages, cUavSlotId, nullptr);
         ctx->bindResourceBufferView(cStages, cCtrSlotId, nullptr);
       });
+      if constexpr (!IsDeferred) {
+        GetTypedContext()->EmitWorkerCs([
+          cUavSlotId    = uavSlotId,
+          cCtrSlotId    = ctrSlotId,
+          cStages       = stages
+        ] (DxvkContext* ctx) {
+          ctx->bindResourceImageView(cStages, cUavSlotId, nullptr);
+          ctx->bindResourceBufferView(cStages, cCtrSlotId, nullptr);
+        });
+      }
     }
   }
 

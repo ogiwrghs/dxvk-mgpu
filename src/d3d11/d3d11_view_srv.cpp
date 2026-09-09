@@ -71,6 +71,9 @@ namespace dxvk {
 
       // Create underlying buffer view object
       m_bufferView = buffer->GetBuffer()->createView(viewInfo);
+      Rc<DxvkBuffer> workerBuffer = buffer->GetWorkerBuffer();
+      if (workerBuffer != nullptr)
+        m_workerBufferView = workerBuffer->createView(viewInfo);
     } else {
       auto texture = GetCommonTexture(pResource);
       auto formatInfo = pDevice->LookupFormat(pDesc->Format, texture->GetFormatMode());
@@ -199,6 +202,7 @@ namespace dxvk {
 
     m_imageView = nullptr;
     m_workerImageView = nullptr;
+    m_workerBufferView = nullptr;
     m_bufferView = nullptr;
   }
   

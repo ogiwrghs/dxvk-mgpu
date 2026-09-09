@@ -53,6 +53,9 @@ namespace dxvk {
       m_info.Buffer.Length = viewInfo.size;
 
       m_bufferView = buffer->GetBuffer()->createView(viewInfo);
+      Rc<DxvkBuffer> workerBuffer = buffer->GetWorkerBuffer();
+      if (workerBuffer != nullptr)
+        m_workerBufferView = workerBuffer->createView(viewInfo);
     } else {
       auto texture = GetCommonTexture(pResource);
       auto formatInfo = pDevice->LookupFormat(pDesc->Format, texture->GetFormatMode());
@@ -124,6 +127,9 @@ namespace dxvk {
       m_info.Image.NumLayers = viewInfo.layerCount;
 
       m_imageView = GetCommonTexture(pResource)->GetImage()->createView(viewInfo);
+      Rc<DxvkImage> workerImage = GetCommonTexture(pResource)->GetWorkerImage();
+      if (workerImage != nullptr)
+        m_workerImageView = workerImage->createView(viewInfo);
     }
   }
   
@@ -137,6 +143,8 @@ namespace dxvk {
     m_bufferView = nullptr;
     m_counterView = nullptr;
     m_imageView = nullptr;
+    m_workerBufferView = nullptr;
+    m_workerImageView = nullptr;
   }
   
   
