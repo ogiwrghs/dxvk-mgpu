@@ -110,6 +110,7 @@ struct Config {
     bool     depthRead      = false;  // sample depth as SRV
     bool     compute        = false;  // CS writing a UAV, sampled in post
     bool     indirect       = false;  // CS writes draw args; scene drawn indirect
+    bool     deferred       = false;  // scene pass recorded on a deferred context
     bool     copyRes        = false;  // CopyResource before the blit
     bool     copyRegion     = false;  // CopySubresourceRegion of a sub-rect
     bool     updateSub      = false;  // UpdateSubresource instead of Map
@@ -602,6 +603,7 @@ static void printUsage() {
         "  -depthread      bind the depth buffer as an SRV in post\n"
         "  -compute        compute shader writing a UAV, sampled in post\n"
         "  -indirect       compute writes draw args, scene drawn DrawIndexedInstancedIndirect\n"
+        "  -deferred       scene pass recorded on a deferred context, ExecuteCommandList\n"
         "  -copyres        CopyResource into a scratch texture before blit\n"
         "  -copyregion     CopySubresourceRegion of a sub-rect\n"
         "  -updatesub      constant buffer via UpdateSubresource, not Map\n");
@@ -643,6 +645,7 @@ static bool parseArgs(int argc, char** argv) {
         else if (a == "-depthread")  { g_cfg.depthRead  = true; }
         else if (a == "-compute")    { g_cfg.compute    = true; }
         else if (a == "-indirect")   { g_cfg.indirect   = true; }
+        else if (a == "-deferred")   { g_cfg.deferred   = true; }
         else if (a == "-copyres")    { g_cfg.copyRes    = true; }
         else if (a == "-copyregion") { g_cfg.copyRegion = true; }
         else if (a == "-updatesub")  { g_cfg.updateSub  = true; }
@@ -756,10 +759,11 @@ int main(int argc, char** argv) {
              (int)g_cfg.offscreen, (int)g_cfg.clearOnly, (int)g_cfg.vsync,
              (int)g_cfg.debugLayer, g_cfg.logCallFrames);
     LOG_INFO("features: renderscale=%.3f passes=%d pyramid=%d msaa=%d depthread=%d "
-             "compute=%d copyres=%d copyregion=%d updatesub=%d indirect=%d",
+             "compute=%d copyres=%d copyregion=%d updatesub=%d indirect=%d deferred=%d",
              g_cfg.renderScale, g_cfg.postPasses, g_cfg.pyramid, g_cfg.msaa,
              (int)g_cfg.depthRead, (int)g_cfg.compute, (int)g_cfg.copyRes,
-             (int)g_cfg.copyRegion, (int)g_cfg.updateSub, (int)g_cfg.indirect);
+             (int)g_cfg.copyRegion, (int)g_cfg.updateSub, (int)g_cfg.indirect,
+             (int)g_cfg.deferred);
 
     const int renderW = (int)(g_cfg.width  * g_cfg.renderScale) & ~1;
     const int renderH = (int)(g_cfg.height * g_cfg.renderScale) & ~1;
@@ -1400,6 +1404,17 @@ int main(int argc, char** argv) {
     const UINT offset = 0;
     const UINT indexCount = (UINT)indices.size();
 
+    // -deferred: the scene pass is recorded on a deferred context and
+    // replayed with ExecuteCommandList, the way Fire Strike renders.
+    // Every worker mirror in the fork is immediate-context only, so on
+    // GPU1 the scene never happens.
+    ID3D11DeviceContext* dctx = nullptr;
+    if (g_cfg.deferred) {
+        LOG_CALL("CreateDeferredContext");
+        hr = device->CreateDeferredContext(0, &dctx);
+        if (!checkHR(hr, "CreateDeferredContext")) return 1;
+    }
+
     // -indirect: a compute shader writes the scene draw's arguments
     // into a buffer every frame, and the draw reads them back with
     // DrawIndexedInstancedIndirect. On a device where Dispatch is not
@@ -1569,48 +1584,49 @@ int main(int argc, char** argv) {
         const float clearColor[4] = { 0.06f, 0.07f, 0.10f, 1.0f };
 
         LOG_CALL("ClearRenderTargetView(rtv=%p)", (void*)targetRTV);
-        ctx->ClearRenderTargetView(targetRTV, clearColor);
+        ID3D11DeviceContext* sc = (g_cfg.deferred && dctx) ? dctx : ctx;
+        sc->ClearRenderTargetView(targetRTV, clearColor);
 
         LOG_CALL("ClearDepthStencilView(dsv=%p, depth=1.0)", (void*)depthDSV);
-        ctx->ClearDepthStencilView(depthDSV, D3D11_CLEAR_DEPTH, 1.0f, 0);
+        sc->ClearDepthStencilView(depthDSV, D3D11_CLEAR_DEPTH, 1.0f, 0);
 
         LOG_CALL("OMSetRenderTargets(1, rtv=%p, dsv=%p)", (void*)targetRTV, (void*)depthDSV);
-        ctx->OMSetRenderTargets(1, &targetRTV, depthDSV);
+        sc->OMSetRenderTargets(1, &targetRTV, depthDSV);
 
         D3D11_VIEWPORT vp{};
         vp.Width    = (float)(g_cfg.offscreen ? renderW : g_cfg.width);
         vp.Height   = (float)(g_cfg.offscreen ? renderH : g_cfg.height);
         vp.MaxDepth = 1.0f;
         LOG_CALL("RSSetViewports(1, %.0fx%.0f)", vp.Width, vp.Height);
-        ctx->RSSetViewports(1, &vp);
+        sc->RSSetViewports(1, &vp);
 
         LOG_CALL("RSSetState(%p)", (void*)rasterState);
-        ctx->RSSetState(rasterState);
+        sc->RSSetState(rasterState);
 
         LOG_CALL("OMSetDepthStencilState(%p)", (void*)depthState);
-        ctx->OMSetDepthStencilState(depthState, 0);
+        sc->OMSetDepthStencilState(depthState, 0);
 
         LOG_CALL("IASetInputLayout(%p)", (void*)inputLayout);
-        ctx->IASetInputLayout(inputLayout);
+        sc->IASetInputLayout(inputLayout);
 
         LOG_CALL("IASetPrimitiveTopology(TRIANGLELIST)");
-        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        sc->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
         LOG_CALL("IASetVertexBuffers(0, 1, vb=%p, stride=%u, offset=%u)",
                  (void*)vertexBuffer, stride, offset);
-        ctx->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
+        sc->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
 
         LOG_CALL("IASetIndexBuffer(ib=%p, R16_UINT, 0)", (void*)indexBuffer);
-        ctx->IASetIndexBuffer(indexBuffer, DXGI_FORMAT_R16_UINT, 0);
+        sc->IASetIndexBuffer(indexBuffer, DXGI_FORMAT_R16_UINT, 0);
 
         LOG_CALL("VSSetShader(%p)", (void*)sceneVS);
-        ctx->VSSetShader(sceneVS, nullptr, 0);
+        sc->VSSetShader(sceneVS, nullptr, 0);
 
         LOG_CALL("PSSetShader(%p)", (void*)scenePS);
-        ctx->PSSetShader(scenePS, nullptr, 0);
+        sc->PSSetShader(scenePS, nullptr, 0);
 
         LOG_CALL("PSSetSamplers(0, 1, %p)", (void*)wrapSampler);
-        ctx->PSSetSamplers(0, 1, &wrapSampler);
+        sc->PSSetSamplers(0, 1, &wrapSampler);
 
         for (int d = 0; d < g_cfg.drawsPerFrame; d++) {
             PerFrameCB cb{};
@@ -1622,11 +1638,11 @@ int main(int argc, char** argv) {
 
             if (g_cfg.updateSub) {
                 LOG_CALL("UpdateSubresource(constBuffer=%p)", (void*)constBuffer);
-                ctx->UpdateSubresource(constBuffer, 0, nullptr, &cb, 0, 0);
+                sc->UpdateSubresource(constBuffer, 0, nullptr, &cb, 0, 0);
             } else {
                 D3D11_MAPPED_SUBRESOURCE mapped{};
                 LOG_CALL("Map(constBuffer=%p, 0, WRITE_DISCARD)", (void*)constBuffer);
-                hr = ctx->Map(constBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+                hr = sc->Map(constBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
                 if (FAILED(hr)) {
                     LOG_ERR("Map(constBuffer) failed (hr=0x%08lX)", (unsigned long)hr);
                     g_running = false;
@@ -1634,34 +1650,41 @@ int main(int argc, char** argv) {
                 }
                 memcpy(mapped.pData, &cb, sizeof(cb));
                 LOG_CALL("Unmap(constBuffer=%p, 0)", (void*)constBuffer);
-                ctx->Unmap(constBuffer, 0);
+                sc->Unmap(constBuffer, 0);
             }
 
             LOG_CALL("VSSetConstantBuffers(0, 1, %p)", (void*)constBuffer);
-            ctx->VSSetConstantBuffers(0, 1, &constBuffer);
+            sc->VSSetConstantBuffers(0, 1, &constBuffer);
 
             LOG_CALL("PSSetConstantBuffers(0, 1, %p)", (void*)constBuffer);
-            ctx->PSSetConstantBuffers(0, 1, &constBuffer);
+            sc->PSSetConstantBuffers(0, 1, &constBuffer);
 
             // Rotate through the ballast pool so every texture gets touched.
             ID3D11ShaderResourceView* srv =
                 ballastSRV[(size_t)(d + g_frameIndex) % ballastSRV.size()];
 
             LOG_CALL("PSSetShaderResources(0, 1, srv=%p)", (void*)srv);
-            ctx->PSSetShaderResources(0, 1, &srv);
+            sc->PSSetShaderResources(0, 1, &srv);
 
             LOG_CALL("DrawIndexedInstanced(indexCount=%u, instances=%d, 0, 0, 0)",
                      indexCount, g_cfg.instances);
             if (g_cfg.indirect && argsBuf) {
                 LOG_CALL("DrawIndexedInstancedIndirect(argsBuf=%p, 0)", (void*)argsBuf);
-                ctx->DrawIndexedInstancedIndirect(argsBuf, 0);
+                sc->DrawIndexedInstancedIndirect(argsBuf, 0);
             } else {
                 ctx->DrawIndexedInstanced(indexCount, (UINT)g_cfg.instances, 0, 0, 0);
             }
         }
 
+        if (g_cfg.deferred && dctx) {
+            ID3D11CommandList* cl = nullptr;
+            hr = dctx->FinishCommandList(FALSE, &cl);
+            if (!checkHR(hr, "FinishCommandList")) return 1;
+            LOG_CALL("ExecuteCommandList(%p)", (void*)cl);
+            ctx->ExecuteCommandList(cl, FALSE);
+            cl->Release();
+        }
         if (!g_running) break;
-
         // --- post chain -----------------------------------------------------
         if (g_cfg.offscreen) {
             ID3D11ShaderResourceView* nullSRV1[1] = { nullptr };
