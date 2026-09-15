@@ -58,6 +58,18 @@ namespace dxvk {
     m_chunks.emplace_back(std::move(Chunk), Cost);
     return m_chunks.size() - 1;
   }
+
+
+  void D3D11CommandList::AddWorkerChunk(DxvkCsChunkRef&& Chunk) {
+    m_workerChunks.push_back(std::move(Chunk));
+  }
+
+
+  void D3D11CommandList::EmitWorkerToCsThread(
+    const std::function<void (DxvkCsChunkRef&&)>& DispatchProc) {
+    for (const auto& chunk : m_workerChunks)
+      DispatchProc(DxvkCsChunkRef(chunk));
+  }
   
   
   uint64_t D3D11CommandList::AddCommandList(
@@ -68,6 +80,8 @@ namespace dxvk {
     
     for (const auto& chunk : pCommandList->m_chunks)
       m_chunks.push_back(chunk);
+    for (const auto& chunk : pCommandList->m_workerChunks)
+      m_workerChunks.push_back(chunk);
 
     for (const auto& query : pCommandList->m_queries)
       m_queries.push_back(query);

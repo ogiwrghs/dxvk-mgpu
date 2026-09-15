@@ -324,6 +324,24 @@ namespace dxvk {
       return csSeqNum;
     });
 
+    // Replay the worker side of the command list. The immediate
+    // context's own worker chunk is flushed first so the deferred
+    // work lands after whatever was mirrored before this call.
+    if (m_workerCsThread) {
+      FlushWorkerCsChunk();
+      static std::atomic<uint64_t> s_lists = { 0u };
+      static std::atomic<uint64_t> s_chunks = { 0u };
+      uint64_t lists = ++s_lists;
+      commandList->EmitWorkerToCsThread([this] (DxvkCsChunkRef&& chunk) {
+        ++s_chunks;
+        InjectWorkerCsChunk(std::move(chunk));
+      });
+      if (lists <= 2u || (lists % 1000u) == 0u) {
+        Logger::warn(str::format("DEFERREDMIRROR lists=", lists,
+          " workerChunks=", s_chunks.load()));
+      }
+    }
+
     // Restore the immediate context's state
     if (RestoreContextState)
       RestoreCommandListState();

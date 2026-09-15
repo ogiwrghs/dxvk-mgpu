@@ -1,4 +1,5 @@
 #include "d3d11_context_def.h"
+#include "d3d11_context_imm.h"
 #include "d3d11_device.h"
 
 namespace dxvk {
@@ -155,7 +156,8 @@ namespace dxvk {
     // Flush any outstanding commands so that
     // we don't mess up the execution order
     FlushCsChunk();
-    
+    FlushWorkerCsChunk();
+
     // Record any chunks from the given command list into the
     // current command list and deal with context state
     auto commandList = static_cast<D3D11CommandList*>(pCommandList);
@@ -184,7 +186,8 @@ namespace dxvk {
 
     // Make sure all commands are visible to the command list
     FlushCsChunk();
-    
+    FlushWorkerCsChunk();
+
     if (ppCommandList)
       *ppCommandList = m_commandList.ref();
 
@@ -285,7 +288,37 @@ namespace dxvk {
     pMappedResource->pData        = bufferSlice->mapPtr();
     pMappedResource->RowPitch     = pBuffer->Desc()->ByteWidth;
     pMappedResource->DepthPitch   = pBuffer->Desc()->ByteWidth;
-
+    // Worker mirror. The slice's host memory holds the application's
+    // bytes from now until the Rc dies, and the worker CS thread only
+    // executes this after ExecuteCommandList, when the write is long
+    // complete. updateBuffer stages through the worker context's own
+    // staging on the worker device; the read is from cached memory.
+    if (HasWorkerDevice() && pBuffer->GetWorkerBuffer() != nullptr) {
+      {
+        static std::atomic<uint64_t> s_n = { 0u };
+        uint64_t n = ++s_n;
+        if (n <= 2u || (n % 100000u) == 0u)
+          Logger::warn(str::format("DEFMAPMIRROR n=", n, " bytes=", pBuffer->Desc()->ByteWidth));
+      }
+      {
+        auto imm = m_parent->GetContext();
+        if (imm->m_cbReadEnabled && !imm->m_cbReadValid && pBuffer->Desc()->ByteWidth >= 16u) {
+          imm->m_cbReadBuffer        = pBuffer->GetWorkerBuffer();
+          imm->m_cbReadOffset        = 0u;
+          imm->m_cbReadPrimary       = pBuffer->GetBuffer();
+          imm->m_cbReadPrimaryOffset = 0u;
+          imm->m_cbReadValid         = true;
+          Logger::warn(str::format("CBREAD latched (deferred) length=", pBuffer->Desc()->ByteWidth));
+        }
+      }
+      EmitWorkerCs([
+        cWorkerBuffer = pBuffer->GetWorkerBuffer(),
+        cSrcSlice     = bufferSlice,
+        cSize         = VkDeviceSize(pBuffer->Desc()->ByteWidth)
+      ] (DxvkContext* ctx) {
+        ctx->updateBuffer(cWorkerBuffer, 0u, cSize, cSrcSlice->mapPtr());
+      });
+    }
     EmitCs([
       cDstBuffer = pBuffer->GetBuffer(),
       cDstSlice  = std::move(bufferSlice)
@@ -398,6 +431,62 @@ namespace dxvk {
   void D3D11DeferredContext::EmitCsChunk(DxvkCsChunkRef&& chunk) {
     m_chunkId = m_commandList->AddChunk(std::move(chunk), m_estimatedCost);
     m_estimatedCost = 0u;
+  }
+
+
+  bool D3D11DeferredContext::HasWorkerDevice() const {
+    return m_parent->GetWorkerDXVKDevice() != nullptr;
+  }
+
+
+  void D3D11DeferredContext::EmitWorkerClearRenderTarget(
+    const DxvkAttachment&       Attachment,
+    const VkClearValue&         ClearValue) {
+    EmitWorkerCs([
+      cAttachment = Attachment,
+      cClearValue = ClearValue
+    ] (DxvkContext* ctx) {
+      ctx->clearRenderTarget(cAttachment,
+        VK_IMAGE_ASPECT_COLOR_BIT, cClearValue, 0u);
+    });
+  }
+
+
+  void D3D11DeferredContext::EmitWorkerBindFramebuffer(
+          DxvkRenderTargets&&         Targets) {
+    EmitWorkerCs([
+      cTargets = std::move(Targets)
+    ] (DxvkContext* ctx) mutable {
+      ctx->bindRenderTargets(std::move(cTargets), 0u);
+    });
+  }
+
+
+  bool D3D11DeferredContext::NoScissor() const {
+    return m_parent->GetContext()->NoScissor();
+  }
+
+
+  bool D3D11DeferredContext::NoLayout() const {
+    return m_parent->GetContext()->NoLayout();
+  }
+
+
+  VkExtent2D D3D11DeferredContext::PresentExtent() const {
+    return m_parent->GetContext()->PresentExtent();
+  }
+
+
+  void D3D11DeferredContext::FlushWorkerCsChunk() {
+    if (!m_workerCsChunk || m_workerCsChunk->empty())
+      return;
+    {
+      static uint32_t s_n = 0;
+      if (s_n++ < 6u)
+        Logger::warn(str::format("DEFWORKER flush: ", m_workerCmdCount, " commands so far on this context"));
+    }
+    m_commandList->AddWorkerChunk(std::move(m_workerCsChunk));
+    m_workerCsChunk = AllocCsChunk();
   }
 
 

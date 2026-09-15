@@ -1664,7 +1664,12 @@ namespace dxvk {
             " rpActive=", m_flags.test(DxvkContextFlag::GpRenderPassActive),
             " gpStateHash=", m_state.gp.state.hash(),
             " target=", m_state.om.framebufferInfo.getColorTarget(0).view != nullptr
-              ? reinterpret_cast<uintptr_t>(m_state.om.framebufferInfo.getColorTarget(0).view->image()) : 0u));
+              ? reinterpret_cast<uintptr_t>(m_state.om.framebufferInfo.getColorTarget(0).view->image()) : 0u,
+            " vp=", m_state.vp.viewports[0].x, ",", m_state.vp.viewports[0].y, " ",
+              m_state.vp.viewports[0].width, "x", m_state.vp.viewports[0].height,
+            " sc=", m_state.vp.scissorRects[0].offset.x, ",", m_state.vp.scissorRects[0].offset.y, " ",
+              m_state.vp.scissorRects[0].extent.width, "x", m_state.vp.scissorRects[0].extent.height,
+            " nvp=", m_state.vp.viewportCount));
 
           // Dump the raw state bytes so the two devices can be diffed
           // offline. The struct is packed and trivially copyable, so

@@ -118,6 +118,49 @@ namespace dxvk {
     
     void EmitCsChunk(DxvkCsChunkRef&& chunk);
 
+    // Worker-side recording. Mirrored commands go into a parallel
+    // chunk that lands in the command list beside the primary ones;
+    // the immediate context's ExecuteCommandList replays them onto
+    // the worker CS thread. Allocated lazily on first use so the
+    // constructor needs no changes; no SingleUse, since a command
+    // list may be executed more than once.
+    DxvkCsChunkRef m_workerCsChunk;
+
+    bool HasWorkerDevice() const;
+
+    template<typename Cmd>
+    void EmitWorkerCs(Cmd&& command) {
+      if (!m_workerCsChunk) {
+        if (!HasWorkerDevice())
+          return;
+        m_workerCsChunk = AllocCsChunk();
+      }
+      m_workerCmdCount++;
+      if (unlikely(!m_workerCsChunk->push(command))) {
+        FlushWorkerCsChunk();
+        m_workerCsChunk->push(command);
+      }
+    }
+
+    uint64_t m_workerCmdCount = 0u;
+
+    void FlushWorkerCsChunk();
+
+    // Immediate-only helpers and settings the mirror sites reach
+    // through GetTypedContext(). The helpers emit the same commands
+    // without the immediate context's composite bookkeeping; the
+    // settings forward to the immediate context, which owns them.
+    void EmitWorkerClearRenderTarget(
+      const DxvkAttachment&       Attachment,
+      const VkClearValue&         ClearValue);
+
+    void EmitWorkerBindFramebuffer(
+            DxvkRenderTargets&&         Targets);
+
+    bool NoScissor() const;
+    bool NoLayout() const;
+    VkExtent2D PresentExtent() const;
+
     uint64_t GetCurrentChunkId() const;
 
     void TrackTextureSequenceNumber(

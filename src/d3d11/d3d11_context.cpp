@@ -497,7 +497,7 @@ namespace dxvk {
         cSrcSlice.offset(),
         sizeof(uint32_t));
     });
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       DxvkBufferSlice workerDst = buf->GetWorkerBufferSlice(DstAlignedByteOffset);
       Rc<DxvkBufferView> workerCtr = uav->GetWorkerCounterView();
       bool mirrored = workerDst.defined() && workerCtr != nullptr;
@@ -557,7 +557,7 @@ namespace dxvk {
         // Mirror the clear onto the worker GPU. Immediate context only:
     // deferred contexts have no worker CS thread, and the branch is
     // discarded at compile time for them.
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       Rc<DxvkImageView> workerView  = rtv->GetWorkerImageView();
       Rc<DxvkImageView> primaryView = rtv->GetImageView();
 
@@ -825,7 +825,7 @@ namespace dxvk {
     // is rejected and mirrored draws produce nothing -- while the
     // colour clear, which needs no pipeline, still works. That
     // asymmetry is exactly what the black output looked like.
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       Rc<DxvkImageView> workerView = dsv->GetWorkerImageView();
 
       if (workerView != nullptr) {
@@ -957,7 +957,7 @@ namespace dxvk {
     (DxvkContext* ctx) {
       ctx->generateMipmaps(cDstImageView, VK_FILTER_LINEAR);
     });
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       Rc<DxvkImageView> workerView = view->GetWorkerImageView();
       {
         static std::atomic<uint64_t> s_hit  = { 0u };
@@ -1289,7 +1289,7 @@ namespace dxvk {
     if (unlikely(HasDirtyGraphicsBindings()))
       ApplyDirtyGraphicsBindings();
 
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerCs([cOffset = AlignedByteOffsetForArgs]
       (DxvkContext* ctx) {
         ctx->drawIndexedIndirect(cOffset, 1u, 0u, true);
@@ -1331,7 +1331,7 @@ namespace dxvk {
     if (unlikely(HasDirtyGraphicsBindings()))
       ApplyDirtyGraphicsBindings();
 
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerCs([cOffset = AlignedByteOffsetForArgs]
       (DxvkContext* ctx) {
         ctx->drawIndirect(cOffset, 1u, 0u, true);
@@ -1385,7 +1385,7 @@ namespace dxvk {
         ThreadGroupCountY,
         ThreadGroupCountZ);
     });
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       {
         static std::atomic<uint64_t> s_n = { 0u };
         uint64_t n = ++s_n;
@@ -1419,7 +1419,7 @@ namespace dxvk {
     (DxvkContext* ctx) {
       ctx->dispatchIndirect(cOffset);
     });
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerCs([cOffset = AlignedByteOffsetForArgs]
       (DxvkContext* ctx) {
         ctx->dispatchIndirect(cOffset);
@@ -3622,7 +3622,7 @@ namespace dxvk {
       // a fixed, modest capture for a call that happens a handful of
       // times per frame rather than per draw. Revisit if input layout
       // changes ever become hot.
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         std::array<DxvkVertexInput, DxvkLimits::MaxNumVertexAttributes
                                   + DxvkLimits::MaxNumVertexBindings> inputs = { };
 
@@ -3650,7 +3650,7 @@ namespace dxvk {
         ctx->setInputLayout(0, nullptr, 0, nullptr);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
           ctx->setInputLayout(0, nullptr, 0, nullptr);
         });
@@ -3698,7 +3698,7 @@ namespace dxvk {
 
     // Pure value state, no resources: the worker takes the identical
     // command.
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerCs([iaState] (DxvkContext* ctx) {
         ctx->setInputAssemblyState(iaState);
       });
@@ -3721,7 +3721,7 @@ namespace dxvk {
         ctx->setLogicOpState(cLoState);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cBlendState = m_state.om.cbState->GetBlendState(),
           cMsState    = m_state.om.cbState->GetMsState(m_state.om.sampleMask),
@@ -3747,7 +3747,7 @@ namespace dxvk {
         ctx->setLogicOpState(InitDefaultLogicOpState());
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cSampleMask = m_state.om.sampleMask
         ] (DxvkContext* ctx) {
@@ -3774,7 +3774,7 @@ namespace dxvk {
       ctx->setBlendConstants(cBlendConstants);
     });
 
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerCs([
         cBlendConstants = DxvkBlendConstants {
           m_state.om.blendFactor[0], m_state.om.blendFactor[1],
@@ -3795,7 +3795,7 @@ namespace dxvk {
         ctx->setDepthStencilState(cState);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cState = m_state.om.dsState->GetState()
         ] (DxvkContext* ctx) {
@@ -3807,7 +3807,7 @@ namespace dxvk {
         ctx->setDepthStencilState(InitDefaultDepthStencilState());
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
           ctx->setDepthStencilState(InitDefaultDepthStencilState());
         });
@@ -3824,7 +3824,7 @@ namespace dxvk {
       ctx->setStencilReference(cStencilRef);
     });
 
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerCs([
         cStencilRef = m_state.om.stencilRef
       ] (DxvkContext* ctx) {
@@ -3845,7 +3845,7 @@ namespace dxvk {
         ctx->setDepthBias(cDepthBias);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cState      = m_state.rs.state->GetState(),
           cDepthBias  = m_state.rs.state->GetDepthBias()
@@ -3860,7 +3860,7 @@ namespace dxvk {
         ctx->setDepthBias(DxvkDepthBias());
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
           ctx->setRasterizerState(InitDefaultRasterizerState());
           ctx->setDepthBias(DxvkDepthBias());
@@ -3891,7 +3891,7 @@ namespace dxvk {
         0u, sizeof(cSpecData), &cSpecData);
     });
 
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerCs([
         cSpecData = specData
       ] (DxvkContext* ctx) {
@@ -3917,16 +3917,12 @@ namespace dxvk {
     // a viewport within 5% of the swapchain's aspect ratio is treated
     // as screen-space. Before the first present nothing is split.
     auto ViewportIsScreenSpace = [this] (const D3D11_VIEWPORT& vp) {
-      if constexpr (IsDeferred) {
+      VkExtent2D ref = GetTypedContext()->PresentExtent();
+      if (!ref.width || !ref.height || vp.Width <= 0.0f || vp.Height <= 0.0f)
         return false;
-      } else {
-        VkExtent2D ref = GetTypedContext()->PresentExtent();
-        if (!ref.width || !ref.height || vp.Width <= 0.0f || vp.Height <= 0.0f)
-          return false;
-        float a = vp.Width / vp.Height;
-        float r = float(ref.width) / float(ref.height);
-        return std::abs(a - r) < 0.05f * r;
-      }
+      float a = vp.Width / vp.Height;
+      float r = float(ref.width) / float(ref.height);
+      return std::abs(a - r) < 0.05f * r;
     };
 
     if (likely(viewportCount)) {
@@ -3964,7 +3960,7 @@ namespace dxvk {
           // single-GPU baseline renders half a screen.
           bool splitFrame = false;
 
-          if constexpr (!IsDeferred) {
+          if (GetTypedContext()->HasWorkerDevice()) {
             splitFrame = GetTypedContext()->HasWorkerDevice()
                       && !GetTypedContext()->NoScissor()
                       && ViewportIsScreenSpace(vp);
@@ -4002,7 +3998,7 @@ namespace dxvk {
       // Recomputed rather than read back out of m_csData so this does
       // not depend on the chunk's internal layout. Bounded at
       // D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE.
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         std::array<DxvkViewport,
           D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> workerViewports = { };
 
@@ -4051,7 +4047,7 @@ namespace dxvk {
         ctx->setViewports(1, &viewport);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
           DxvkViewport viewport = { };
           ctx->setViewports(1, &viewport);
@@ -4077,7 +4073,7 @@ namespace dxvk {
     // accumulates into m_workerCsChunk -- so the cost is chunk space,
     // not submissions. Worth revisiting if draw-heavy workloads show
     // the worker chunk filling much faster than the primary.
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerCs([
         cDraw = draw
       ] (DxvkContext* ctx) {
@@ -4111,7 +4107,7 @@ namespace dxvk {
       ApplyDirtyGraphicsBindings();
 
     // Batch consecutive draws if there are no state changes
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerCs([
         cDraw = draw
       ] (DxvkContext* ctx) {
@@ -4147,7 +4143,7 @@ namespace dxvk {
     if (pShaderModule) {
       auto buffer = pShaderModule->GetIcb();
       auto shader = pShaderModule->GetShader();
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         if (buffer.defined()) {
           bool mirrored = pShaderModule->GetWorkerIcb().defined();
           static std::atomic<uint64_t> s_hit  = { 0u };
@@ -4187,7 +4183,7 @@ namespace dxvk {
       // initializer uploads the same bytes to both, so the worker
       // binds its own slice here. Superposition's vertex shaders use
       // it; the testbed does not.
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cShader = shader,
           cBuffer = pShaderModule->GetWorkerIcb()
@@ -4235,7 +4231,7 @@ namespace dxvk {
       // command. Mirrored unconditionally for the same reason empty
       // framebuffer binds are: divergent state between the two
       // contexts turns every later bug into a two-part question.
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
           constexpr VkShaderStageFlagBits stage = GetShaderStage(ShaderStage);
 
@@ -4310,7 +4306,7 @@ namespace dxvk {
 
         // Worker-side mirror. Buffer-backed RTVs have no worker view
         // (see D3D11RenderTargetView) and are left as a gap here.
-        if constexpr (!IsDeferred)
+        if (GetTypedContext()->HasWorkerDevice())
           workerAttachments.color[i].view = m_state.om.rtvs[i]->GetWorkerImageView();
       }
     }
@@ -4322,11 +4318,11 @@ namespace dxvk {
       if (m_device->features().extDepthBiasControl.leastRepresentableValueForceUnormRepresentation)
         depthBiasRepresentation.depthBiasRepresentation = FormatToDepthBiasRepresentation(m_state.om.dsv->GetViewFormat());
 
-      if constexpr (!IsDeferred)
+      if (GetTypedContext()->HasWorkerDevice())
         workerAttachments.depth.view = m_state.om.dsv->GetWorkerImageView();
     }
 
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       static uint32_t s_fb = 0;
 
       if (s_fb++ < 40u) {
@@ -4349,7 +4345,7 @@ namespace dxvk {
       }
     }
 
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       static uint32_t s_fb = 0;
 
       if (s_fb++ < 40u) {
@@ -4386,7 +4382,7 @@ namespace dxvk {
     // the branch above already left workerAttachments empty for them.
     // Always dispatched, including empty binds, so the worker context
     // never holds a stale framebuffer relative to the primary one.
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerBindFramebuffer(std::move(workerAttachments));
     }
 
@@ -4410,7 +4406,7 @@ namespace dxvk {
         Forwarder::move(cArgBuffer),
         Forwarder::move(cCntBuffer));
     });
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       DxvkBufferSlice workerArg = pBufferForArgs  ? pBufferForArgs->GetWorkerBufferSlice()  : DxvkBufferSlice();
       DxvkBufferSlice workerCnt = pBufferForCount ? pBufferForCount->GetWorkerBufferSlice() : DxvkBufferSlice();
       {
@@ -4450,7 +4446,7 @@ namespace dxvk {
           cStride);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         {
           static uint32_t s_vb = 0;
 
@@ -4482,7 +4478,7 @@ namespace dxvk {
         ctx->bindVertexBuffer(cSlotId, DxvkBufferSlice(), 0);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cSlotId       = Slot
         ] (DxvkContext* ctx) {
@@ -4515,7 +4511,7 @@ namespace dxvk {
 
       // Range rebinds carry no resource handle, only numbers, so the
       // worker takes the identical command.
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cSlotId       = Slot,
           cBufferOffset = offset,
@@ -4549,7 +4545,7 @@ namespace dxvk {
           cIndexType);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cBufferSlice  = pBuffer->GetWorkerBufferSlice(Offset),
           cIndexType    = indexType
@@ -4566,7 +4562,7 @@ namespace dxvk {
         ctx->bindIndexBuffer(DxvkBufferSlice(), cIndexType);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cIndexType    = indexType
         ] (DxvkContext* ctx) {
@@ -4600,7 +4596,7 @@ namespace dxvk {
           cIndexType);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cBufferOffset = offset,
           cBufferLength = length,
@@ -4677,7 +4673,7 @@ namespace dxvk {
       // rather than once at load like vertex data, so this is the
       // largest outstanding gap before mirrored draws can produce
       // correct pixels.
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cSlotId      = slotId,
           cStage       = GetShaderStage(ShaderStage),
@@ -4695,7 +4691,7 @@ namespace dxvk {
         ctx->bindUniformBuffer(cStage, cSlotId, DxvkBufferSlice());
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cSlotId      = slotId,
           cStage       = GetShaderStage(ShaderStage)
@@ -4724,7 +4720,7 @@ namespace dxvk {
       ctx->bindUniformBufferRange(cStage, cSlotId, cOffset, cLength);
     });
 
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerCs([
         cSlotId = slotId,
         cStage  = GetShaderStage(ShaderStage),
@@ -4754,7 +4750,7 @@ namespace dxvk {
           Forwarder::move(cSampler));
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cSlotId   = slotId,
           cStage    = GetShaderStage(ShaderStage),
@@ -4772,7 +4768,7 @@ namespace dxvk {
         ctx->bindResourceSampler(cStage, cSlotId, nullptr);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cSlotId   = slotId,
           cStage    = GetShaderStage(ShaderStage)
@@ -4803,7 +4799,7 @@ namespace dxvk {
             Forwarder::move(cView));
         });
 
-        if constexpr (!IsDeferred) {
+        if (GetTypedContext()->HasWorkerDevice()) {
           Rc<DxvkImageView> workerSrv = pResource->GetWorkerImageView();
 
           // A null worker view here binds nothing and the shader
@@ -4844,7 +4840,7 @@ namespace dxvk {
             Forwarder::move(cView));
         });
 
-        if constexpr (!IsDeferred) {
+        if (GetTypedContext()->HasWorkerDevice()) {
           Rc<DxvkBufferView> workerSrv = pResource->GetWorkerBufferView();
           {
             static std::atomic<uint64_t> s_hit  = { 0u };
@@ -4873,7 +4869,7 @@ namespace dxvk {
         ctx->bindResourceImageView(cStage, cSlotId, nullptr);
       });
 
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cSlotId = slotId,
           cStage  = GetShaderStage(ShaderStage)
@@ -4911,7 +4907,7 @@ namespace dxvk {
           ctx->bindResourceBufferView(cStages, cCtrSlotId,
             Forwarder::move(cCounterView));
         });
-        if constexpr (!IsDeferred) {
+        if (GetTypedContext()->HasWorkerDevice()) {
           Rc<DxvkBufferView> workerUav = pUav->GetWorkerBufferView();
           {
             static std::atomic<uint64_t> s_hit  = { 0u };
@@ -4952,7 +4948,7 @@ namespace dxvk {
             Forwarder::move(cImageView));
           ctx->bindResourceBufferView(cStages, cCtrSlotId, nullptr);
         });
-        if constexpr (!IsDeferred) {
+        if (GetTypedContext()->HasWorkerDevice()) {
           Rc<DxvkImageView> workerUav = pUav->GetWorkerImageView();
           {
             static std::atomic<uint64_t> s_hit  = { 0u };
@@ -4984,7 +4980,7 @@ namespace dxvk {
         ctx->bindResourceImageView(cStages, cUavSlotId, nullptr);
         ctx->bindResourceBufferView(cStages, cCtrSlotId, nullptr);
       });
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         GetTypedContext()->EmitWorkerCs([
           cUavSlotId    = uavSlotId,
           cCtrSlotId    = ctrSlotId,
@@ -5179,7 +5175,7 @@ namespace dxvk {
       }
     });
 
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       DxvkBufferSlice workerDst = pDstBuffer->GetWorkerBufferSlice(DstOffset, ByteCount);
       DxvkBufferSlice workerSrc = pSrcBuffer->GetWorkerBufferSlice(SrcOffset, ByteCount);
       bool mirrored = workerDst.defined() && workerSrc.defined();
@@ -5319,7 +5315,7 @@ namespace dxvk {
             cSrcOffset, cExtent);
         }
       });
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         Rc<DxvkImage> workerDst = pDstTexture->GetWorkerImage();
         Rc<DxvkImage> workerSrc = pSrcTexture->GetWorkerImage();
         bool mirrored = workerDst != nullptr && workerSrc != nullptr;
@@ -5358,7 +5354,7 @@ namespace dxvk {
         }
       }
     } else {
-      if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
         static std::atomic<uint64_t> s_staging = { 0u };
         uint64_t n = ++s_staging;
         if (n <= 4u || (n % 10000u) == 0u)
@@ -5877,7 +5873,7 @@ namespace dxvk {
     // state keeps the zeroes from DxvkGraphicsPipelineStateInfo's
     // constructor -- including a zero colorWriteMask, which builds a
     // valid pipeline that rasterizes and writes no channel at all.
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
         ctx->setInputLayout(0, nullptr, 0, nullptr);
         ctx->setInputAssemblyState(InitDefaultPrimitiveTopology());
@@ -6916,7 +6912,7 @@ namespace dxvk {
       ctx->updateBuffer(cView->buffer(),
         cView->info().offset, sizeof(cCounter), &cCounter);
     });
-    if constexpr (!IsDeferred) {
+    if (GetTypedContext()->HasWorkerDevice()) {
       Rc<DxvkBufferView> workerView = pUav->GetWorkerCounterView();
       if (workerView != nullptr) {
         GetTypedContext()->EmitWorkerCs([

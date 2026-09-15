@@ -34,6 +34,12 @@ namespace dxvk {
     uint64_t AddCommandList(
             D3D11CommandList*   pCommandList);
 
+    void AddWorkerChunk(
+            DxvkCsChunkRef&&    Chunk);
+
+    void EmitWorkerToCsThread(
+      const std::function<void (DxvkCsChunkRef&&)>& DispatchProc);
+
     void EmitToCsThread(
       const D3D11ChunkDispatchProc& DispatchProc);
 
@@ -63,6 +69,7 @@ namespace dxvk {
     std::vector<ChunkEntry>             m_chunks;
     std::vector<Com<D3D11Query, false>> m_queries;
     std::vector<TrackedResource>        m_resources;
+    std::vector<DxvkCsChunkRef>         m_workerChunks;
 
     D3DDestructionNotifier              m_destructionNotifier;
 
