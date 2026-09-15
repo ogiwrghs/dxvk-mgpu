@@ -759,6 +759,20 @@ namespace dxvk {
           cDstView->elementCount(),
           cClearValue.color);
       });
+      if (GetTypedContext()->HasWorkerDevice()) {
+        Rc<DxvkBufferView> workerView = uav->GetWorkerBufferView();
+        if (workerView != nullptr) {
+          GetTypedContext()->EmitWorkerCs([
+            cClearValue = clearValue,
+            cDstView    = std::move(workerView)
+          ] (DxvkContext* ctx) {
+            ctx->clearBufferView(
+              cDstView, 0,
+              cDstView->elementCount(),
+              cClearValue.color);
+          });
+        }
+      }
     } else {
       EmitCs([
         cClearValue = clearValue,
@@ -770,6 +784,21 @@ namespace dxvk {
           VK_IMAGE_ASPECT_COLOR_BIT,
           cClearValue);
       });
+      if (GetTypedContext()->HasWorkerDevice()) {
+        Rc<DxvkImageView> workerView = uav->GetWorkerImageView();
+        if (workerView != nullptr) {
+          GetTypedContext()->EmitWorkerCs([
+            cClearValue = clearValue,
+            cDstView    = std::move(workerView)
+          ] (DxvkContext* ctx) {
+            ctx->clearImageView(cDstView,
+              VkOffset3D { 0, 0, 0 },
+              cDstView->mipLevelExtent(0),
+              VK_IMAGE_ASPECT_COLOR_BIT,
+              cClearValue);
+          });
+        }
+      }
     }
   }
 
