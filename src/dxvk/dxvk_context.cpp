@@ -13,6 +13,54 @@
 #include "dxvk_context.h"
 
 namespace dxvk {
+
+  // Per-device call census one layer below D3D11: every DxvkContext
+  // method counts once per call on whichever device's context ran it.
+  // A method the primary reaches and the worker never does is an
+  // unmirrored path, for any application, with no reading required.
+  struct MgpuCtxCounter {
+    const char*                     name;
+    VkDevice                        dev[2]   = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    std::atomic<uint64_t>           count[2] = { };
+    MgpuCtxCounter*                 next     = nullptr;
+    static std::atomic<MgpuCtxCounter*> s_head;
+
+    MgpuCtxCounter(const char* n) : name(n) {
+      MgpuCtxCounter* head = s_head.load();
+      do { next = head; } while (!s_head.compare_exchange_weak(head, this));
+    }
+
+    void hit(VkDevice h) {
+      for (uint32_t i = 0; i < 2u; i++) {
+        VkDevice expected = VK_NULL_HANDLE;
+        if (dev[i] == h || (dev[i] == VK_NULL_HANDLE
+         && reinterpret_cast<std::atomic<VkDevice>&>(dev[i]).compare_exchange_strong(expected, h))) {
+          count[i].fetch_add(1u, std::memory_order_relaxed);
+          return;
+        }
+        if (dev[i] == h) {
+          count[i].fetch_add(1u, std::memory_order_relaxed);
+          return;
+        }
+      }
+    }
+  };
+
+  std::atomic<MgpuCtxCounter*> MgpuCtxCounter::s_head = { nullptr };
+
+  void MgpuDumpCtxCounters() {
+    for (auto* c = MgpuCtxCounter::s_head.load(); c; c = c->next) {
+      uint64_t a = c->count[0].load();
+      uint64_t b = c->count[1].load();
+      const char* flag = ((a && !b) || (!a && b)) ? "  <-- ONE DEVICE ONLY"
+                       : (a != b) ? "  <-- differs" : "";
+      Logger::warn(str::format("MGPUCTX ", c->name,
+        " dev=", reinterpret_cast<uintptr_t>(c->dev[0]), " n=", a,
+        " dev=", reinterpret_cast<uintptr_t>(c->dev[1]), " n=", b, flag));
+    }
+  }
+
+#define MGPU_CTX_COUNT() { static MgpuCtxCounter s_mgpuCtx(__func__); s_mgpuCtx.hit(m_device->handle()); }
   
   DxvkContext::DxvkContext(const Rc<DxvkDevice>& device)
   : m_device      (device),
@@ -25,6 +73,7 @@ namespace dxvk {
     m_queryManager(m_common->queryPool()),
     m_descriptorWorker(device),
     m_implicitResolves(device) {
+    MGPU_CTX_COUNT();
     // Create descriptor heap or legacy pool object,
     // depending on feature support.
     if (device->canUseDescriptorHeap()) {
@@ -94,6 +143,7 @@ namespace dxvk {
   
   
   void DxvkContext::beginRecording(const Rc<DxvkCommandList>& cmdList) {
+    MGPU_CTX_COUNT();
     m_cmd = cmdList;
     m_cmd->init();
 
@@ -112,6 +162,7 @@ namespace dxvk {
   
   Rc<DxvkCommandList> DxvkContext::endRecording(
     const VkDebugUtilsLabelEXT*       reason) {
+    MGPU_CTX_COUNT();
     this->endCurrentCommands();
     this->relocateQueuedResources();
 
@@ -129,6 +180,7 @@ namespace dxvk {
 
 
   void DxvkContext::endFrame() {
+    MGPU_CTX_COUNT();
     m_renderPassIndex = 0u;
 
     if (m_frameCount >= m_framesToCapture.first && m_frameCount < m_framesToCapture.second)
@@ -144,6 +196,7 @@ namespace dxvk {
   void DxvkContext::beginLatencyTracking(
     const Rc<DxvkLatencyTracker>&     tracker,
           uint64_t                    frameId) {
+    MGPU_CTX_COUNT();
     if (tracker && (!m_latencyTracker || m_latencyTracker == tracker)) {
       tracker->notifyCsRenderBegin(frameId);
 
@@ -157,6 +210,7 @@ namespace dxvk {
 
   void DxvkContext::endLatencyTracking(
     const Rc<DxvkLatencyTracker>&     tracker) {
+    MGPU_CTX_COUNT();
     if (tracker && tracker == m_latencyTracker)
       m_endLatencyTracking = true;
   }
@@ -165,6 +219,7 @@ namespace dxvk {
   void DxvkContext::flushCommandList(
     const VkDebugUtilsLabelEXT*       reason,
           DxvkSubmitStatus*           status) {
+    MGPU_CTX_COUNT();
     // If necessary, block any async queue on previous command completion
     if (m_submitWaitId)
       m_cmd->waitFence(m_trackingFence, std::exchange(m_submitWaitId, 0ull));
@@ -206,6 +261,7 @@ namespace dxvk {
 
 
   Rc<DxvkCommandList> DxvkContext::beginExternalRendering() {
+    MGPU_CTX_COUNT();
     // Flush and invalidate everything
     endCurrentCommands();
     beginCurrentCommands();
@@ -215,11 +271,13 @@ namespace dxvk {
 
   
   void DxvkContext::beginQuery(const Rc<DxvkQuery>& query) {
+    MGPU_CTX_COUNT();
     m_queryManager.enableQuery(m_cmd, query);
   }
 
 
   void DxvkContext::endQuery(const Rc<DxvkQuery>& query) {
+    MGPU_CTX_COUNT();
     m_queryManager.disableQuery(m_cmd, query);
   }
   
@@ -230,6 +288,7 @@ namespace dxvk {
     const Rc<DxvkImageView>&    srcView,
     const VkOffset3D*           srcOffsets,
           VkFilter              filter) {
+    MGPU_CTX_COUNT();
     this->endCurrentPass(true);
 
     auto mapping = util::resolveSrcComponentMapping(
@@ -271,6 +330,7 @@ namespace dxvk {
           VkDeviceSize          offset,
           VkDeviceSize          length,
           uint32_t              value) {
+    MGPU_CTX_COUNT();
     DxvkResourceAccess access(*buffer, offset, length,
       VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
@@ -305,6 +365,7 @@ namespace dxvk {
           VkDeviceSize          offset,
           VkDeviceSize          length,
           VkClearColorValue     value) {
+    MGPU_CTX_COUNT();
     DxvkResourceAccess access(*bufferView, offset, length,
       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT);
 
@@ -366,6 +427,7 @@ namespace dxvk {
           VkImageAspectFlags    clearAspects,
           VkClearValue          clearValue,
           VkImageAspectFlags    discardAspects) {
+    MGPU_CTX_COUNT();
     // Make sure the color components are ordered correctly
     if (clearAspects & VK_IMAGE_ASPECT_COLOR_BIT) {
       clearValue.color = util::swizzleClearColor(clearValue.color,
@@ -433,6 +495,7 @@ namespace dxvk {
           VkExtent3D            extent,
           VkImageAspectFlags    aspect,
           VkClearValue          value) {
+    MGPU_CTX_COUNT();
     const VkImageUsageFlags viewUsage = imageView->info().usage;
 
     if (aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -460,6 +523,7 @@ namespace dxvk {
     const Rc<DxvkBuffer>&       srcBuffer,
           VkDeviceSize          srcOffset,
           VkDeviceSize          numBytes) {
+    MGPU_CTX_COUNT();
     small_vector<DxvkResourceAccess, 2u> accessBatch;
     accessBatch.emplace_back(*dstBuffer, dstOffset, numBytes, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     accessBatch.emplace_back(*srcBuffer, srcOffset, numBytes, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -498,6 +562,7 @@ namespace dxvk {
           VkDeviceSize          dstOffset,
           VkDeviceSize          srcOffset,
           VkDeviceSize          numBytes) {
+    MGPU_CTX_COUNT();
     VkDeviceSize loOvl = std::max(dstOffset, srcOffset);
     VkDeviceSize hiOvl = std::min(dstOffset, srcOffset) + numBytes;
 
@@ -534,6 +599,7 @@ namespace dxvk {
           VkDeviceSize          rowAlignment,
           VkDeviceSize          sliceAlignment,
           VkFormat              srcFormat) {
+    MGPU_CTX_COUNT();
     bool useFb = !formatsAreBufferCopyCompatible(dstImage->info().format, srcFormat)
               || dstImage->info().sampleCount != VK_SAMPLE_COUNT_1_BIT;
 
@@ -556,6 +622,7 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            extent) {
+    MGPU_CTX_COUNT();
     if (this->copyImageClear(dstImage, dstSubresource, dstOffset, extent, srcImage, srcSubresource)
      || this->copyImageInline(*dstImage, dstSubresource, dstOffset, *srcImage, srcSubresource, srcOffset, extent))
       return;
@@ -592,6 +659,7 @@ namespace dxvk {
           VkOffset3D            dstOffset,
           VkOffset3D            srcOffset,
           VkExtent3D            extent) {
+    MGPU_CTX_COUNT();
     VkOffset3D loOvl = {
       std::max(dstOffset.x, srcOffset.x),
       std::max(dstOffset.y, srcOffset.y),
@@ -663,6 +731,7 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            srcExtent) {
+    MGPU_CTX_COUNT();
     bool useFb = !formatsAreBufferCopyCompatible(srcImage->info().format, dstFormat);
 
     {
@@ -700,6 +769,7 @@ namespace dxvk {
           VkExtent3D            srcSize,
           VkExtent3D            extent,
           VkDeviceSize          elementSize) {
+    MGPU_CTX_COUNT();
     this->endCurrentPass(true);
     this->invalidateState();
 
@@ -834,6 +904,7 @@ namespace dxvk {
     const Rc<DxvkPagedResource>& srcResource,
           uint32_t              pageCount,
     const uint32_t*             pages) {
+    MGPU_CTX_COUNT();
     this->copySparsePages<true>(
       srcResource, pageCount, pages,
       dstBuffer, dstOffset);
@@ -846,6 +917,7 @@ namespace dxvk {
     const uint32_t*             pages,
     const Rc<DxvkBuffer>&       srcBuffer,
           VkDeviceSize          srcOffset) {
+    MGPU_CTX_COUNT();
     this->copySparsePages<false>(
       dstResource, pageCount, pages,
       srcBuffer, srcOffset);
@@ -854,6 +926,7 @@ namespace dxvk {
 
   void DxvkContext::discardImage(
     const Rc<DxvkImage>&          image) {
+    MGPU_CTX_COUNT();
     VkImageUsageFlags imageUsage = image->info().usage;
 
     if (!(imageUsage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
@@ -876,6 +949,7 @@ namespace dxvk {
           uint32_t x,
           uint32_t y,
           uint32_t z) {
+    MGPU_CTX_COUNT();
     if (this->commitComputeState<false>()) {
       m_queryManager.beginQueries(m_cmd,
         VK_QUERY_TYPE_PIPELINE_STATISTICS);
@@ -891,6 +965,7 @@ namespace dxvk {
   
   void DxvkContext::dispatchIndirect(
           VkDeviceSize      offset) {
+    MGPU_CTX_COUNT();
     auto argInfo = m_state.id.argBuffer.getSliceInfo();
 
     if (unlikely(offset + sizeof(VkDispatchIndirectCommand) > argInfo.size))
@@ -917,6 +992,7 @@ namespace dxvk {
   void DxvkContext::draw(
           uint32_t          count,
     const VkDrawIndirectCommand* draws) {
+    MGPU_CTX_COUNT();
     drawGeneric<false>(count, draws);
   }
   
@@ -926,6 +1002,7 @@ namespace dxvk {
           uint32_t          count,
           uint32_t          stride,
           bool              unroll) {
+    MGPU_CTX_COUNT();
     drawIndirectGeneric<false>(offset, count, stride, unroll);
   }
   
@@ -935,6 +1012,7 @@ namespace dxvk {
           VkDeviceSize      countOffset,
           uint32_t          maxCount,
           uint32_t          stride) {
+    MGPU_CTX_COUNT();
     drawIndirectCountGeneric<false>(offset, countOffset, maxCount, stride);
   }
   
@@ -942,6 +1020,7 @@ namespace dxvk {
   void DxvkContext::drawIndexed(
           uint32_t          count,
     const VkDrawIndexedIndirectCommand* draws) {
+    MGPU_CTX_COUNT();
     drawGeneric<true>(count, draws);
   }
 
@@ -951,6 +1030,7 @@ namespace dxvk {
           uint32_t          count,
           uint32_t          stride,
           bool              unroll) {
+    MGPU_CTX_COUNT();
     drawIndirectGeneric<true>(offset, count, stride, unroll);
   }
   
@@ -960,6 +1040,7 @@ namespace dxvk {
           VkDeviceSize      countOffset,
           uint32_t          maxCount,
           uint32_t          stride) {
+    MGPU_CTX_COUNT();
     drawIndirectCountGeneric<true>(offset, countOffset, maxCount, stride);
   }
 
@@ -968,6 +1049,7 @@ namespace dxvk {
           VkDeviceSize      counterOffset,
           uint32_t          counterDivisor,
           uint32_t          counterBias) {
+    MGPU_CTX_COUNT();
     if (this->commitGraphicsState<false, true>()) {
       auto argInfo = m_state.id.cntBuffer.getSliceInfo();
 
@@ -986,6 +1068,7 @@ namespace dxvk {
 
   void DxvkContext::initBuffer(
     const Rc<DxvkBuffer>&           buffer) {
+    MGPU_CTX_COUNT();
     auto dstSlice = buffer->getSliceInfo();
 
     // If the buffer is suballocated, clear the entire allocated
@@ -1043,6 +1126,7 @@ namespace dxvk {
   void DxvkContext::initImage(
     const Rc<DxvkImage>&            image,
           VkImageLayout             initialLayout) {
+    MGPU_CTX_COUNT();
     VkImageSubresourceRange subresources = image->getAvailableSubresources();
 
     if (initialLayout == VK_IMAGE_LAYOUT_PREINITIALIZED) {
@@ -1161,6 +1245,7 @@ namespace dxvk {
   
   void DxvkContext::initSparseImage(
     const Rc<DxvkImage>&            image) {
+    MGPU_CTX_COUNT();
     auto vk = m_device->vkd();
 
     // Query sparse memory requirements
@@ -1214,6 +1299,7 @@ namespace dxvk {
           VkAccessFlags             srcAccess,
           VkPipelineStageFlags      dstStages,
           VkAccessFlags             dstAccess) {
+    MGPU_CTX_COUNT();
     // Emit barrier early so we can fold this into
     // the spill render pass barrier if possible
     if (srcStages | dstStages) {
@@ -1234,6 +1320,7 @@ namespace dxvk {
   void DxvkContext::acquireExternalResource(
       const Rc<DxvkPagedResource>&    resource,
             VkImageLayout             layout) {
+    MGPU_CTX_COUNT();
     DxvkResourceAccess access;
     access.stages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     access.access = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -1277,6 +1364,7 @@ namespace dxvk {
   void DxvkContext::releaseExternalResource(
     const Rc<DxvkPagedResource>&    resource,
           VkImageLayout             layout) {
+    MGPU_CTX_COUNT();
     endCurrentPass(true);
 
     DxvkResourceAccess access;
@@ -1302,6 +1390,7 @@ namespace dxvk {
   void DxvkContext::generateMipmaps(
     const Rc<DxvkImageView>&        imageView,
           VkFilter                  filter) {
+    MGPU_CTX_COUNT();
     if (imageView->info().mipCount <= 1)
       return;
     
@@ -1361,6 +1450,7 @@ namespace dxvk {
   void DxvkContext::invalidateBuffer(
     const Rc<DxvkBuffer>&           buffer,
           Rc<DxvkResourceAllocation>&& slice) {
+    MGPU_CTX_COUNT();
     Rc<DxvkResourceAllocation> prevAllocation = buffer->assignStorage(std::move(slice));
     m_cmd->track(std::move(prevAllocation));
 
@@ -1401,6 +1491,7 @@ namespace dxvk {
 
   void DxvkContext::ensureBufferAddress(
     const Rc<DxvkBuffer>&           buffer) {
+    MGPU_CTX_COUNT();
     // Really nothing else to do here but set the flag
     if (buffer->canRelocate()) {
       buffer->enableStableAddress();
@@ -1414,6 +1505,7 @@ namespace dxvk {
     const Rc<DxvkImage>&            image,
           Rc<DxvkResourceAllocation>&& slice,
           VkImageLayout             layout) {
+    MGPU_CTX_COUNT();
     invalidateImageWithUsage(image, std::move(slice), DxvkImageUsageInfo(), layout);
   }
 
@@ -1423,6 +1515,7 @@ namespace dxvk {
           Rc<DxvkResourceAllocation>&& slice,
     const DxvkImageUsageInfo&       usageInfo,
           VkImageLayout             layout) {
+    MGPU_CTX_COUNT();
     VkImageUsageFlags usage = image->info().usage;
 
     // Invalidate active image descriptors
@@ -1494,6 +1587,7 @@ namespace dxvk {
   bool DxvkContext::ensureImageCompatibility(
     const Rc<DxvkImage>&            image,
     const DxvkImageUsageInfo&       usageInfo) {
+    MGPU_CTX_COUNT();
     // Check whether image usage, flags and view formats are supported.
     // If any of these are false, we need to create a new image.
     bool isUsageAndFormatCompatible = (image->info().usage & usageInfo.usage) == usageInfo.usage
@@ -1627,6 +1721,7 @@ namespace dxvk {
   void DxvkContext::drawGeneric(
           uint32_t                  count,
     const T*                        draws) {
+    MGPU_CTX_COUNT();
     if (this->commitGraphicsState<Indexed, false>()) {
       // The capped dump below only ever sees startup draws. This
       // accumulates the distinct pipeline state hashes each device
@@ -1805,6 +1900,7 @@ namespace dxvk {
           uint32_t                  count,
           uint32_t                  stride,
           bool                      unroll) {
+    MGPU_CTX_COUNT();
     constexpr VkDeviceSize ElementSize = Indexed
       ? sizeof(VkDrawIndexedIndirectCommand)
       : sizeof(VkDrawIndirectCommand);
@@ -1872,6 +1968,7 @@ namespace dxvk {
           VkDeviceSize          countOffset,
           uint32_t              maxCount,
           uint32_t              stride) {
+    MGPU_CTX_COUNT();
     constexpr VkDeviceSize ElementSize = Indexed
       ? sizeof(VkDrawIndexedIndirectCommand)
       : sizeof(VkDrawIndirectCommand);
@@ -1918,6 +2015,7 @@ namespace dxvk {
           VkDeviceSize          argOffset,
           VkDeviceSize          argStride,
           VkDeviceSize          argSize) {
+    MGPU_CTX_COUNT();
     if (unlikely(!count || bufferSize < argOffset + argSize))
       return std::make_pair(0u, 0u);
 
@@ -1940,6 +2038,7 @@ namespace dxvk {
           VkFormat                  format,
           VkResolveModeFlagBits     mode,
           VkResolveModeFlagBits     stencilMode) {
+    MGPU_CTX_COUNT();
     auto formatInfo = lookupFormatInfo(format);
 
     // Normalize resolve modes to available subresources
@@ -2044,6 +2143,7 @@ namespace dxvk {
     const VkImageSubresourceRange&  dstSubresources,
           VkImageLayout             srcLayout,
           VkImageLayout             dstLayout) {
+    MGPU_CTX_COUNT();
     this->endCurrentPass(false);
 
     if (srcLayout != dstLayout) {
@@ -2057,6 +2157,7 @@ namespace dxvk {
   
   
   void DxvkContext::acquireShadowAttachment(const DxvkAttachment& attachment) {
+    MGPU_CTX_COUNT();
     copyBufferToImage(attachment.view->image(),
       vk::pickSubresourceLayers(attachment.view->imageSubresources(), 0u),
       VkOffset3D(),
@@ -2068,6 +2169,7 @@ namespace dxvk {
 
 
   void DxvkContext::releaseShadowAttachment(const DxvkAttachment& attachment) {
+    MGPU_CTX_COUNT();
     copyImageToBuffer(
       attachment.shadow->buffer(),
       attachment.shadow->info().offset, 0u, 0u,
@@ -2079,6 +2181,7 @@ namespace dxvk {
 
 
   void DxvkContext::acquireShadowAttachments() {
+    MGPU_CTX_COUNT();
     for (uint32_t i = 0u; i < m_state.om.framebufferInfo.numAttachments(); i++) {
       const auto& attachment = m_state.om.framebufferInfo.getAttachment(i);
 
@@ -2089,6 +2192,7 @@ namespace dxvk {
 
 
   void DxvkContext::releaseShadowAttachments() {
+    MGPU_CTX_COUNT();
     for (uint32_t i = 0u; i < m_state.om.framebufferInfo.numAttachments(); i++) {
       const auto& attachment = m_state.om.framebufferInfo.getAttachment(i);
 
@@ -2100,6 +2204,7 @@ namespace dxvk {
 
   VkAttachmentStoreOp DxvkContext::determineClearStoreOp(
           VkAttachmentLoadOp        loadOp) const {
+    MGPU_CTX_COUNT();
     if (loadOp == VK_ATTACHMENT_LOAD_OP_NONE)
       return VK_ATTACHMENT_STORE_OP_NONE;
 
@@ -2116,6 +2221,7 @@ namespace dxvk {
           VkImageAspectFlags        discardAspects,
           VkImageAspectFlags        clearAspects,
           VkClearValue              clearValue) {
+    MGPU_CTX_COUNT();
     bool hasLoadOpNone = m_device->properties().khrMaintenance7.separateDepthStencilAttachmentAccess;
 
     DxvkColorAttachmentOps colorOp;
@@ -2198,6 +2304,7 @@ namespace dxvk {
 
   void DxvkContext::performClears(
     const DxvkClearBatch&           batch) {
+    MGPU_CTX_COUNT();
     auto [entries, count] = batch.getRange();
 
     // Batch barriers and try to hoist clears if possible
@@ -2307,6 +2414,7 @@ namespace dxvk {
     const Rc<DxvkImageView>&        imageView,
           VkImageAspectFlags        clearAspects,
           VkClearValue              clearValue) {
+    MGPU_CTX_COUNT();
     for (auto& entry : m_deferredClears) {
       if (entry.imageView->matchesView(imageView)) {
         entry.imageView = imageView;
@@ -2334,6 +2442,7 @@ namespace dxvk {
   void DxvkContext::deferDiscard(
     const Rc<DxvkImageView>&        imageView,
           VkImageAspectFlags        discardAspects) {
+    MGPU_CTX_COUNT();
     for (auto& entry : m_deferredClears) {
       if (entry.imageView->matchesView(imageView)) {
         entry.imageView = imageView;
@@ -2354,6 +2463,7 @@ namespace dxvk {
           DxvkDeferredClear&        clear,
           VkRenderingAttachmentInfo& attachment,
           VkImageAspectFlagBits     aspect) {
+    MGPU_CTX_COUNT();
     if (clear.clearAspects & aspect) {
       attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
       attachment.clearValue = clear.clearValue;
@@ -2368,6 +2478,7 @@ namespace dxvk {
 
 
   void DxvkContext::flushClearsInline() {
+    MGPU_CTX_COUNT();
     small_vector<VkClearAttachment, MaxNumRenderTargets + 1u> attachments;
 
     for (auto& clear : m_deferredClears) {
@@ -2432,6 +2543,7 @@ namespace dxvk {
 
   void DxvkContext::flushClears(
           bool                      useRenderPass) {
+    MGPU_CTX_COUNT();
     DxvkClearBatch clearBatch;
 
     for (const auto& clear : m_deferredClears) {
@@ -2456,6 +2568,7 @@ namespace dxvk {
 
 
   void DxvkContext::flushRenderPassDiscards() {
+    MGPU_CTX_COUNT();
     if (!m_deferredClears.empty()) {
       for (size_t i = 0; i < m_state.om.framebufferInfo.numAttachments(); i++) {
         auto view = m_state.om.framebufferInfo.getAttachment(i).view;
@@ -2495,6 +2608,7 @@ namespace dxvk {
 
 
   void DxvkContext::flushRenderPassResolves() {
+    MGPU_CTX_COUNT();
     for (size_t i = 0; i < m_state.om.framebufferInfo.numAttachments(); i++) {
       auto& resolve = m_deferredResolves.at(i);
 
@@ -2637,6 +2751,7 @@ namespace dxvk {
 
 
   void DxvkContext::flushResolves() {
+    MGPU_CTX_COUNT();
     for (size_t i = 0; i < m_state.om.framebufferInfo.numAttachments(); i++) {
       auto& resolve = m_deferredResolves.at(i);
 
@@ -2679,6 +2794,7 @@ namespace dxvk {
 
 
   void DxvkContext::finalizeLoadStoreOps() {
+    MGPU_CTX_COUNT();
     auto& renderingInfo = m_state.om.renderingInfo;
 
     // Track attachment access for render pass clears and resolves
@@ -2761,6 +2877,7 @@ namespace dxvk {
   void DxvkContext::adjustAttachmentLoadStoreOps(
           VkRenderingAttachmentInfo&  attachment,
           DxvkAccess                  access) const {
+    MGPU_CTX_COUNT();
     if (access == DxvkAccess::None) {
       // If the attachment is not accessed at all, we can set both the
       // load and store op to NONE if supported by the implementation.
@@ -2779,6 +2896,7 @@ namespace dxvk {
 
 
   void DxvkContext::adjustRenderArea(const VkRect2D& rect, bool layered) {
+    MGPU_CTX_COUNT();
     m_state.om.renderAreaLo = VkOffset2D {
       std::min(m_state.om.renderAreaLo.x, rect.offset.x),
       std::min(m_state.om.renderAreaLo.y, rect.offset.y) };
@@ -2794,6 +2912,7 @@ namespace dxvk {
           VkDeviceSize              offset,
           VkDeviceSize              size,
     const void*                     data) {
+    MGPU_CTX_COUNT();
     DxvkResourceAccess access(*buffer, offset, size,
       VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
@@ -2820,6 +2939,7 @@ namespace dxvk {
     const Rc<DxvkBuffer>&           source,
           VkDeviceSize              sourceOffset,
           VkDeviceSize              size) {
+    MGPU_CTX_COUNT();
     auto bufferSlice = buffer->getSliceInfo(bufferOffset, size);
     auto sourceSlice = source->getSliceInfo(sourceOffset, size);
 
@@ -2849,6 +2969,7 @@ namespace dxvk {
           VkDeviceSize              sourceOffset,
           VkDeviceSize              subresourceAlignment,
           VkFormat                  format) {
+    MGPU_CTX_COUNT();
     // Always use framebuffer path for depth-stencil images since we know
     // they are writeable and can't use Vulkan transfer queues. Stencil
     // data is interleaved and needs to be decoded manually anyway.
@@ -2865,6 +2986,7 @@ namespace dxvk {
   void DxvkContext::setViewports(
           uint32_t            viewportCount,
     const DxvkViewport*       viewports) {
+    MGPU_CTX_COUNT();
     for (uint32_t i = 0; i < viewportCount; i++) {
       m_state.vp.viewports[i] = viewports[i].viewport;
       m_state.vp.scissorRects[i] = viewports[i].scissor;
@@ -2888,6 +3010,7 @@ namespace dxvk {
   
   void DxvkContext::setBlendConstants(
           DxvkBlendConstants  blendConstants) {
+    MGPU_CTX_COUNT();
     if (m_state.dyn.blendConstants != blendConstants) {
       m_state.dyn.blendConstants = blendConstants;
       m_flags.set(DxvkContextFlag::GpDirtyBlendConstants);
@@ -2897,6 +3020,7 @@ namespace dxvk {
   
   void DxvkContext::setDepthBias(
           DxvkDepthBias       depthBias) {
+    MGPU_CTX_COUNT();
     if (m_state.dyn.depthBias != depthBias) {
       m_state.dyn.depthBias = depthBias;
       m_flags.set(DxvkContextFlag::GpDirtyDepthBias);
@@ -2906,6 +3030,7 @@ namespace dxvk {
 
   void DxvkContext::setDepthBiasRepresentation(
           DxvkDepthBiasRepresentation  depthBiasRepresentation) {
+    MGPU_CTX_COUNT();
     if (m_state.dyn.depthBiasRepresentation != depthBiasRepresentation) {
       m_state.dyn.depthBiasRepresentation = depthBiasRepresentation;
       m_flags.set(DxvkContextFlag::GpDirtyDepthBias);
@@ -2915,6 +3040,7 @@ namespace dxvk {
 
   void DxvkContext::setDepthBounds(
           DxvkDepthBounds     depthBounds) {
+    MGPU_CTX_COUNT();
     if (m_state.dyn.depthBounds != depthBounds) {
       m_state.dyn.depthBounds = depthBounds;
       m_flags.set(DxvkContextFlag::GpDirtyDepthBounds);
@@ -2924,6 +3050,7 @@ namespace dxvk {
   
   void DxvkContext::setStencilReference(
           uint32_t            reference) {
+    MGPU_CTX_COUNT();
     if (m_state.dyn.stencilReference != reference) {
       m_state.dyn.stencilReference = reference;
       m_flags.set(DxvkContextFlag::GpDirtyStencilRef);
@@ -2932,6 +3059,7 @@ namespace dxvk {
   
   
   void DxvkContext::setInputAssemblyState(const DxvkInputAssemblyState& ia) {
+    MGPU_CTX_COUNT();
     m_state.gp.state.ia = DxvkIaInfo(
       ia.primitiveTopology(),
       ia.primitiveRestart(),
@@ -2946,6 +3074,7 @@ namespace dxvk {
     const DxvkVertexInput*     attributes,
           uint32_t             bindingCount,
     const DxvkVertexInput*     bindings) {
+    MGPU_CTX_COUNT();
     // Avoiding redundant input layout setups from the front-end can be
     // hard, but at least avoid rebinding the pipeline redundantly.
     bool dirty = m_state.gp.state.il.attributeCount() != attributeCount
@@ -3009,6 +3138,7 @@ namespace dxvk {
 
 
   void DxvkContext::setRasterizerState(const DxvkRasterizerState& rs) {
+    MGPU_CTX_COUNT();
     VkCullModeFlags cullMode = rs.cullMode();
     VkFrontFace frontFace = rs.frontFace();
 
@@ -3046,6 +3176,7 @@ namespace dxvk {
   
   
   void DxvkContext::setMultisampleState(const DxvkMultisampleState& ms) {
+    MGPU_CTX_COUNT();
     m_state.gp.state.ms = DxvkMsInfo(
       m_state.gp.state.ms.sampleCount(),
       ms.sampleMask(),
@@ -3058,6 +3189,7 @@ namespace dxvk {
   
   
   void DxvkContext::setDepthStencilState(const DxvkDepthStencilState& ds) {
+    MGPU_CTX_COUNT();
     if (m_state.dyn.depthStencilState.depthTest() != ds.depthTest()
      || m_state.dyn.depthStencilState.depthWrite() != ds.depthWrite()
      || m_state.dyn.depthStencilState.depthCompareOp() != ds.depthCompareOp())
@@ -3073,6 +3205,7 @@ namespace dxvk {
   
   
   void DxvkContext::setLogicOpState(const DxvkLogicOpState& lo) {
+    MGPU_CTX_COUNT();
     m_state.gp.state.om = DxvkOmInfo(
       lo.logicOpEnable(),
       lo.logicOp(),
@@ -3085,6 +3218,7 @@ namespace dxvk {
   void DxvkContext::setBlendMode(
           uint32_t            attachment,
     const DxvkBlendMode&      blendMode) {
+    MGPU_CTX_COUNT();
     m_state.gp.state.omBlend[attachment] = DxvkOmAttachmentBlend(
       blendMode.blendEnable(),
       blendMode.colorSrcFactor(),
@@ -3100,6 +3234,7 @@ namespace dxvk {
 
 
   void DxvkContext::setBarrierControl(DxvkBarrierControlFlags control) {
+    MGPU_CTX_COUNT();
     // If any currently relevant control flags change, play it safe and force
     // a barrier the next time we encounter a write-after-write hazard, even
     // if the same set of flags is restored by that time. Only check graphics
@@ -3125,6 +3260,7 @@ namespace dxvk {
   void DxvkContext::updatePageTable(
     const DxvkSparseBindInfo&   bindInfo,
           DxvkSparseBindFlags   flags) {
+    MGPU_CTX_COUNT();
     // Split command buffers here so that we execute
     // the sparse binding operation at the right time
     if (!flags.test(DxvkSparseBindFlag::SkipSynchronization))
@@ -3214,6 +3350,7 @@ namespace dxvk {
 
 
   void DxvkContext::signalGpuEvent(const Rc<DxvkEvent>& event) {
+    MGPU_CTX_COUNT();
     this->endCurrentPass(true);
     
     Rc<DxvkGpuEvent> gpuEvent = m_common->eventPool().allocEvent();
@@ -3238,6 +3375,7 @@ namespace dxvk {
     const VkCuLaunchInfoNVX& nvxLaunchInfo,
     const std::vector<std::pair<Rc<DxvkBuffer>, DxvkAccessFlags>>& buffers,
     const std::vector<std::pair<Rc<DxvkImage>,  DxvkAccessFlags>>& images) {
+    MGPU_CTX_COUNT();
     // The resources in the std::vectors above are called-out
     // explicitly in the API for barrier and tracking purposes
     // since they're being used bindlessly.
@@ -3274,32 +3412,38 @@ namespace dxvk {
   
   
   void DxvkContext::writeTimestamp(const Rc<DxvkQuery>& query) {
+    MGPU_CTX_COUNT();
     m_queryManager.writeTimestamp(m_cmd, query);
   }
 
 
   void DxvkContext::signal(const Rc<sync::Signal>& signal, uint64_t value) {
+    MGPU_CTX_COUNT();
     m_cmd->queueSignal(signal, value);
   }
 
 
   void DxvkContext::waitFence(const Rc<DxvkFence>& fence, uint64_t value) {
+    MGPU_CTX_COUNT();
     m_cmd->waitFence(fence, value);
   }
 
 
   void DxvkContext::signalFence(const Rc<DxvkFence>& fence, uint64_t value) {
+    MGPU_CTX_COUNT();
     m_cmd->signalFence(fence, value);
   }
 
 
   bool DxvkContext::needsDrawBarriers() {
+    MGPU_CTX_COUNT();
     return m_state.gp.flags.test(DxvkGraphicsPipelineFlag::UnrollMergedDraws)
       && !m_barrierControl.test(DxvkBarrierControl::GraphicsAllowReadWriteOverlap);
   }
 
 
   void DxvkContext::beginRenderPassDebugRegion() {
+    MGPU_CTX_COUNT();
     VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_1_BIT;
 
     bool hasFeedbackLoop = false;
@@ -3368,6 +3512,7 @@ namespace dxvk {
 
   template<VkPipelineBindPoint BindPoint>
   void DxvkContext::beginBarrierControlDebugRegion() {
+    MGPU_CTX_COUNT();
     if (hasDebugRegion(util::DxvkDebugLabelType::InternalBarrierControl))
       return;
 
@@ -3391,24 +3536,28 @@ namespace dxvk {
 
 
   void DxvkContext::beginDebugLabel(const VkDebugUtilsLabelEXT& label) {
+    MGPU_CTX_COUNT();
     if (m_features.test(DxvkContextFeature::DebugUtils))
       pushDebugRegion(label, util::DxvkDebugLabelType::External);
   }
 
 
   void DxvkContext::endDebugLabel() {
+    MGPU_CTX_COUNT();
     if (m_features.test(DxvkContextFeature::DebugUtils))
       popDebugRegion(util::DxvkDebugLabelType::External);
   }
 
 
   void DxvkContext::insertDebugLabel(const VkDebugUtilsLabelEXT& label) {
+    MGPU_CTX_COUNT();
     if (m_features.test(DxvkContextFeature::DebugUtils))
       m_cmd->cmdInsertDebugUtilsLabel(DxvkCmdBuffer::ExecBuffer, label);
   }
 
 
   void DxvkContext::setDebugName(const Rc<DxvkPagedResource>& resource, const char* name) {
+    MGPU_CTX_COUNT();
     if (m_features.test(DxvkContextFeature::DebugUtils))
       resource->setDebugName(name);
   }
@@ -3420,6 +3569,7 @@ namespace dxvk {
           Rc<DxvkImageView>     srcView,
     const VkOffset3D*           srcOffsets,
           VkFilter              filter) {
+    MGPU_CTX_COUNT();
     this->invalidateState();
 
     bool dstIsDepthStencil = dstView->info().aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
@@ -3574,6 +3724,7 @@ namespace dxvk {
     const Rc<DxvkImageView>&    srcView,
     const VkOffset3D*           srcOffsets,
           VkFilter              filter) {
+    MGPU_CTX_COUNT();
     // Prepare the two images for transfer ops if necessary
     auto dstLayout = dstView->image()->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     auto srcLayout = srcView->image()->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -3619,6 +3770,7 @@ namespace dxvk {
     const DxvkResourceBufferInfo& bufferSlice,
           VkDeviceSize          bufferRowAlignment,
           VkDeviceSize          bufferSliceAlignment) {
+    MGPU_CTX_COUNT();
     auto formatInfo = image->formatInfo();
     auto layers = imageSubresource.layerCount;
 
@@ -3722,6 +3874,7 @@ namespace dxvk {
           VkDeviceSize          bufferOffset,
           VkDeviceSize          bufferRowAlignment,
           VkDeviceSize          bufferSliceAlignment) {
+    MGPU_CTX_COUNT();
     VkDeviceSize dataSize = imageSubresource.layerCount * util::computeImageDataSize(
       image->info().format, imageExtent, imageSubresource.aspectMask);
 
@@ -3774,6 +3927,7 @@ namespace dxvk {
           VkDeviceSize          bufferRowAlignment,
           VkDeviceSize          bufferSliceAlignment,
           VkFormat              bufferFormat) {
+    MGPU_CTX_COUNT();
     this->endCurrentPass(true);
     this->invalidateState();
 
@@ -4031,6 +4185,7 @@ namespace dxvk {
           VkImageSubresourceLayers imageSubresource,
           VkOffset3D            imageOffset,
           VkExtent3D            imageExtent) {
+    MGPU_CTX_COUNT();
     this->endCurrentPass(true);
 
     VkDeviceSize dataSize = imageSubresource.layerCount * util::computeImageDataSize(
@@ -4076,6 +4231,7 @@ namespace dxvk {
           VkImageSubresourceLayers imageSubresource,
           VkOffset3D            imageOffset,
           VkExtent3D            imageExtent) {
+    MGPU_CTX_COUNT();
     this->endCurrentPass(true);
     this->invalidateState();
 
@@ -4217,6 +4373,7 @@ namespace dxvk {
           VkExtent3D            extent,
           VkImageAspectFlags    aspect,
           VkClearValue          value) {
+    MGPU_CTX_COUNT();
     // Ensure that the clear region is actually within the bounds of the given view
     VkExtent3D mipExtent = imageView->mipLevelExtent(0);
 
@@ -4408,6 +4565,7 @@ namespace dxvk {
           VkOffset3D            offset,
           VkExtent3D            extent,
           VkClearValue          value) {
+    MGPU_CTX_COUNT();
     DxvkResourceAccess access(*imageView, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
       imageView->image()->isFullSubresource(vk::pickSubresourceLayers(imageView->imageSubresources(), 0u), extent));
 
@@ -4476,6 +4634,7 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            extent) {
+    MGPU_CTX_COUNT();
     auto dstSubresourceRange = vk::makeSubresourceRange(dstSubresource);
     auto srcSubresourceRange = vk::makeSubresourceRange(srcSubresource);
 
@@ -4575,6 +4734,7 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            extent) {
+    MGPU_CTX_COUNT();
     this->endCurrentPass(true);
     this->invalidateState();
 
@@ -4815,6 +4975,7 @@ namespace dxvk {
           VkExtent3D            dstExtent,
     const Rc<DxvkImage>&        srcImage,
           VkImageSubresourceLayers srcSubresource) {
+    MGPU_CTX_COUNT();
     // If the source image has a pending deferred clear, we can
     // implement the copy by clearing the destination image to
     // the same clear value.
@@ -4874,6 +5035,7 @@ namespace dxvk {
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
           VkExtent3D            extent) {
+    MGPU_CTX_COUNT();
     if (!m_flags.test(DxvkContextFlag::GpRenderPassActive))
       return false;
 
@@ -5134,6 +5296,7 @@ namespace dxvk {
     const uint32_t*             pages,
     const Rc<DxvkBuffer>&       buffer,
           VkDeviceSize          offset) {
+    MGPU_CTX_COUNT();
     auto pageTable = sparse->getSparsePageTable();
 
     if (pageTable->getBufferHandle()) {
@@ -5155,6 +5318,7 @@ namespace dxvk {
     const uint32_t*             pages,
     const Rc<DxvkBuffer>&       buffer,
           VkDeviceSize          offset) {
+    MGPU_CTX_COUNT();
     std::vector<VkBufferCopy2> regions;
     regions.reserve(pageCount);
 
@@ -5204,6 +5368,7 @@ namespace dxvk {
     const uint32_t*             pages,
     const Rc<DxvkBuffer>&       buffer,
           VkDeviceSize          offset) {
+    MGPU_CTX_COUNT();
     std::vector<VkBufferImageCopy2> regions;
     regions.reserve(pageCount);
 
@@ -5266,6 +5431,7 @@ namespace dxvk {
   void DxvkContext::generateMipmapsHw(
     const Rc<DxvkImageView>&        imageView,
           VkFilter                  filter) {
+    MGPU_CTX_COUNT();
     auto image = imageView->image();
 
     VkImageSubresourceRange subresources = imageView->imageSubresources();
@@ -5320,6 +5486,7 @@ namespace dxvk {
   void DxvkContext::generateMipmapsFb(
     const Rc<DxvkImageView>&        imageView,
           VkFilter                  filter) {
+    MGPU_CTX_COUNT();
     this->invalidateState();
 
     // Make sure we can both render to and read from the image
@@ -5436,6 +5603,7 @@ namespace dxvk {
 
   void DxvkContext::generateMipmapsCs(
     const Rc<DxvkImageView>&        imageView) {
+    MGPU_CTX_COUNT();
     this->invalidateState();
 
     // Number of descriptors to bind, first is for source mip
@@ -5565,6 +5733,7 @@ namespace dxvk {
     const Rc<DxvkImage>&            dstImage,
     const Rc<DxvkImage>&            srcImage,
     const VkImageResolve&           region) {
+    MGPU_CTX_COUNT();
     auto dstSubresourceRange = vk::makeSubresourceRange(region.dstSubresource);
     auto srcSubresourceRange = vk::makeSubresourceRange(region.srcSubresource);
 
@@ -5617,6 +5786,7 @@ namespace dxvk {
           VkResolveModeFlagBits     mode,
           VkResolveModeFlagBits     stencilMode,
           bool                      flushClears) {
+    MGPU_CTX_COUNT();
     auto dstSubresourceRange = vk::makeSubresourceRange(region.dstSubresource);
     auto srcSubresourceRange = vk::makeSubresourceRange(region.srcSubresource);
 
@@ -5716,6 +5886,7 @@ namespace dxvk {
           VkFormat                  format,
           VkResolveModeFlagBits     depthMode,
           VkResolveModeFlagBits     stencilMode) {
+    MGPU_CTX_COUNT();
     this->invalidateState();
 
     auto dstSubresourceRange = vk::makeSubresourceRange(region.dstSubresource);
@@ -5937,6 +6108,7 @@ namespace dxvk {
     const Rc<DxvkImage>&            srcImage,
     const VkImageResolve&           region,
           VkFormat                  format) {
+    MGPU_CTX_COUNT();
     // If the destination image is only partially written, ignore
     if (dstImage->mipLevelExtent(region.dstSubresource.mipLevel, region.dstSubresource.aspectMask) != region.extent)
       return false;
@@ -5998,6 +6170,7 @@ namespace dxvk {
           VkFormat                  format,
           VkResolveModeFlagBits     depthMode,
           VkResolveModeFlagBits     stencilMode) {
+    MGPU_CTX_COUNT();
     // Ignore any non-2D images due to the added complexity, and the
     // source image is going to be a multisampled 2D image anyway.
     if (dstImage->info().type != VK_IMAGE_TYPE_2D)
@@ -6147,6 +6320,7 @@ namespace dxvk {
           VkDeviceSize              sourceOffset,
           VkDeviceSize              subresourceAlignment,
           VkFormat                  format) {
+    MGPU_CTX_COUNT();
     if (!format)
       format = image->info().format;
 
@@ -6178,6 +6352,7 @@ namespace dxvk {
     const Rc<DxvkBuffer>&           source,
           VkDeviceSize              sourceOffset,
           VkDeviceSize              subresourceAlignment) {
+    MGPU_CTX_COUNT();
     // Initialize all subresources of the image at once
     VkImageLayout transferLayout = image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
@@ -6220,6 +6395,7 @@ namespace dxvk {
 
 
   void DxvkContext::beginRenderPass() {
+    MGPU_CTX_COUNT();
     if (!m_flags.test(DxvkContextFlag::GpRenderPassActive)) {
       if (unlikely(m_features.test(DxvkContextFeature::DebugUtils)))
         popDebugRegion(util::DxvkDebugLabelType::InternalBarrierControl);
@@ -6275,6 +6451,7 @@ namespace dxvk {
   
   
   void DxvkContext::endRenderPass(bool suspend) {
+    MGPU_CTX_COUNT();
     if (m_flags.test(DxvkContextFlag::GpRenderPassActive)) {
       bool unsynchronized = m_flags.test(DxvkContextFlag::GpRenderPassUnsynchronized);
 
@@ -6337,6 +6514,7 @@ namespace dxvk {
 
 
   void DxvkContext::endCurrentPass(bool suspend) {
+    MGPU_CTX_COUNT();
     endRenderPass(suspend);
     endComputePass();
   }
@@ -6345,6 +6523,7 @@ namespace dxvk {
   void DxvkContext::acquireRenderTargets(
     const DxvkFramebufferInfo&  framebufferInfo,
           DxvkRenderPassOps&    ops) {
+    MGPU_CTX_COUNT();
     m_rtAccess.clear();
 
     // Try to perform the layout transitions on the init command buffer to avoid
@@ -6433,6 +6612,7 @@ namespace dxvk {
 
 
   void DxvkContext::releaseRenderTargets() {
+    MGPU_CTX_COUNT();
     releaseResources(DxvkCmdBuffer::ExecBuffer, m_rtAccess.size(), m_rtAccess.data());
 
     m_rtAccess.clear();
@@ -6440,6 +6620,7 @@ namespace dxvk {
 
 
   bool DxvkContext::renderPassStartUnsynchronized() {
+    MGPU_CTX_COUNT();
     // Don't even try if there is a depth buffer bound, this is most likely
     // either a shadow pass or an otherwise expensive main render pass.
     //
@@ -6462,6 +6643,7 @@ namespace dxvk {
   void DxvkContext::renderPassBindFramebuffer(
     const DxvkFramebufferInfo&  framebufferInfo,
           DxvkRenderPassOps&    ops) {
+    MGPU_CTX_COUNT();
     const DxvkFramebufferSize fbSize = framebufferInfo.size();
 
     {
@@ -6682,6 +6864,7 @@ namespace dxvk {
   
   
   void DxvkContext::renderPassUnbindFramebuffer() {
+    MGPU_CTX_COUNT();
     if (m_flags.test(DxvkContextFlag::GpRenderPassSecondaryCmd)) {
       m_flags.clr(DxvkContextFlag::GpRenderPassSecondaryCmd);
       VkCommandBuffer cmdBuffer = m_cmd->endSecondaryCommandBuffer();
@@ -6711,6 +6894,7 @@ namespace dxvk {
   void DxvkContext::resetRenderPassOps(
     const DxvkRenderTargets&    renderTargets,
           DxvkRenderPassOps&    renderPassOps) {
+    MGPU_CTX_COUNT();
     renderPassOps.depthOps = DxvkDepthAttachmentOps {
       VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_LOAD };
     
@@ -6720,6 +6904,7 @@ namespace dxvk {
   
   
   void DxvkContext::startTransformFeedback() {
+    MGPU_CTX_COUNT();
     if (!m_flags.test(DxvkContextFlag::GpXfbActive)) {
       m_flags.set(DxvkContextFlag::GpXfbActive);
 
@@ -6758,6 +6943,7 @@ namespace dxvk {
 
 
   void DxvkContext::pauseTransformFeedback() {
+    MGPU_CTX_COUNT();
     if (m_flags.test(DxvkContextFlag::GpXfbActive)) {
       m_flags.clr(DxvkContextFlag::GpXfbActive);
       
@@ -6783,6 +6969,7 @@ namespace dxvk {
 
 
   void DxvkContext::unbindComputePipeline() {
+    MGPU_CTX_COUNT();
     m_flags.set(DxvkContextFlag::CpDirtyPipelineState);
     m_flags.clr(DxvkContextFlag::CpHasPushData);
 
@@ -6791,6 +6978,7 @@ namespace dxvk {
   
   
   bool DxvkContext::updateComputePipelineState() {
+    MGPU_CTX_COUNT();
     if (unlikely(m_state.gp.pipeline != nullptr))
       this->unbindGraphicsPipeline();
 
@@ -6847,6 +7035,7 @@ namespace dxvk {
   
   
   void DxvkContext::unbindGraphicsPipeline() {
+    MGPU_CTX_COUNT();
     m_flags.set(DxvkContextFlag::GpDirtyPipeline,
                 DxvkContextFlag::GpDirtyPipelineState,
                 DxvkContextFlag::GpDirtyVertexBuffers,
@@ -6872,6 +7061,7 @@ namespace dxvk {
   
   
   bool DxvkContext::updateGraphicsPipeline() {
+    MGPU_CTX_COUNT();
     if (unlikely(m_state.cp.pipeline != nullptr))
       this->unbindComputePipeline();
 
@@ -6885,10 +7075,13 @@ namespace dxvk {
       static std::atomic<uint32_t> s_lookupFail = { 0u };
       uint32_t n = ++s_lookupFail;
 
-      if (n <= 5u) {
-        Logger::warn(str::format("updateGraphicsPipeline: lookup failed #", n,
+      if (n <= 8u || (n % 1000u) == 0u) {
+        Logger::warn(str::format("SHADERSEQ DRAW-FAIL updateGraphicsPipeline: lookup failed #", n,
+          " dev=", reinterpret_cast<uintptr_t>(m_device->handle()),
           " vs=", (m_state.gp.shaders.vs != nullptr),
-          " fs=", (m_state.gp.shaders.fs != nullptr)));
+          " gs=", (m_state.gp.shaders.gs != nullptr),
+          " fs=", (m_state.gp.shaders.fs != nullptr),
+          " rpActive=", m_flags.test(DxvkContextFlag::GpRenderPassActive)));
       }
 
       m_state.gp.flags = DxvkGraphicsPipelineFlags();
@@ -6919,6 +7112,7 @@ namespace dxvk {
   
   
   bool DxvkContext::updateGraphicsPipelineState() {
+    MGPU_CTX_COUNT();
     auto oldPipelineLayoutType = getActivePipelineLayoutType(VK_PIPELINE_BIND_POINT_GRAPHICS);
 
     // Check which dynamic states need to be active. States that
@@ -7089,6 +7283,7 @@ namespace dxvk {
 
 
   uint32_t DxvkContext::getGraphicsPipelineDebugColor() const {
+    MGPU_CTX_COUNT();
     if (m_state.gp.flags.test(DxvkGraphicsPipelineFlag::HasStorageDescriptors))
       return 0xf0a2dc;
 
@@ -7102,6 +7297,7 @@ namespace dxvk {
   template<VkPipelineBindPoint BindPoint>
   void DxvkContext::resetSpecConstants(
           uint32_t                newMask) {
+    MGPU_CTX_COUNT();
     auto& scInfo  = BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS ? m_state.gp.state.sc  : m_state.cp.state.sc;
     auto& scState = BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS ? m_state.gp.constants : m_state.cp.constants;
 
@@ -7126,6 +7322,7 @@ namespace dxvk {
 
   template<VkPipelineBindPoint BindPoint>
   void DxvkContext::updateSpecConstants() {
+    MGPU_CTX_COUNT();
     auto& scInfo  = BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS ? m_state.gp.state.sc  : m_state.cp.state.sc;
     auto& scState = BindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS ? m_state.gp.constants : m_state.cp.constants;
 
@@ -7144,12 +7341,14 @@ namespace dxvk {
 
 
   void DxvkContext::invalidateState() {
+    MGPU_CTX_COUNT();
     this->unbindComputePipeline();
     this->unbindGraphicsPipeline();
   }
 
   template<VkPipelineBindPoint BindPoint>
   void DxvkContext::updateSamplerSet(const DxvkPipelineLayout* layout) {
+    MGPU_CTX_COUNT();
     if (m_features.test(DxvkContextFeature::DescriptorBuffer)) {
       const uint32_t     bufferIndex = 0u;
       const VkDeviceSize bufferOffset = 0u;
@@ -7179,6 +7378,7 @@ namespace dxvk {
 
   template<VkPipelineBindPoint BindPoint, bool AlwaysTrack>
   bool DxvkContext::updateResourceBindings(const DxvkPipelineBindings* layout) {
+    MGPU_CTX_COUNT();
     if (m_features.test(DxvkContextFeature::DescriptorHeap)) {
       if (!updateDescriptorHeapBindings<BindPoint, DxvkBindingModel::DescriptorHeap, AlwaysTrack>(layout))
         return false;
@@ -7196,6 +7396,7 @@ namespace dxvk {
 
   template<VkPipelineBindPoint BindPoint, bool AlwaysTrack>
   void DxvkContext::updateDescriptorSetsBindings(const DxvkPipelineBindings* layout) {
+    MGPU_CTX_COUNT();
     constexpr bool TrackBindings = AlwaysTrack || BindPoint == VK_PIPELINE_BIND_POINT_COMPUTE;
 
     DxvkPipelineLayoutType pipelineLayoutType = getActivePipelineLayoutType(BindPoint);
@@ -7444,6 +7645,7 @@ namespace dxvk {
 
   template<VkPipelineBindPoint BindPoint, DxvkBindingModel Model, bool AlwaysTrack>
   bool DxvkContext::updateDescriptorHeapBindings(const DxvkPipelineBindings* layout) {
+    MGPU_CTX_COUNT();
     constexpr bool TrackBindings = AlwaysTrack || BindPoint == VK_PIPELINE_BIND_POINT_COMPUTE;
     using HeapOffset = std::conditional_t<Model == DxvkBindingModel::DescriptorHeap, uint32_t, VkDeviceSize>;
 
@@ -7652,6 +7854,7 @@ namespace dxvk {
 
   template<VkPipelineBindPoint BindPoint, bool AlwaysTrack>
   void DxvkContext::updatePushDataBindings(const DxvkPipelineBindings* layout) {
+    MGPU_CTX_COUNT();
     constexpr bool TrackBindings = AlwaysTrack || BindPoint == VK_PIPELINE_BIND_POINT_COMPUTE;
 
     DxvkPipelineLayoutType pipelineLayoutType = getActivePipelineLayoutType(BindPoint);
@@ -7712,6 +7915,7 @@ namespace dxvk {
 
 
   void DxvkContext::updateComputeShaderResources() {
+    MGPU_CTX_COUNT();
     this->updateResourceBindings<VK_PIPELINE_BIND_POINT_COMPUTE, true>(
       m_state.cp.pipeline->getLayout());
 
@@ -7720,6 +7924,7 @@ namespace dxvk {
   
   
   bool DxvkContext::updateGraphicsShaderResources() {
+    MGPU_CTX_COUNT();
     bool status;
 
     if (m_flags.test(DxvkContextFlag::GpRenderPassUnsynchronized)) {
@@ -7742,11 +7947,13 @@ namespace dxvk {
   
   DxvkFramebufferInfo DxvkContext::makeFramebufferInfo(
     const DxvkRenderTargets&      renderTargets) {
+    MGPU_CTX_COUNT();
     return DxvkFramebufferInfo(renderTargets, m_device->getDefaultFramebufferSize());
   }
 
 
   void DxvkContext::updateRenderTargets() {
+    MGPU_CTX_COUNT();
     if (m_flags.test(DxvkContextFlag::GpDirtyRenderTargets)) {
       m_flags.clr(DxvkContextFlag::GpDirtyRenderTargets);
 
@@ -7795,6 +8002,7 @@ namespace dxvk {
   bool DxvkContext::flushDeferredClear(
     const DxvkImage&              image,
     const VkImageSubresourceRange& subresources) {
+    MGPU_CTX_COUNT();
     if (!(image.info().usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
       return false;
 
@@ -7836,6 +8044,7 @@ namespace dxvk {
   DxvkDeferredClear* DxvkContext::findDeferredClear(
     const DxvkImage&              image,
     const VkImageSubresourceRange& subresources) {
+    MGPU_CTX_COUNT();
     for (auto& entry : m_deferredClears) {
       if ((entry.imageView->image() == &image) && ((subresources.aspectMask & entry.clearAspects) == subresources.aspectMask)
        && (vk::checkSubresourceRangeSuperset(entry.imageView->imageSubresources(), subresources)))
@@ -7849,6 +8058,7 @@ namespace dxvk {
   DxvkDeferredClear* DxvkContext::findOverlappingDeferredClear(
     const DxvkImage&              image,
     const VkImageSubresourceRange& subresources) {
+    MGPU_CTX_COUNT();
     for (auto& entry : m_deferredClears) {
       if ((entry.imageView->image() == &image)
        && ((entry.clearAspects | entry.discardAspects) | subresources.aspectMask)
@@ -7863,6 +8073,7 @@ namespace dxvk {
   DxvkDeferredResolve* DxvkContext::findOverlappingDeferredResolve(
     const DxvkImage&              image,
     const VkImageSubresourceRange& subresources) {
+    MGPU_CTX_COUNT();
     for (auto& entry : m_deferredResolves) {
       if (entry.imageView && entry.imageView->image() == &image
        && (vk::checkSubresourceRangeOverlap(entry.imageView->imageSubresources(), subresources)))
@@ -7876,6 +8087,7 @@ namespace dxvk {
   bool DxvkContext::isBoundAsRenderTarget(
     const DxvkImage&              image,
     const VkImageSubresourceRange& subresources) {
+    MGPU_CTX_COUNT();
     for (uint32_t i = 0; i < m_state.om.framebufferInfo.numAttachments(); i++) {
       auto& view = m_state.om.framebufferInfo.getAttachment(i).view;
 
@@ -7890,6 +8102,7 @@ namespace dxvk {
   int32_t DxvkContext::findColorAttachmentIndex(
     const DxvkImage&              image,
     const VkImageSubresourceRange& subresources) {
+    MGPU_CTX_COUNT();
     for (uint32_t i = 0u; i < MaxNumRenderTargets; i++) {
       const auto& attachment = m_state.om.framebufferInfo.getColorTarget(i).view;
 
@@ -7908,6 +8121,7 @@ namespace dxvk {
 
 
   void DxvkContext::updateIndexBufferBinding() {
+    MGPU_CTX_COUNT();
     m_flags.clr(DxvkContextFlag::GpDirtyIndexBuffer);
 
     if (likely(m_state.vi.indexBuffer.length())) {
@@ -7938,6 +8152,7 @@ namespace dxvk {
   
   
   void DxvkContext::updateVertexBufferBindings() {
+    MGPU_CTX_COUNT();
     m_flags.clr(DxvkContextFlag::GpDirtyVertexBuffers);
 
     if (unlikely(!m_state.gp.state.il.bindingCount()))
@@ -8012,6 +8227,7 @@ namespace dxvk {
   
   
   void DxvkContext::updateTransformFeedbackBuffers() {
+    MGPU_CTX_COUNT();
     const auto& gsInfo = m_state.gp.shaders.gs->metadata();
 
     VkBuffer     xfbBuffers[MaxNumXfbBuffers];
@@ -8047,6 +8263,7 @@ namespace dxvk {
 
 
   void DxvkContext::updateTransformFeedbackState() {
+    MGPU_CTX_COUNT();
     if (m_flags.test(DxvkContextFlag::GpDirtyXfbBuffers)) {
       m_flags.clr(DxvkContextFlag::GpDirtyXfbBuffers);
 
@@ -8059,6 +8276,7 @@ namespace dxvk {
 
   
   void DxvkContext::updateDynamicState() {
+    MGPU_CTX_COUNT();
     if (unlikely(m_flags.all(DxvkContextFlag::GpDirtyViewport,
                              DxvkContextFlag::GpDynamicViewport))) {
       m_flags.clr(DxvkContextFlag::GpDirtyViewport);
@@ -8286,6 +8504,7 @@ namespace dxvk {
 
   template<VkPipelineBindPoint BindPoint>
   void DxvkContext::updatePushData() {
+    MGPU_CTX_COUNT();
     m_flags.clr(DxvkContextFlag::DirtyPushData);
 
     // Optimized pipelines may have push constants trimmed, so look
@@ -8334,6 +8553,7 @@ namespace dxvk {
 
 
   void DxvkContext::beginComputePass() {
+    MGPU_CTX_COUNT();
     m_flags.set(DxvkContextFlag::CpComputePassActive,
                 DxvkContextFlag::DirtyDrawBuffer);
 
@@ -8346,12 +8566,14 @@ namespace dxvk {
 
 
   void DxvkContext::endComputePass() {
+    MGPU_CTX_COUNT();
     m_flags.clr(DxvkContextFlag::CpComputePassActive);
   }
 
 
   template<bool Indirect, bool Resolve>
   bool DxvkContext::commitComputeState() {
+    MGPU_CTX_COUNT();
     this->endRenderPass(false);
 
     if (!m_flags.test(DxvkContextFlag::CpComputePassActive))
@@ -8393,6 +8615,7 @@ namespace dxvk {
   
   template<bool Indexed, bool Indirect, bool Resolve>
   bool DxvkContext::commitGraphicsState() {
+    MGPU_CTX_COUNT();
     if (m_flags.test(DxvkContextFlag::GpDirtyPipeline)) {
       if (unlikely(!this->updateGraphicsPipeline()))
         return false;
@@ -8572,6 +8795,7 @@ namespace dxvk {
   template<VkPipelineBindPoint BindPoint>
   bool DxvkContext::checkResourceHazards(
     const DxvkPipelineBindings*     layout) {
+    MGPU_CTX_COUNT();
     // For performance reasons, we generall want to skip tracking resources that are
     // not written from any graphics shaders, but in unsynchronized passes we have
     // to check everything anyway.
@@ -8701,6 +8925,7 @@ namespace dxvk {
 
   template<bool Indirect>
   bool DxvkContext::checkComputeHazards() {
+    MGPU_CTX_COUNT();
     // Exit early if we know that there cannot be any hazards to avoid
     // some overhead after barriers are flushed. This is common.
     if (m_barrierTracker.empty())
@@ -8719,6 +8944,7 @@ namespace dxvk {
 
   template<bool Indexed, bool Indirect>
   bool DxvkContext::checkGraphicsHazards() {
+    MGPU_CTX_COUNT();
     // If the current pipeline does not have any stores, we only need to iterate
     // over all resources if any stores are in the current barrier set. If the
     // render pass has side effects, we know that there are writes already.
@@ -8818,6 +9044,7 @@ namespace dxvk {
     const DxvkBufferSlice&          bufferSlice,
           VkAccessFlags             access,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     return checkResourceBarrier<BindPoint>([this, &bufferSlice, accessOp] (DxvkAccess access) {
       return resourceHasAccess(*bufferSlice.buffer(),
         bufferSlice.offset(), bufferSlice.length(), access, accessOp);
@@ -8830,6 +9057,7 @@ namespace dxvk {
     const Rc<DxvkBufferView>&       bufferView,
           VkAccessFlags             access,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     return checkResourceBarrier<BindPoint>([this, &bufferView, accessOp] (DxvkAccess access) {
       return resourceHasAccess(*bufferView, access, accessOp);
     }, access);
@@ -8841,6 +9069,7 @@ namespace dxvk {
     const Rc<DxvkImageView>&        imageView,
           VkAccessFlags             access,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     return checkResourceBarrier<BindPoint>([this, &imageView, accessOp] (DxvkAccess access) {
       return resourceHasAccess(*imageView, access, accessOp);
     }, access);
@@ -8852,6 +9081,7 @@ namespace dxvk {
           VkAccessFlags             srcAccess,
           VkPipelineStageFlags      dstStages,
           VkAccessFlags             dstAccess) {
+    MGPU_CTX_COUNT();
     VkMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
     barrier.srcStageMask = srcStages;
     barrier.srcAccessMask = srcAccess;
@@ -8867,6 +9097,7 @@ namespace dxvk {
 
 
   void DxvkContext::trackDrawBuffer() {
+    MGPU_CTX_COUNT();
     if (m_flags.test(DxvkContextFlag::DirtyDrawBuffer)) {
       m_flags.clr(DxvkContextFlag::DirtyDrawBuffer);
 
@@ -8885,6 +9116,7 @@ namespace dxvk {
   bool DxvkContext::tryInvalidateDeviceLocalBuffer(
       const Rc<DxvkBuffer>&           buffer,
             VkDeviceSize              copySize) {
+    MGPU_CTX_COUNT();
     // We can only discard if the full buffer gets written, and we will only discard
     // small buffers in order to not waste significant amounts of memory.
     if (copySize != buffer->info().size || copySize > 0x40000)
@@ -8908,6 +9140,7 @@ namespace dxvk {
   Rc<DxvkImageView> DxvkContext::ensureImageViewCompatibility(
     const Rc<DxvkImageView>&        view,
           VkImageUsageFlagBits      usage) {
+    MGPU_CTX_COUNT();
     // Return existing view if it already compatible with the image
     VkFormat viewFormat = view->info().format;
 
@@ -8948,6 +9181,7 @@ namespace dxvk {
     const DxvkRelocateBufferInfo*   bufferInfos,
           size_t                    imageCount,
     const DxvkRelocateImageInfo*    imageInfos) {
+    MGPU_CTX_COUNT();
     if (!bufferCount && !imageCount)
       return;
 
@@ -9232,6 +9466,7 @@ namespace dxvk {
 
 
   void DxvkContext::relocateQueuedResources() {
+    MGPU_CTX_COUNT();
     // Limit the number and size of resources to process per submission to
     // something reasonable. We don't know if we are transferring over PCIe.
     constexpr static uint32_t MaxRelocationsPerSubmission = 128u;
@@ -9293,6 +9528,7 @@ namespace dxvk {
 
   Rc<DxvkSampler> DxvkContext::createBlitSampler(
           VkFilter                    filter) {
+    MGPU_CTX_COUNT();
     DxvkSamplerKey samplerKey;
     samplerKey.setFilter(filter, filter,
       VK_SAMPLER_MIPMAP_MODE_NEAREST);
@@ -9307,6 +9543,7 @@ namespace dxvk {
 
   DxvkGraphicsPipeline* DxvkContext::lookupGraphicsPipeline(
     const DxvkGraphicsPipelineShaders&  shaders) {
+    MGPU_CTX_COUNT();
     auto idx = shaders.hash() % m_gpLookupCache.size();
     
     if (unlikely(!m_gpLookupCache[idx] || !shaders.eq(m_gpLookupCache[idx]->shaders())))
@@ -9318,6 +9555,7 @@ namespace dxvk {
 
   DxvkComputePipeline* DxvkContext::lookupComputePipeline(
     const DxvkComputePipelineShaders&   shaders) {
+    MGPU_CTX_COUNT();
     auto idx = shaders.hash() % m_cpLookupCache.size();
     
     if (unlikely(!m_cpLookupCache[idx] || !shaders.eq(m_cpLookupCache[idx]->shaders())))
@@ -9329,6 +9567,7 @@ namespace dxvk {
 
   Rc<DxvkBuffer> DxvkContext::createZeroBuffer(
           VkDeviceSize              size) {
+    MGPU_CTX_COUNT();
     if (m_zeroBuffer && m_zeroBuffer->info().size >= size) {
       m_cmd->track(m_zeroBuffer, DxvkAccess::Read);
       return m_zeroBuffer;
@@ -9369,6 +9608,7 @@ namespace dxvk {
 
 
   DxvkResourceBufferInfo DxvkContext::allocateSpecDataBuffer(const DxvkPipelineLayout* layout) {
+    MGPU_CTX_COUNT();
     if (unlikely(!m_specBuffer)) {
       DxvkBufferCreateInfo bufInfo;
       bufInfo.size    = layout->getSpecDataMemorySize();
@@ -9391,6 +9631,7 @@ namespace dxvk {
 
 
   void DxvkContext::freeZeroBuffer() {
+    MGPU_CTX_COUNT();
     constexpr uint64_t ZeroBufferLifetime = 4096u;
 
     // Don't free the zero buffer if it is still kept alive by a prior
@@ -9406,6 +9647,7 @@ namespace dxvk {
 
   void DxvkContext::resizeDescriptorArrays(
           uint32_t                  bindingCount) {
+    MGPU_CTX_COUNT();
     m_legacyDescriptors.infos.resize(bindingCount);
     m_legacyDescriptors.writes.resize(bindingCount);
 
@@ -9424,6 +9666,7 @@ namespace dxvk {
 
 
   void DxvkContext::flushImplicitResolves() {
+    MGPU_CTX_COUNT();
     endCurrentPass(true);
 
     DxvkImplicitResolveOp op;
@@ -9449,6 +9692,7 @@ namespace dxvk {
 
 
   void DxvkContext::beginCurrentCommands() {
+    MGPU_CTX_COUNT();
     beginActiveDebugRegions();
 
     // The current state of the internal command buffer is
@@ -9500,6 +9744,7 @@ namespace dxvk {
 
 
   void DxvkContext::endCurrentCommands() {
+    MGPU_CTX_COUNT();
     endCurrentPass(true);
 
     prepareSharedImages();
@@ -9517,6 +9762,7 @@ namespace dxvk {
 
 
   void DxvkContext::splitCommands() {
+    MGPU_CTX_COUNT();
     // This behaves the same as a pair of endRecording and
     // beginRecording calls, except that we keep the same
     // command list object for subsequent commands.
@@ -9532,6 +9778,7 @@ namespace dxvk {
   void DxvkContext::discardRenderTarget(
     const DxvkImage&                image,
     const VkImageSubresourceRange&  subresources) {
+    MGPU_CTX_COUNT();
     // We can only retroactively change store ops if we are currently
     // inside a render pass that uses secondary command buffers.
     if (!m_flags.test(DxvkContextFlag::GpRenderPassSecondaryCmd))
@@ -9559,6 +9806,7 @@ namespace dxvk {
 
   void DxvkContext::flushImageLayoutTransitions(
           DxvkCmdBuffer             cmdBuffer) {
+    MGPU_CTX_COUNT();
     if (m_imageLayoutTransitions.empty())
       return;
 
@@ -9598,6 +9846,7 @@ namespace dxvk {
           VkImageLayout             dstLayout,
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess) {
+    MGPU_CTX_COUNT();
     if (srcLayout == dstLayout && srcStages == dstStages)
       return;
 
@@ -9628,6 +9877,7 @@ namespace dxvk {
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess,
           bool                      discard) {
+    MGPU_CTX_COUNT();
     // If discard is false, this assumes that the image is in its default
     // layout and ready to be accessed via its standard access patterns.
     VkImageLayout srcLayout = image.info().layout;
@@ -9656,6 +9906,7 @@ namespace dxvk {
           VkImageLayout             dstLayout,
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess) {
+    MGPU_CTX_COUNT();
     addImageLayoutTransition(image, subresources,
       VK_IMAGE_LAYOUT_UNDEFINED, 0, 0,
       dstLayout, dstStages, dstAccess);
@@ -9664,6 +9915,7 @@ namespace dxvk {
 
   void DxvkContext::trackNonDefaultImageLayout(
             DxvkImage&                image) {
+    MGPU_CTX_COUNT();
     for (const auto& e : m_nonDefaultLayoutImages) {
       if (e == &image)
         return;
@@ -9676,6 +9928,7 @@ namespace dxvk {
   bool DxvkContext::overlapsRenderTarget(
           DxvkImage&                image,
     const VkImageSubresourceRange&  subresources) {
+    MGPU_CTX_COUNT();
     if (!(image.info().usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
       return false;
 
@@ -9713,6 +9966,7 @@ namespace dxvk {
           DxvkImage&                image,
     const VkImageSubresourceRange&  subresources,
           bool                      keepAttachments) {
+    MGPU_CTX_COUNT();
     // Note that this method does not flush layout transitions
     m_cmd->track(&image, DxvkAccess::Read);
 
@@ -9765,6 +10019,7 @@ namespace dxvk {
 
   template<typename Pred>
   void DxvkContext::restoreImageLayouts(const Pred& pred, bool keepAttachments) {
+    MGPU_CTX_COUNT();
     if (m_nonDefaultLayoutImages.empty())
       return;
 
@@ -9799,6 +10054,7 @@ namespace dxvk {
 
 
   void DxvkContext::prepareShaderReadableImages(bool renderPass) {
+    MGPU_CTX_COUNT();
     // Flush pending clears and emit barriers before potentially
     // emitting layout transitions affecting the same images.
     if (!m_deferredClears.empty()) {
@@ -9820,6 +10076,7 @@ namespace dxvk {
 
 
   void DxvkContext::prepareSharedImages() {
+    MGPU_CTX_COUNT();
     // Only flush clears for shared images, and restore layouts
     bool hasSharedClear = false;
 
@@ -9847,6 +10104,7 @@ namespace dxvk {
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess,
           bool                      discard) {
+    MGPU_CTX_COUNT();
     // If all subresources are in the correct layout, we don't need to do anything.
     // If we're discarding a render target, re-initialize the image since doing so
     // may lead to more efficient compression in some cases.
@@ -9919,6 +10177,7 @@ namespace dxvk {
           size_t                    count,
     const DxvkResourceAccess*       batch,
           bool                      flushClears) {
+    MGPU_CTX_COUNT();
     if (cmdBuffer == DxvkCmdBuffer::InitBuffer)
       cmdBuffer = DxvkCmdBuffer::InitBarriers;
     else if (cmdBuffer == DxvkCmdBuffer::SdmaBuffer)
@@ -10048,6 +10307,7 @@ namespace dxvk {
           DxvkCmdBuffer             cmdBuffer,
           size_t                    count,
     const DxvkResourceAccess*       batch) {
+    MGPU_CTX_COUNT();
     if (likely(cmdBuffer < DxvkCmdBuffer::SdmaBuffer)) {
       for (size_t i = 0u; i < count; i++) {
         const auto& e = batch[i];
@@ -10092,6 +10352,7 @@ namespace dxvk {
           size_t                    count,
     const DxvkResourceAccess*       batch,
           bool                      flushClears) {
+    MGPU_CTX_COUNT();
     acquireResources(cmdBuffer, count, batch, flushClears);
     releaseResources(cmdBuffer, count, batch);
   }
@@ -10103,6 +10364,7 @@ namespace dxvk {
           VkAccessFlags2            srcAccess,
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess) {
+    MGPU_CTX_COUNT();
     auto& batch = getBarrierBatch(cmdBuffer);
 
     VkMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
@@ -10123,6 +10385,7 @@ namespace dxvk {
           VkPipelineStageFlags2     srcStages,
           VkAccessFlags2            srcAccess,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     accessImage(cmdBuffer, image, subresources,
       srcLayout, srcStages, srcAccess,
       image.info().layout,
@@ -10138,6 +10401,7 @@ namespace dxvk {
           VkPipelineStageFlags2     srcStages,
           VkAccessFlags2            srcAccess,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     accessImage(cmdBuffer, *imageView.image(),
       imageView.imageSubresources(),
       imageView.image()->info().layout,
@@ -10156,6 +10420,7 @@ namespace dxvk {
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     auto& batch = getBarrierBatch(cmdBuffer);
 
     VkImageMemoryBarrier2 barrier = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2 };
@@ -10227,6 +10492,7 @@ namespace dxvk {
           VkPipelineStageFlags2     srcStages,
           VkAccessFlags2            srcAccess,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     accessImageRegion(cmdBuffer, image, subresources,
       offset, extent, srcLayout, srcStages, srcAccess,
       image.info().layout, image.info().stages, image.info().access,
@@ -10247,6 +10513,7 @@ namespace dxvk {
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     // If the image layout needs to change, access the entire image
     if (srcLayout != dstLayout) {
       accessImage(cmdBuffer, image, vk::makeSubresourceRange(subresources),
@@ -10308,6 +10575,7 @@ namespace dxvk {
           VkImageLayout             srcLayout,
           VkPipelineStageFlags2     srcStages,
           VkAccessFlags2            srcAccess) {
+    MGPU_CTX_COUNT();
     auto& transferBatch = getBarrierBatch(DxvkCmdBuffer::SdmaBuffer);
     auto& graphicsBatch = getBarrierBatch(DxvkCmdBuffer::InitBarriers);
 
@@ -10367,6 +10635,7 @@ namespace dxvk {
           VkPipelineStageFlags2     srcStages,
           VkAccessFlags2            srcAccess,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     accessBuffer(cmdBuffer, buffer, offset, size,
       srcStages, srcAccess,
       buffer.info().stages,
@@ -10385,6 +10654,7 @@ namespace dxvk {
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     if (unlikely(!size))
       return;
 
@@ -10419,6 +10689,7 @@ namespace dxvk {
           VkPipelineStageFlags2     srcStages,
           VkAccessFlags2            srcAccess,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     accessBuffer(cmdBuffer,
       *bufferSlice.buffer(),
       bufferSlice.offset(),
@@ -10436,6 +10707,7 @@ namespace dxvk {
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     accessBuffer(cmdBuffer,
       *bufferSlice.buffer(),
       bufferSlice.offset(),
@@ -10452,6 +10724,7 @@ namespace dxvk {
           VkPipelineStageFlags2     srcStages,
           VkAccessFlags2            srcAccess,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     accessBuffer(cmdBuffer,
       *bufferView.buffer(),
       bufferView.info().offset,
@@ -10468,6 +10741,7 @@ namespace dxvk {
           VkPipelineStageFlags2     dstStages,
           VkAccessFlags2            dstAccess,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     accessBuffer(cmdBuffer,
       *bufferView.buffer(),
       bufferView.info().offset,
@@ -10482,6 +10756,7 @@ namespace dxvk {
           DxvkBuffer&               buffer,
           VkPipelineStageFlags2     srcStages,
           VkAccessFlags2            srcAccess) {
+    MGPU_CTX_COUNT();
     auto& transferBatch = getBarrierBatch(DxvkCmdBuffer::SdmaBuffer);
     auto& graphicsBatch = getBarrierBatch(DxvkCmdBuffer::InitBarriers);
 
@@ -10517,6 +10792,7 @@ namespace dxvk {
   void DxvkContext::accessDrawBuffer(
           VkDeviceSize              offset,
           VkDeviceSize              size) {
+    MGPU_CTX_COUNT();
     accessBuffer(DxvkCmdBuffer::ExecBuffer,
       *m_state.id.argBuffer.buffer(),
       m_state.id.argBuffer.offset() + offset, size,
@@ -10528,6 +10804,7 @@ namespace dxvk {
 
   void DxvkContext::accessDrawCountBuffer(
           VkDeviceSize              offset) {
+    MGPU_CTX_COUNT();
     accessBuffer(DxvkCmdBuffer::ExecBuffer,
       *m_state.id.cntBuffer.buffer(),
       m_state.id.cntBuffer.offset() + offset, sizeof(uint32_t),
@@ -10538,6 +10815,7 @@ namespace dxvk {
 
 
   void DxvkContext::flushBarriers() {
+    MGPU_CTX_COUNT();
     m_execBarriers.flush(m_cmd);
     m_barrierTracker.clear();
 
@@ -10551,6 +10829,7 @@ namespace dxvk {
           VkDeviceSize              size,
           DxvkAccess                access,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     if (unlikely(!size))
       return false;
 
@@ -10568,6 +10847,7 @@ namespace dxvk {
           DxvkBufferView&           bufferView,
           DxvkAccess                access,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     return resourceHasAccess(*bufferView.buffer(),
       bufferView.info().offset,
       bufferView.info().size, access, accessOp);
@@ -10579,6 +10859,7 @@ namespace dxvk {
     const VkImageSubresourceRange&  subresources,
           DxvkAccess                access,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     uint32_t layerCount = image.info().numLayers;
 
     // Subresources are enumerated in such a way that array layers of
@@ -10620,6 +10901,7 @@ namespace dxvk {
           VkExtent3D                extent,
           DxvkAccess                access,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     DxvkAddressRange range;
     range.resource = image.getResourceId();
     range.accessOp = accessOp;
@@ -10661,12 +10943,14 @@ namespace dxvk {
           DxvkImageView&            imageView,
           DxvkAccess                access,
           DxvkAccessOp              accessOp) {
+    MGPU_CTX_COUNT();
     return resourceHasAccess(*imageView.image(), imageView.imageSubresources(), access, accessOp);
   }
 
 
   DxvkBarrierBatch& DxvkContext::getBarrierBatch(
           DxvkCmdBuffer             cmdBuffer) {
+    MGPU_CTX_COUNT();
     switch (cmdBuffer) {
       default:
       case DxvkCmdBuffer::ExecBuffer: return m_execBarriers;
@@ -10682,6 +10966,7 @@ namespace dxvk {
           DxvkCmdBuffer             cmdBuffer,
           size_t                    accessCount,
     const DxvkResourceAccess*       accessBatch) {
+    MGPU_CTX_COUNT();
     for (size_t i = 0u; i < accessCount; i++) {
       const auto& e = accessBatch[i];
 
@@ -10711,6 +10996,7 @@ namespace dxvk {
           VkDeviceSize              offset,
           VkDeviceSize              size,
           DxvkAccess                access) {
+    MGPU_CTX_COUNT();
     // Sparse resources can alias, need to ignore.
     if (unlikely(buffer.info().flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT))
       return DxvkCmdBuffer::ExecBuffer;
@@ -10779,6 +11065,7 @@ namespace dxvk {
     const VkImageSubresourceRange&  subresources,
           bool                      discard,
           DxvkAccess                access) {
+    MGPU_CTX_COUNT();
     // Sparse resources can alias, need to ignore.
     if (unlikely(image.info().flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT))
       return DxvkCmdBuffer::ExecBuffer;
@@ -10848,6 +11135,7 @@ namespace dxvk {
 
   bool DxvkContext::prepareOutOfOrderTransition(
           DxvkImage&                image) {
+    MGPU_CTX_COUNT();
     // Sparse resources can alias, need to ignore.
     return !(image.isTracked(m_trackingId, DxvkAccess::Write))
         && !(image.info().flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT);
@@ -10873,6 +11161,7 @@ namespace dxvk {
 
 
   void DxvkContext::beginFrameCapture() {
+    MGPU_CTX_COUNT();
     if (m_features.test(DxvkContextFeature::DebugUtils)) {
       m_cmd->cmdInsertDebugUtilsLabel(DxvkCmdBuffer::SdmaBarriers,
         vk::makeLabel(0, "capture-marker,begin_capture"));
@@ -10881,6 +11170,7 @@ namespace dxvk {
 
 
   void DxvkContext::endFrameCapture() {
+    MGPU_CTX_COUNT();
     if (m_features.test(DxvkContextFeature::DebugUtils)) {
       m_cmd->cmdInsertDebugUtilsLabel(DxvkCmdBuffer::ExecBuffer,
         vk::makeLabel(0, "capture-marker,end_capture"));
@@ -10906,6 +11196,7 @@ namespace dxvk {
   bool DxvkContext::formatsAreImageCopyCompatible(
           VkFormat                  dstFormat,
           VkFormat                  srcFormat) {
+    MGPU_CTX_COUNT();
     // Assume compatibility as long as no depth/stencil formats
     // are involved, or if the aspect masks are equal
     constexpr VkImageAspectFlags DsAspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -11016,12 +11307,14 @@ namespace dxvk {
 
 
   void DxvkContext::pushDebugRegion(const VkDebugUtilsLabelEXT& label, util::DxvkDebugLabelType type) {
+    MGPU_CTX_COUNT();
     m_cmd->cmdBeginDebugUtilsLabel(DxvkCmdBuffer::ExecBuffer, label);
     m_debugLabelStack.emplace_back(label, type);
   }
 
 
   void DxvkContext::popDebugRegion(util::DxvkDebugLabelType type) {
+    MGPU_CTX_COUNT();
     // Find last active region of the given type
     size_t index = m_debugLabelStack.size();
 
@@ -11048,6 +11341,7 @@ namespace dxvk {
 
   bool DxvkContext::hasDebugRegion(
           util::DxvkDebugLabelType    type) {
+    MGPU_CTX_COUNT();
     auto e = std::find_if(m_debugLabelStack.crbegin(), m_debugLabelStack.crend(),
       [type] (const util::DxvkDebugLabel& label) { return label.type() == type; });
     return e != m_debugLabelStack.crend();
@@ -11055,12 +11349,14 @@ namespace dxvk {
 
 
   void DxvkContext::beginActiveDebugRegions() {
+    MGPU_CTX_COUNT();
     for (const auto& region : m_debugLabelStack)
       m_cmd->cmdBeginDebugUtilsLabel(DxvkCmdBuffer::ExecBuffer, region.get());
   }
 
 
   void DxvkContext::endActiveDebugRegions() {
+    MGPU_CTX_COUNT();
     for (size_t i = 0; i < m_debugLabelStack.size(); i++)
       m_cmd->cmdEndDebugUtilsLabel(DxvkCmdBuffer::ExecBuffer);
   }
@@ -11069,6 +11365,7 @@ namespace dxvk {
   DxvkResourceBufferInfo DxvkContext::allocateScratchMemory(
           VkDeviceSize                alignment,
           VkDeviceSize                size) {
+    MGPU_CTX_COUNT();
     if (unlikely(!m_scratchBuffer || m_scratchBuffer->info().size < size)) {
       // We probably won't need a lot of scratch memory, so keep it small
       DxvkBufferCreateInfo info = { };

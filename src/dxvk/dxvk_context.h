@@ -313,6 +313,16 @@ namespace dxvk {
     template<VkShaderStageFlagBits Stage>
     void bindShader(
             Rc<DxvkShader>&&      shader) {
+      if (Stage == VK_SHADER_STAGE_VERTEX_BIT || Stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+        static std::atomic<uint32_t> s_seq = { 0u };
+        uint32_t n = ++s_seq;
+        if (n <= 120u) {
+          Logger::warn(str::format("SHADERSEQ #", n,
+            " dev=", reinterpret_cast<uintptr_t>(m_device->handle()),
+            Stage == VK_SHADER_STAGE_VERTEX_BIT ? " VS" : " FS",
+            shader != nullptr ? " bind" : " NULL"));
+        }
+      }
       switch (Stage) {
         case VK_SHADER_STAGE_VERTEX_BIT:
           m_state.gp.shaders.vs = std::move(shader);

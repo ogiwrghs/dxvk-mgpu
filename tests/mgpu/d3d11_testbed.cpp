@@ -1672,7 +1672,7 @@ int main(int argc, char** argv) {
                 LOG_CALL("DrawIndexedInstancedIndirect(argsBuf=%p, 0)", (void*)argsBuf);
                 sc->DrawIndexedInstancedIndirect(argsBuf, 0);
             } else {
-                ctx->DrawIndexedInstanced(indexCount, (UINT)g_cfg.instances, 0, 0, 0);
+                sc->DrawIndexedInstanced(indexCount, (UINT)g_cfg.instances, 0, 0, 0);
             }
         }
 

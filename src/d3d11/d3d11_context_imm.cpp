@@ -1769,10 +1769,21 @@ namespace dxvk {
             return str::format("[", uint32_t(px[o]), ",", uint32_t(px[o + 1]),
               ",", uint32_t(px[o + 2]), ",", uint32_t(px[o + 3]), "]");
           };
+          uint32_t litBottom = 0u, totalBottom = 0u, litTop = 0u;
+          const uint8_t* ref = px + (size_t(h - 1u) * w + (w - 1u)) * 4u;
+          for (uint32_t y = 0; y < h; y += 4u) {
+            for (uint32_t x = 0; x < w; x += 4u) {
+              const uint8_t* p = px + (size_t(y) * w + x) * 4u;
+              bool differs = p[0] != ref[0] || p[1] != ref[1] || p[2] != ref[2];
+              if (y >= h / 2u) { totalBottom++; if (differs) litBottom++; }
+              else if (differs) litTop++;
+            }
+          }
           Logger::info(str::format("worker image ", w, "x", h,
             " centre ", sample(w / 2u, h / 2u),
             " topleft ", sample(w / 8u, h / 8u),
-            " corner ", sample(2u, 2u)));
+            " corner ", sample(2u, 2u),
+            " bottomLit=", litBottom, "/", totalBottom, " topLit=", litTop));
         }
       }
     }

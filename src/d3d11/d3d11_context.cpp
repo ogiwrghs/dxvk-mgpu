@@ -29,10 +29,8 @@ namespace dxvk {
       if (!s_registered) {
         s_registered = true;
         std::atexit([] {
-          for (auto* c = s_head.load(); c; c = c->next) {
-            Logger::warn(str::format("MGPUCALLS ", c->name,
-              " count=", c->count.load()));
-          }
+          void MgpuDumpCallCounters();
+          MgpuDumpCallCounters();
         });
       }
     }
@@ -40,11 +38,14 @@ namespace dxvk {
 
   std::atomic<MgpuCallCounter*> MgpuCallCounter::s_head = { nullptr };
 
+  void MgpuDumpCtxCounters();
+
   void MgpuDumpCallCounters() {
     for (auto* c = MgpuCallCounter::s_head.load(); c; c = c->next) {
       Logger::warn(str::format("MGPUCALLS ", c->name,
         " count=", c->count.load()));
     }
+    MgpuDumpCtxCounters();
   }
 
 }
@@ -4108,6 +4109,12 @@ namespace dxvk {
 
     // Batch consecutive draws if there are no state changes
     if (GetTypedContext()->HasWorkerDevice()) {
+      if constexpr (IsDeferred) {
+        static std::atomic<uint32_t> s_rec = { 0u };
+        uint32_t n = ++s_rec;
+        if (n <= 40u)
+          Logger::warn(str::format("DEFREC #", n, " drawIndexed"));
+      }
       GetTypedContext()->EmitWorkerCs([
         cDraw = draw
       ] (DxvkContext* ctx) {
@@ -4184,6 +4191,12 @@ namespace dxvk {
       // binds its own slice here. Superposition's vertex shaders use
       // it; the testbed does not.
       if (GetTypedContext()->HasWorkerDevice()) {
+        if constexpr (IsDeferred) {
+          static std::atomic<uint32_t> s_rec = { 0u };
+          uint32_t n = ++s_rec;
+          if (n <= 40u)
+            Logger::warn(str::format("DEFREC #", n, " bind stage=", uint32_t(ShaderStage)));
+        }
         GetTypedContext()->EmitWorkerCs([
           cShader = shader,
           cBuffer = pShaderModule->GetWorkerIcb()
