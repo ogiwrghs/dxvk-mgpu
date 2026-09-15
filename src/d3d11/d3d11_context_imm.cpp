@@ -444,13 +444,13 @@ namespace dxvk {
           cSize    = m_mappedWorkerSize,
           cCopy    = m_mappedWorkerNoOverwrite
         ] (DxvkContext* ctx) {
-          if (cCopy) {
-            ctx->copyBuffer(cBuffer, 0u,
-              cStaging.buffer(), cStaging.offset(), cSize);
-          } else {
-            ctx->uploadBuffer(cBuffer, 0u,
-              cStaging.buffer(), cStaging.offset(), cSize);
-          }
+          // copyBuffer on both branches. uploadBuffer is hoisted ahead
+          // of the command list, and with one fixed worker allocation
+          // that puts every update of the frame before every draw of
+          // the frame: each draw then reads the last update. copyBuffer
+          // stays in order. Same reasoning as 01c875f4.
+          ctx->copyBuffer(cBuffer, 0u,
+            cStaging.buffer(), cStaging.offset(), cSize);
         });
       }
       m_mappedWorkerBuffer      = nullptr;

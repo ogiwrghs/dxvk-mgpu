@@ -191,14 +191,24 @@ namespace dxvk {
       });
     } else {
       m_transferCommands += 1;
-
       EmitCs([
         cBuffer       = buffer
       ] (DxvkContext* ctx) {
         ctx->initBuffer(cBuffer);
       });
+      // DXVK zero-fills every buffer created without initial data.
+      // The worker's copy has to start from zero too, or argument
+      // buffers and counters on GPU1 begin as whatever the allocator
+      // handed back. MGPUCTX: initBuffer primary=139 worker=0.
+      Rc<DxvkBuffer> workerBuffer = pBuffer->GetWorkerBuffer();
+      if (m_workerDevice != nullptr && workerBuffer != nullptr) {
+        EmitWorkerCs([
+          cBuffer       = std::move(workerBuffer)
+        ] (DxvkContext* ctx) {
+          ctx->initBuffer(cBuffer);
+        });
+      }
     }
-
     ThrottleAllocationLocked();
   }
 
@@ -213,6 +223,37 @@ namespace dxvk {
       std::memcpy(pBuffer->GetMapPtr(), pInitialData->pSysMem, pBuffer->Desc()->ByteWidth);
     else
       std::memset(pBuffer->GetMapPtr(), 0, pBuffer->Desc()->ByteWidth);
+
+    // The worker's mirror is device-local and gets nothing from the
+    // host write above. Upload the same bytes, or zero it, the same
+    // way the device-local branch does. Without this a host-visible
+    // buffer that is initialised once and never mapped again holds
+    // garbage on GPU1 forever.
+    Rc<DxvkBuffer> workerBuffer = pBuffer->GetWorkerBuffer();
+    if (m_workerDevice != nullptr && workerBuffer != nullptr) {
+      std::lock_guard<dxvk::mutex> lock(m_mutex);
+      m_transferCommands += 1;
+      if (pInitialData && pInitialData->pSysMem) {
+        VkDeviceSize size = pBuffer->Desc()->ByteWidth;
+        auto workerSlice = m_workerStagingBuffer->alloc(size);
+        std::memcpy(workerSlice.mapPtr(0), pInitialData->pSysMem, size);
+        EmitWorkerCs([
+          cBuffer       = std::move(workerBuffer),
+          cStagingSlice = std::move(workerSlice),
+          cSize         = size
+        ] (DxvkContext* ctx) {
+          ctx->copyBuffer(cBuffer, 0u,
+            cStagingSlice.buffer(), cStagingSlice.offset(), cSize);
+        });
+      } else {
+        EmitWorkerCs([
+          cBuffer       = std::move(workerBuffer)
+        ] (DxvkContext* ctx) {
+          ctx->initBuffer(cBuffer);
+        });
+      }
+      ThrottleAllocationLocked();
+    }
   }
 
 
