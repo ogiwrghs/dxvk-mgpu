@@ -250,6 +250,30 @@ namespace dxvk {
       return m_image;
     }
 
+    /**
+     * \brief A live render target with images on both devices
+     *
+     * Diagnostic. Holds references to both images, so the pair
+     * stays valid after the texture that owned it is destroyed.
+     */
+    struct WorkerImagePair {
+      uint32_t      index;
+      DXGI_FORMAT   format;
+      Rc<DxvkImage> primary;
+      Rc<DxvkImage> worker;
+    };
+
+    /**
+     * \brief Lists live colour render targets of a given size
+     *
+     * Diagnostic, for the render target dump. Single-sample,
+     * single-layer 2D textures bound as render targets whose
+     * format has a colour aspect only, sorted by creation index.
+     */
+    static std::vector<WorkerImagePair> ListWorkerRenderTargets(
+            uint32_t                    Width,
+            uint32_t                    Height);
+
     Rc<DxvkImage> GetWorkerImage() const {
       return m_workerImage;
     }
@@ -587,6 +611,7 @@ namespace dxvk {
     VkFormat                      m_packedFormat;
     
     Rc<DxvkImage>                 m_workerImage;
+    uint32_t                      m_workerIndex = 0;
     Rc<DxvkImage>                 m_image;
     small_vector<MappedBuffer, 6> m_buffers;
     small_vector<MappedInfo, 6>   m_mapInfo;

@@ -7,6 +7,9 @@
 #include "../util/util_env.h"
 #include "../util/util_win32_compat.h"
 
+#include <cstdio>
+#include <fstream>
+
 constexpr static uint32_t MinFlushIntervalUs = 750;
 constexpr static uint32_t IncFlushIntervalUs = 250;
 constexpr static uint32_t MaxPendingSubmits  = 6;
@@ -1883,6 +1886,280 @@ namespace dxvk {
       "us  max ", m_compositeSubMax, "us"));
     report("cs sync ", m_compositeSyncLog);
     report("gpu wait", m_compositeSubLog);
+  }
+
+
+  // Render target dump helpers. Diagnostic.
+  static void MgpuCopyImageForDump(
+          DxvkContext*                ctx,
+    const Rc<DxvkBuffer>&             buffer,
+          VkDeviceSize                offset,
+    const Rc<DxvkImage>&              image) {
+    VkImageSubresourceLayers sub = { };
+    sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    sub.layerCount = 1;
+
+    // The image's own format as the buffer format keeps this a plain
+    // vkCmdCopyImageToBuffer: the bytes arrive exactly as stored.
+    ctx->copyImageToBuffer(buffer, offset, 0, 0,
+      image->info().format, image, sub,
+      VkOffset3D { 0, 0, 0 }, image->info().extent);
+  }
+
+
+  static bool MgpuIsZero(const uint8_t* data, VkDeviceSize size) {
+    for (VkDeviceSize i = 0; i < size; i++) {
+      if (data[i])
+        return false;
+    }
+
+    return true;
+  }
+
+
+  // DDS with the DX10 header, so the DXGI format is stored as is.
+  // For the formats in use here the Vulkan and DXGI byte layouts are
+  // identical (A2B10G10R10_PACK32 is R10G10B10A2, B10G11R11_UFLOAT is
+  // R11G11B10_FLOAT), so the bytes are written unconverted.
+  static void MgpuWriteDds(
+    const std::string&                name,
+          DXGI_FORMAT                 format,
+          VkExtent3D                  extent,
+    const uint8_t*                    data,
+          VkDeviceSize                size) {
+    uint32_t header[31] = { };
+    header[0]  = 124;           // header size
+    header[1]  = 0x21007;       // caps, height, width, pixel format, mip count
+    header[2]  = extent.height;
+    header[3]  = extent.width;
+    header[6]  = 1;             // mip count
+    header[18] = 32;            // pixel format size
+    header[19] = 0x4;           // FourCC
+    header[20] = 0x30315844;    // 'DX10'
+    header[26] = 0x1000;        // texture
+
+    uint32_t dx10[5] = { uint32_t(format), 3u, 0u, 1u, 0u };
+
+    std::ofstream file(name, std::ios::binary);
+
+    if (!file) {
+      Logger::warn(str::format("RTDUMP: cannot open ", name));
+      return;
+    }
+
+    file.write("DDS ", 4);
+    file.write(reinterpret_cast<const char*>(header), sizeof(header));
+    file.write(reinterpret_cast<const char*>(dx10), sizeof(dx10));
+    file.write(reinterpret_cast<const char*>(data), std::streamsize(size));
+
+    Logger::info(str::format("RTDUMP wrote ", name));
+  }
+
+
+  void D3D11ImmediateContext::DumpWorkerRenderTargets() {
+    // DXVK_MGPU_DUMP_RT=WxH[@N]: every N presents (default 300), copy
+    // every live colour render target of size WxH on both devices at
+    // the same point of each command stream, compare them pixel by
+    // pixel, and write DDS files for the ones that differ, for the
+    // first three dumps that find a difference. Under NO_SCISSOR both
+    // devices execute the same stream, so a correct mirror gives
+    // identical targets.
+    struct DumpSpec {
+      unsigned width  = 0;
+      unsigned height = 0;
+      unsigned every  = 300;
+    };
+
+    static const DumpSpec s_spec = [] {
+      DumpSpec spec;
+      std::string value = env::getEnvVar("DXVK_MGPU_DUMP_RT");
+
+      if (!value.empty() && std::sscanf(value.c_str(), "%ux%u@%u",
+          &spec.width, &spec.height, &spec.every) < 2) {
+        Logger::warn(str::format("RTDUMP: cannot parse DXVK_MGPU_DUMP_RT=", value));
+        spec.width = 0;
+      }
+
+      if (!spec.every)
+        spec.every = 300;
+
+      return spec;
+    }();
+
+    if (!s_spec.width || !m_workerCsThread)
+      return;
+
+    static uint32_t s_presents = 0;
+
+    if ((++s_presents % s_spec.every) != 0u)
+      return;
+
+    static uint32_t s_events     = 0;
+    static uint32_t s_fileEvents = 0;
+
+    uint32_t event = ++s_events;
+
+    auto pairs = D3D11CommonTexture::ListWorkerRenderTargets(s_spec.width, s_spec.height);
+
+    if (pairs.empty()) {
+      Logger::warn(str::format("RTDUMP e=", event, ": no live colour render targets at ",
+        s_spec.width, "x", s_spec.height));
+      return;
+    }
+
+    // One host buffer per device, targets packed one after another.
+    std::vector<VkDeviceSize>   offsets;
+    std::vector<Rc<DxvkImage>>  primaryImages;
+    std::vector<Rc<DxvkImage>>  workerImages;
+    VkDeviceSize                totalSize = 0;
+
+    for (const auto& pair : pairs) {
+      VkExtent3D extent = pair.primary->info().extent;
+
+      offsets.push_back(totalSize);
+      primaryImages.push_back(pair.primary);
+      workerImages.push_back(pair.worker);
+
+      totalSize += VkDeviceSize(extent.width) * extent.height
+        * lookupFormatInfo(pair.primary->info().format)->elementSize;
+    }
+
+    DxvkBufferCreateInfo info;
+    info.size   = totalSize;
+    info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT
+                | VK_PIPELINE_STAGE_HOST_BIT;
+    info.access = VK_ACCESS_TRANSFER_WRITE_BIT
+                | VK_ACCESS_HOST_READ_BIT;
+    info.debugName = "MGPU render target dump";
+
+    // Cached, so the CPU reads below are not write-combined (358be5d9).
+    VkMemoryPropertyFlags memType = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                  | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                  | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    Rc<DxvkDevice> workerDevice  = m_parent->GetWorkerDXVKDevice();
+    Rc<DxvkBuffer> primaryBuffer = m_device->createBuffer(info, memType);
+    Rc<DxvkBuffer> workerBuffer  = workerDevice->createBuffer(info, memType);
+
+    // GPU1: send everything recorded for this frame first, so the
+    // copies see the frame's final contents.
+    FlushWorkerCsChunk();
+
+    DxvkSubmitStatus workerStatus = { };
+    workerStatus.result.store(VK_NOT_READY);
+
+    DxvkCsChunkRef workerChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+
+    workerChunk->push([
+      cBuffer  = workerBuffer,
+      cImages  = std::move(workerImages),
+      cOffsets = offsets,
+      cStatus  = &workerStatus
+    ] (DxvkContext* ctx) {
+      for (size_t i = 0; i < cImages.size(); i++)
+        MgpuCopyImageForDump(ctx, cBuffer, cOffsets[i], cImages[i]);
+
+      ctx->flushCommandList(nullptr, cStatus);
+    });
+
+    uint64_t workerSeq = m_workerCsThread->dispatchChunk(std::move(workerChunk));
+
+    // GPU0: the same copies at the same point of its own stream.
+    EmitCs([
+      cBuffer  = primaryBuffer,
+      cImages  = std::move(primaryImages),
+      cOffsets = offsets
+    ] (DxvkContext* ctx) {
+      for (size_t i = 0; i < cImages.size(); i++)
+        MgpuCopyImageForDump(ctx, cBuffer, cOffsets[i], cImages[i]);
+    });
+
+    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
+    SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
+    m_device->waitForResource(*primaryBuffer, DxvkAccess::Write);
+
+    m_workerCsThread->synchronize(workerSeq);
+    workerDevice->waitForSubmission(&workerStatus);
+    workerDevice->waitForResource(*workerBuffer, DxvkAccess::Write);
+
+    const uint8_t* primaryData = reinterpret_cast<const uint8_t*>(primaryBuffer->mapPtr(0));
+    const uint8_t* workerData  = reinterpret_cast<const uint8_t*>(workerBuffer->mapPtr(0));
+
+    if (!primaryData || !workerData) {
+      Logger::warn(str::format("RTDUMP e=", event, ": dump buffer not mapped, primary=",
+        primaryData != nullptr, " worker=", workerData != nullptr));
+      return;
+    }
+
+    std::vector<size_t> differing;
+
+    for (size_t i = 0; i < pairs.size(); i++) {
+      const auto& pair = pairs[i];
+
+      VkExtent3D   extent = pair.primary->info().extent;
+      VkDeviceSize size   = lookupFormatInfo(pair.primary->info().format)->elementSize;
+
+      const uint8_t* p = primaryData + offsets[i];
+      const uint8_t* w = workerData  + offsets[i];
+
+      uint64_t diffTop    = 0;
+      uint64_t diffBottom = 0;
+      uint64_t nonzeroP   = 0;
+      uint64_t nonzeroW   = 0;
+      int32_t  firstX     = -1;
+      int32_t  firstY     = -1;
+
+      for (uint32_t y = 0; y < extent.height; y++) {
+        for (uint32_t x = 0; x < extent.width; x++) {
+          VkDeviceSize at = (VkDeviceSize(y) * extent.width + x) * size;
+
+          if (std::memcmp(p + at, w + at, size)) {
+            if (y < extent.height / 2u)
+              diffTop += 1;
+            else
+              diffBottom += 1;
+
+            if (firstX < 0) {
+              firstX = int32_t(x);
+              firstY = int32_t(y);
+            }
+          }
+
+          nonzeroP += MgpuIsZero(p + at, size) ? 0u : 1u;
+          nonzeroW += MgpuIsZero(w + at, size) ? 0u : 1u;
+        }
+      }
+
+      Logger::warn(str::format("RTDUMP e=", event,
+        " #", pair.index, " ", extent.width, "x", extent.height,
+        " dxgi ", uint32_t(pair.format), " bpp ", size,
+        ": diff top=", diffTop, " bottom=", diffBottom,
+        " of ", VkDeviceSize(extent.width) * extent.height,
+        " first=(", firstX, ",", firstY, ")",
+        " nonzero gpu0=", nonzeroP, " gpu1=", nonzeroW));
+
+      if (diffTop || diffBottom)
+        differing.push_back(i);
+    }
+
+    if (differing.empty() || s_fileEvents >= 3u)
+      return;
+
+    s_fileEvents += 1;
+
+    for (size_t i : differing) {
+      const auto& pair = pairs[i];
+
+      VkExtent3D   extent = pair.primary->info().extent;
+      VkDeviceSize size   = VkDeviceSize(extent.width) * extent.height
+        * lookupFormatInfo(pair.primary->info().format)->elementSize;
+
+      std::string base = str::format("mgpu_rt_e", event, "_n", pair.index);
+
+      MgpuWriteDds(base + "_gpu0.dds", pair.format, extent, primaryData + offsets[i], size);
+      MgpuWriteDds(base + "_gpu1.dds", pair.format, extent, workerData  + offsets[i], size);
+    }
   }
 
 

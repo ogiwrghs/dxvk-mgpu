@@ -361,6 +361,8 @@ namespace dxvk {
 
     bool NoLayout() const { return m_noLayout; }
 
+    void DumpWorkerRenderTargets();
+
     void CompositeWorkerOutput(
       const Rc<DxvkImage>&              DstImage,
       const Rc<DxvkImage>&              SrcImage);

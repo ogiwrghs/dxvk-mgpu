@@ -7,6 +7,19 @@
 #include "../util/util_win32_compat.h"
 
 namespace dxvk {
+
+  // Every texture with a worker image, for the render target dump.
+  // Allocated once and never freed, so textures destroyed during
+  // process teardown never find it gone.
+  struct MgpuWorkerImageRegistry {
+    dxvk::mutex                       mutex;
+    std::vector<D3D11CommonTexture*>  textures;
+  };
+
+  static MgpuWorkerImageRegistry& GetMgpuWorkerImageRegistry() {
+    static MgpuWorkerImageRegistry* s_registry = new MgpuWorkerImageRegistry();
+    return *s_registry;
+  }
   
   D3D11CommonTexture::D3D11CommonTexture(
           ID3D11Resource*             pInterface,
@@ -248,7 +261,8 @@ namespace dxvk {
       if (workerDevice != nullptr) {
         m_workerImage = workerDevice->createImage(imageInfo, memoryProperties);
         static std::atomic<uint32_t> s_workerImageCount{0u};
-        Logger::info(str::format("D3D11CommonTexture: Created worker image #", ++s_workerImageCount,
+        m_workerIndex = ++s_workerImageCount;
+        Logger::info(str::format("D3D11CommonTexture: Created worker image #", m_workerIndex,
           " (", m_desc.Width, "x", m_desc.Height, "x", m_desc.Depth, ")",
           " mips ", m_desc.MipLevels,
           " layers ", m_desc.ArraySize,
@@ -278,14 +292,68 @@ namespace dxvk {
 
       ExportImageInfo();
     }
+
+    // Last, so that nothing after it can throw and leave a dangling
+    // pointer in the registry.
+    if (m_workerImage != nullptr) {
+      auto& registry = GetMgpuWorkerImageRegistry();
+      std::lock_guard<dxvk::mutex> lock(registry.mutex);
+      registry.textures.push_back(this);
+    }
   }
   
   
   D3D11CommonTexture::~D3D11CommonTexture() {
+    if (m_workerImage != nullptr) {
+      auto& registry = GetMgpuWorkerImageRegistry();
+      std::lock_guard<dxvk::mutex> lock(registry.mutex);
+
+      auto entry = std::find(registry.textures.begin(), registry.textures.end(), this);
+
+      if (entry != registry.textures.end()) {
+        *entry = registry.textures.back();
+        registry.textures.pop_back();
+      }
+    }
     
   }
   
   
+  std::vector<D3D11CommonTexture::WorkerImagePair> D3D11CommonTexture::ListWorkerRenderTargets(
+          uint32_t                    Width,
+          uint32_t                    Height) {
+    std::vector<WorkerImagePair> result;
+
+    auto& registry = GetMgpuWorkerImageRegistry();
+    std::lock_guard<dxvk::mutex> lock(registry.mutex);
+
+    for (D3D11CommonTexture* texture : registry.textures) {
+      const D3D11_COMMON_TEXTURE_DESC& desc = texture->m_desc;
+
+      if (desc.Width != Width || desc.Height != Height || desc.Depth != 1
+       || desc.ArraySize != 1 || desc.SampleDesc.Count != 1
+       || !(desc.BindFlags & D3D11_BIND_RENDER_TARGET))
+        continue;
+
+      const DxvkFormatInfo* formatInfo = lookupFormatInfo(texture->m_image->info().format);
+
+      if (formatInfo->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT
+       || formatInfo->elementSize == 0)
+        continue;
+
+      result.push_back({ texture->m_workerIndex, desc.Format,
+        texture->m_image, texture->m_workerImage });
+    }
+
+    std::sort(result.begin(), result.end(),
+      [] (const WorkerImagePair& a, const WorkerImagePair& b) {
+        return a.index < b.index;
+      });
+
+    return result;
+  }
+
+
   VkDeviceSize D3D11CommonTexture::ComputeMappedOffset(UINT Subresource, UINT Plane, VkOffset3D Offset) const {
     auto packedFormatInfo = lookupFormatInfo(m_packedFormat);
 
