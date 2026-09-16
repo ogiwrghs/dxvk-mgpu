@@ -249,7 +249,15 @@ namespace dxvk {
         m_workerImage = workerDevice->createImage(imageInfo, memoryProperties);
         static std::atomic<uint32_t> s_workerImageCount{0u};
         Logger::info(str::format("D3D11CommonTexture: Created worker image #", ++s_workerImageCount,
-          " (", m_desc.Width, "x", m_desc.Height, "x", m_desc.Depth, ")"));
+          " (", m_desc.Width, "x", m_desc.Height, "x", m_desc.Depth, ")",
+          " mips ", m_desc.MipLevels,
+          " layers ", m_desc.ArraySize,
+          " samples ", m_desc.SampleDesc.Count,
+          " dxgi ", m_desc.Format,
+          " vk ", imageInfo.format,
+          " usage ", uint32_t(m_desc.Usage),
+          " bind 0x", std::hex, m_desc.BindFlags,
+          " misc 0x", m_desc.MiscFlags));
       }
     } else {
       m_image = m_device->GetDXVKDevice()->importImage(imageInfo, vkImage, memoryProperties);
