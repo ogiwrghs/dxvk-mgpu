@@ -1,0 +1,8 @@
+#!/bin/sh
+# Filter an MGPUCTX dump down to rows that are not already explained.
+# Removes: draw batching ratios, composite and HUD-only calls, barrier and
+# layout bookkeeping, and the known-asymmetric internals. Whatever survives
+# is a candidate for an unmirrored path.
+# Usage: mgpuctx_filter.sh <logfile>
+grep "MGPUCTX" "$1" | tail -260 | grep "ONE DEVICE ONLY\|differs" | grep -v \
+"copyImage\|copyBufferToImage\|signal\|endFrame\|beginExternal\|setDebugName\|needsDrawBarriers\|invalidateBuffer\|formatsAre\|ensureImage\|endLatency\|setDepthBias\|discard\|deferDiscard\|updateDynamic\|updateGraphicsPipelineState\|renderPassUnbind\|updateResourceBindings\|updateDescriptor\|updatePushData\|updateGraphicsShaderResources\|setViewports\|updateRenderTargets\|updateBuffer\|uploadBuffer\|copyBuffer\|initBuffer\|updateSamplerSet\|updateIndexBuffer\|updateVertexBuffer\|unbind\|updateSpecConstants\|performClears\|flushDeferredClear\|batchClear\|flushClears\|clearRenderTarget\|trackDrawBuffer\|accessDrawBuffer\|flushBarriers\|prepareOutOfOrder\|access\|resourceHas\|releaseResources\|acquireResources\|getBarrierBatch\|flushImageLayout\|transitionImageLayout\|trackNonDefault\|restoreImageLayout\|prepareSharedImages\|relocateQueued\|freeZeroBuffer\|endRecording\|beginRecording\|beginCurrentCommands\|endCurrentCommands\|beginActiveDebug\|endActiveDebug\|endRenderPass\|endCurrentPass\|endComputePass\|checkGraphicsHazards\|checkResourceHazards\|checkImageViewBarrier\|checkBufferBarrier\|addImageLayoutTransition\|addImageInitTransition\|lookupGraphicsPipeline\|updateGraphicsPipeline\b\|flushCommandList\|syncResources\|copyImageBufferData"
