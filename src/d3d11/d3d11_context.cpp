@@ -5916,7 +5916,9 @@ namespace dxvk {
     // constructor -- including a zero colorWriteMask, which builds a
     // valid pipeline that rasterizes and writes no channel at all.
     if (GetTypedContext()->HasWorkerDevice()) {
-      GetTypedContext()->EmitWorkerCs([] (DxvkContext* ctx) {
+      GetTypedContext()->EmitWorkerCs([
+        cUsedBindings  = GetMaxUsedBindings()
+      ] (DxvkContext* ctx) {
         ctx->setInputLayout(0, nullptr, 0, nullptr);
         ctx->setInputAssemblyState(InitDefaultPrimitiveTopology());
         ctx->setDepthStencilState(InitDefaultDepthStencilState());
@@ -5932,6 +5934,36 @@ namespace dxvk {
 
         ctx->setBlendConstants(DxvkBlendConstants { 1.0f, 1.0f, 1.0f, 1.0f });
         ctx->setStencilReference(D3D11_DEFAULT_STENCIL_REFERENCE);
+
+        // The unbinds the primary's reset below performs. Without
+        // them the worker keeps every binding across a command list
+        // boundary: BINDSHADER on Fire Strike counted 237417 tcs
+        // unbinds on the primary against 20408 on the worker, so
+        // GPU1 held a hull and domain shader after every tessellated
+        // draw and failed validatePipelineState's patch-topology
+        // check on every triangle-list draw that followed --
+        // 218000+ silently skipped draws, an empty G-buffer, and a
+        // worker half with no lit geometry on it.
+        //
+        // Render targets are excluded deliberately: the worker's are
+        // bound through EmitWorkerBindFramebuffer from the primary's
+        // BindFramebuffer, and RestoreCommandListState calls that
+        // again on the way back.
+        ctx->bindShader<VK_SHADER_STAGE_VERTEX_BIT>(nullptr);
+        ctx->bindShader<VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT>(nullptr);
+        ctx->bindShader<VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT>(nullptr);
+        ctx->bindShader<VK_SHADER_STAGE_GEOMETRY_BIT>(nullptr);
+        ctx->bindShader<VK_SHADER_STAGE_FRAGMENT_BIT>(nullptr);
+        ctx->bindShader<VK_SHADER_STAGE_COMPUTE_BIT>(nullptr);
+
+        ctx->bindDrawBuffers(DxvkBufferSlice(), DxvkBufferSlice());
+        ctx->bindIndexBuffer(DxvkBufferSlice(), VK_INDEX_TYPE_UINT32);
+
+        for (uint32_t i = 0; i < cUsedBindings.vbCount; i++)
+          ctx->bindVertexBuffer(i, DxvkBufferSlice(), 0);
+
+        for (uint32_t i = 0; i < cUsedBindings.soCount; i++)
+          ctx->bindXfbBuffer(i, DxvkBufferSlice(), DxvkBufferSlice());
       });
     }
 
