@@ -215,6 +215,30 @@ namespace dxvk {
         DiscardTexture(pResource, i);
 
       if (image) {
+        // Mirror before the primary EmitCs moves out of the local.
+        // Unmirrored discards leave GPU1 loading contents the primary
+        // has declared undefined, which diverges the two devices by
+        // construction and shows up as noise in every byte-diff
+        // instrument in this fork.
+        if (GetTypedContext()->HasWorkerDevice()) {
+          auto workerImage = texture->GetWorkerImage();
+
+          static std::atomic<uint64_t> s_hit  = { 0u };
+          static std::atomic<uint64_t> s_miss = { 0u };
+          uint64_t n = workerImage != nullptr ? ++s_hit : ++s_miss;
+
+          if (n <= 4u || (n % 5000u) == 0u) {
+            Logger::warn(str::format("DISCARDMIRROR image ",
+              workerImage != nullptr ? "hit=" : "miss=", n));
+          }
+
+          if (workerImage != nullptr) {
+            GetTypedContext()->EmitWorkerCs([cImage = std::move(workerImage)] (DxvkContext* ctx) {
+              ctx->discardImage(cImage);
+            });
+          }
+        }
+
         EmitCs([cImage = std::move(image)] (DxvkContext* ctx) {
           ctx->discardImage(cImage);
         });
@@ -284,6 +308,38 @@ namespace dxvk {
     }
 
     if (rtv || dsv) {
+      // Same mirror for the view path. This is the one that reaches
+      // depth: a depth buffer the primary discards and the worker
+      // does not leaves GPU1 depth-testing against stale values and
+      // rejecting fragments the primary accepts, which drops geometry
+      // rather than miscolouring it. RTDUMP does not cover depth
+      // targets, so this has never been observed either way.
+      if (GetTypedContext()->HasWorkerDevice()) {
+        Rc<DxvkImageView> workerView;
+
+        if (dsv) workerView = dsv->GetWorkerImageView();
+        if (rtv) workerView = rtv->GetWorkerImageView();
+
+        static std::atomic<uint64_t> s_hit  = { 0u };
+        static std::atomic<uint64_t> s_miss = { 0u };
+        uint64_t n = workerView != nullptr ? ++s_hit : ++s_miss;
+
+        if (n <= 4u || (n % 5000u) == 0u) {
+          Logger::warn(str::format("DISCARDMIRROR view ",
+            workerView != nullptr ? "hit=" : "miss=", n,
+            " dsv=", (dsv != nullptr), " rtv=", (rtv != nullptr)));
+        }
+
+        if (workerView != nullptr) {
+          GetTypedContext()->EmitWorkerCs([cView = std::move(workerView)] (DxvkContext* ctx) {
+            DxvkAttachment attachment = {};
+            attachment.view = cView;
+
+            ctx->clearRenderTarget(attachment, 0, VkClearValue(), cView->info().aspects);
+          });
+        }
+      }
+
       EmitCs([cView = view] (DxvkContext* ctx) {
         DxvkAttachment attachment = {};
         attachment.view = cView;

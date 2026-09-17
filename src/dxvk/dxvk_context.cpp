@@ -8814,6 +8814,39 @@ namespace dxvk {
     if (m_flags.test(DxvkContextFlag::DirtyDrawBuffer) && Indirect)
       this->trackDrawBuffer();
 
+    // TESSDRAW: committed draws per device, split by whether a
+    // tessellation control shader is bound. RTDUMP after the
+    // ResetCommandListState fix shows GPU1 drawing the scene's
+    // hard-surface geometry and not its rock and terrain, which is
+    // the geometry an engine displaces through tessellation. If the
+    // worker commits as many tcs-bound draws as the primary, those
+    // draws execute on both devices and differ in their data; if it
+    // commits fewer, they are still being lost. This sits after every
+    // early return in commitGraphicsState, so it counts draws that
+    // are actually going through.
+    {
+      static std::atomic<uint64_t> s_dev0 = { 0u };
+      static std::atomic<uint64_t> s_counts[2][2] = { };
+      static std::atomic<uint64_t> s_calls = { 0u };
+
+      uint64_t dev = reinterpret_cast<uint64_t>(m_device->handle());
+      uint64_t expected = 0u;
+      s_dev0.compare_exchange_strong(expected, dev);
+
+      uint32_t slot = (s_dev0.load() == dev) ? 0u : 1u;
+      bool tess = m_state.gp.shaders.tcs != nullptr;
+
+      s_counts[slot][tess ? 1u : 0u]++;
+
+      if ((++s_calls % 200000u) == 0u) {
+        for (uint32_t d = 0; d < 2u; d++) {
+          Logger::warn(str::format("TESSDRAW dev", d,
+            " plain=", s_counts[d][0].load(),
+            " tess=", s_counts[d][1].load()));
+        }
+      }
+    }
+
     return true;
   }
   
