@@ -14,6 +14,18 @@
 
 namespace dxvk {
 
+  // Defined in dxvk_context.cpp. MgpuLogShaderSeq exists because
+  // DxvkDevice is incomplete in this header: calling handle() on it
+  // from the bindShader template compiles, but warns in every
+  // translation unit that includes dxvk_context.h.
+  bool MgpuDebugVerbose();
+
+  void MgpuLogShaderSeq(
+    const void*                 device,
+          uint32_t              n,
+          bool                  isVertex,
+          bool                  bound);
+
   /**
    * \brief DXVK context
    * 
@@ -313,14 +325,14 @@ namespace dxvk {
     template<VkShaderStageFlagBits Stage>
     void bindShader(
             Rc<DxvkShader>&&      shader) {
-      if (Stage == VK_SHADER_STAGE_VERTEX_BIT || Stage == VK_SHADER_STAGE_FRAGMENT_BIT) {
+      if (MgpuDebugVerbose()
+       && (Stage == VK_SHADER_STAGE_VERTEX_BIT || Stage == VK_SHADER_STAGE_FRAGMENT_BIT)) {
         static std::atomic<uint32_t> s_seq = { 0u };
         uint32_t n = ++s_seq;
-        if (n <= 120u) {
-          Logger::warn(str::format("SHADERSEQ #", n,
-            " dev=", reinterpret_cast<uintptr_t>(m_device->handle()),
-            Stage == VK_SHADER_STAGE_VERTEX_BIT ? " VS" : " FS",
-            shader != nullptr ? " bind" : " NULL"));
+        if (n <= 1200u) {
+          MgpuLogShaderSeq(m_device.ptr(), n,
+            Stage == VK_SHADER_STAGE_VERTEX_BIT,
+            shader != nullptr);
         }
       }
 
@@ -336,7 +348,13 @@ namespace dxvk {
         static std::atomic<uint64_t> s_counts[2][6][2] = { };
         static std::atomic<uint64_t> s_calls = { 0u };
 
-        uint64_t dev = reinterpret_cast<uint64_t>(m_device->handle());
+        // m_device.ptr(), not m_device->handle(): DxvkDevice is
+        // incomplete in this header. Only used to tell the two
+        // devices apart, so any stable per-device value does. Note
+        // the dev= numbers here and in SHADERSEQ are DxvkDevice
+        // pointers, while COPY2BUF, NULLPIPE and MGPUCTX print
+        // VkDevice handles -- do not compare them across logs.
+        uint64_t dev = reinterpret_cast<uint64_t>(m_device.ptr());
         uint64_t expected = 0u;
         s_dev0.compare_exchange_strong(expected, dev);
 

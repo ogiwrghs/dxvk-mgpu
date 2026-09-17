@@ -61,6 +61,38 @@ namespace dxvk {
   }
 
 #define MGPU_CTX_COUNT() { static MgpuCtxCounter s_mgpuCtx(__func__); s_mgpuCtx.hit(m_device->handle()); }
+
+  // One gate for the exploratory diagnostics: SHADERSEQ, COPY2BUF,
+  // DRAWEMIT, GPSTATE, GPHASH, RPBIND. Each is capped per run, so
+  // left on by default they spend their slots during startup and are
+  // exhausted by the time anything interesting happens -- the trap
+  // that cost a session in efbf5946. Off unless asked for.
+  //
+  // Not gated, because they only fire when something is already
+  // wrong and the first occurrence matters: NULLPIPE, the pipeline
+  // lookup failure, updateGraphicsShaderResources. Nor are the
+  // periodic per-device counters BINDSHADER and TESSDRAW.
+  static const bool g_mgpuDebugVerbose =
+    env::getEnvVar("DXVK_MGPU_DEBUG_VERBOSE") == "1";
+
+  bool MgpuDebugVerbose() {
+    return g_mgpuDebugVerbose;
+  }
+
+  // SHADERSEQ's message, out of line. In the header DxvkDevice is
+  // only forward declared, so m_device->handle() there compiles by
+  // template instantiation but warns in every translation unit that
+  // includes dxvk_context.h.
+  void MgpuLogShaderSeq(
+    const void*                 device,
+          uint32_t              n,
+          bool                  isVertex,
+          bool                  bound) {
+    Logger::warn(str::format("SHADERSEQ #", n,
+      " dev=", reinterpret_cast<uintptr_t>(device),
+      isVertex ? " VS" : " FS",
+      bound ? " bind" : " NULL"));
+  }
   
   DxvkContext::DxvkContext(const Rc<DxvkDevice>& device)
   : m_device      (device),
@@ -737,7 +769,7 @@ namespace dxvk {
     {
       static uint32_t s_c2b = 0;
 
-      if (s_c2b++ < 12u) {
+      if (MgpuDebugVerbose() && s_c2b++ < 1200u) {
         Logger::warn(str::format("COPY2BUF dev=",
           reinterpret_cast<uintptr_t>(m_device->handle()),
           " image=", reinterpret_cast<uintptr_t>(srcImage.ptr()),
@@ -1739,7 +1771,7 @@ namespace dxvk {
         if (h != m_lastLoggedGpHash) {
           m_lastLoggedGpHash = h;
 
-          if (m_gpHashLogCount < 400u) {
+          if (MgpuDebugVerbose() && m_gpHashLogCount < 1200u) {
             m_gpHashLogCount++;
 
             Logger::warn(str::format("GPHASH dev=",
@@ -1752,7 +1784,7 @@ namespace dxvk {
       {
         static uint32_t s_dg = 0;
 
-        if (s_dg++ < 64u) {
+        if (MgpuDebugVerbose() && s_dg++ < 1200u) {
           Logger::warn(str::format("DRAWEMIT dev=",
             reinterpret_cast<uintptr_t>(m_device->handle()),
             " indexed=", Indexed, " count=", count,
@@ -6649,7 +6681,7 @@ namespace dxvk {
     {
       static uint32_t s_rpb = 0;
 
-      if (s_rpb++ < 24u) {
+      if (MgpuDebugVerbose() && s_rpb++ < 1200u) {
         const auto& ct0 = framebufferInfo.getColorTarget(0);
 
         Logger::warn(str::format("RPBIND dev=",
@@ -8778,7 +8810,7 @@ namespace dxvk {
           static std::atomic<uint32_t> s_resFail = { 0u };
           uint32_t n = ++s_resFail;
 
-          if (n <= 5u)
+          if (n <= 8u || (n % 1000u) == 0u)
             Logger::warn(str::format("updateGraphicsShaderResources failed #", n));
         }
         // This can only happen if we were inside a secondary command buffer.
