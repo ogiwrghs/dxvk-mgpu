@@ -323,6 +323,54 @@ namespace dxvk {
             shader != nullptr ? " bind" : " NULL"));
         }
       }
+
+      // BINDSHADER: binds and unbinds per device per stage, all five
+      // stages. NULLPIPE showed GPU1 failing every draw with tcs and
+      // tes bound while the primary failed none, so the two contexts'
+      // shader state has diverged; this says in which direction. The
+      // D3D11 unbind path mirrors unconditionally, so a worker bind
+      // count above the primary's, or an unbind count below it, names
+      // the gap. First device seen takes slot 0, which is the primary.
+      {
+        static std::atomic<uint64_t> s_dev0 = { 0u };
+        static std::atomic<uint64_t> s_counts[2][6][2] = { };
+        static std::atomic<uint64_t> s_calls = { 0u };
+
+        uint64_t dev = reinterpret_cast<uint64_t>(m_device->handle());
+        uint64_t expected = 0u;
+        s_dev0.compare_exchange_strong(expected, dev);
+
+        uint32_t slot  = (s_dev0.load() == dev) ? 0u : 1u;
+        uint32_t index = 5u;
+
+        switch (Stage) {
+          case VK_SHADER_STAGE_VERTEX_BIT:                  index = 0u; break;
+          case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT:    index = 1u; break;
+          case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: index = 2u; break;
+          case VK_SHADER_STAGE_GEOMETRY_BIT:                index = 3u; break;
+          case VK_SHADER_STAGE_FRAGMENT_BIT:                index = 4u; break;
+          default: break;
+        }
+
+        s_counts[slot][index][shader != nullptr ? 0u : 1u]++;
+
+        if ((++s_calls % 200000u) == 0u) {
+          static const char* s_names[6] = { "vs", "tcs", "tes", "gs", "fs", "other" };
+
+          for (uint32_t d = 0; d < 2u; d++) {
+            for (uint32_t i = 0; i < 6u; i++) {
+              uint64_t binds   = s_counts[d][i][0].load();
+              uint64_t unbinds = s_counts[d][i][1].load();
+
+              if (binds || unbinds) {
+                Logger::warn(str::format("BINDSHADER dev", d, " ", s_names[i],
+                  " bind=", binds, " null=", unbinds,
+                  " live=", int64_t(binds) - int64_t(unbinds)));
+              }
+            }
+          }
+        }
+      }
       switch (Stage) {
         case VK_SHADER_STAGE_VERTEX_BIT:
           m_state.gp.shaders.vs = std::move(shader);

@@ -7135,12 +7135,38 @@ namespace dxvk {
 
     if (unlikely(!pipelineInfo.handle)) {
       // Same silent-no-op path as the lookup failure above, one stage
-      // later.
-      static std::atomic<uint32_t> s_handleFail = { 0u };
-      uint32_t n = ++s_handleFail;
+      // later. getPipelineHandle only returns a null handle when
+      // validatePipelineState(state, true) rejects the state vector,
+      // and with trusted=true exactly three checks can fire: tess
+      // shaders inconsistent with patch topology, an undefined
+      // primitive topology, or an out-of-range attribute or binding
+      // count. Print the inputs to all three, per device, uncapped.
+      // The previous cap of five was read as "five failures at
+      // startup" when the real count was unknown.
+      static std::atomic<uint64_t> s_handleFailDev0 = { 0u };
+      static std::atomic<uint32_t> s_handleFailCount[2] = { { 0u }, { 0u } };
 
-      if (n <= 5u)
-        Logger::warn(str::format("updateGraphicsPipelineState: null handle #", n));
+      uint64_t dev = reinterpret_cast<uint64_t>(m_device->handle());
+      uint64_t expected = 0u;
+
+      s_handleFailDev0.compare_exchange_strong(expected, dev);
+
+      uint32_t slot = (s_handleFailDev0.load() == dev) ? 0u : 1u;
+      uint32_t n = ++s_handleFailCount[slot];
+
+      if (n <= 8u || (n % 1000u) == 0u) {
+        Logger::warn(str::format("NULLPIPE #", n, " dev=", dev,
+          " topology=", uint32_t(m_state.gp.state.ia.primitiveTopology()),
+          " patchVerts=", m_state.gp.state.ia.patchVertexCount(),
+          " attribs=", m_state.gp.state.il.attributeCount(),
+          " bindings=", m_state.gp.state.il.bindingCount(),
+          " vs=", (m_state.gp.shaders.vs != nullptr),
+          " tcs=", (m_state.gp.shaders.tcs != nullptr),
+          " tes=", (m_state.gp.shaders.tes != nullptr),
+          " gs=", (m_state.gp.shaders.gs != nullptr),
+          " fs=", (m_state.gp.shaders.fs != nullptr),
+          " rpActive=", m_flags.test(DxvkContextFlag::GpRenderPassActive)));
+      }
 
       return false;
     }
