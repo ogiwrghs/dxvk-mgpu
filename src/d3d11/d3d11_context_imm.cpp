@@ -165,6 +165,7 @@ namespace dxvk {
       // Ignore the DONOTFLUSH flag here as some games will spin
       // on queries without ever flushing the context otherwise.
       D3D10DeviceLock lock = LockContext();
+      { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
 
       if (unlikely(m_device->debugFlags().test(DxvkDebugFlag::Capture)))
         m_flushReason = "Query read-back";
@@ -178,6 +179,7 @@ namespace dxvk {
   
   void STDMETHODCALLTYPE D3D11ImmediateContext::Begin(ID3D11Asynchronous* pAsync) {
     D3D10DeviceLock lock = LockContext();
+    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
 
     if (unlikely(!pAsync))
       return;
@@ -196,6 +198,7 @@ namespace dxvk {
 
   void STDMETHODCALLTYPE D3D11ImmediateContext::End(ID3D11Asynchronous* pAsync) {
     D3D10DeviceLock lock = LockContext();
+    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
 
     if (unlikely(!pAsync))
       return;
@@ -241,6 +244,7 @@ namespace dxvk {
           ID3D11Fence*                pFence,
           UINT64                      Value) {
     D3D10DeviceLock lock = LockContext();
+    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
     auto fence = static_cast<D3D11Fence*>(pFence);
 
     if (!fence)
@@ -265,6 +269,7 @@ namespace dxvk {
           ID3D11Fence*                pFence,
           UINT64                      Value) {
     D3D10DeviceLock lock = LockContext();
+    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
     auto fence = static_cast<D3D11Fence*>(pFence);
 
     if (!fence)
@@ -290,6 +295,7 @@ namespace dxvk {
           ID3D11CommandList*  pCommandList,
           BOOL                RestoreContextState) {
     D3D10DeviceLock lock = LockContext();
+    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
 
     auto commandList = static_cast<D3D11CommandList*>(pCommandList);
 
@@ -370,6 +376,7 @@ namespace dxvk {
           UINT                        MapFlags,
           D3D11_MAPPED_SUBRESOURCE*   pMappedResource) {
     D3D10DeviceLock lock = LockContext();
+    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
 
     if (unlikely(!pResource))
       return E_INVALIDARG;
@@ -400,6 +407,7 @@ namespace dxvk {
 
       if (resourceDim != D3D11_RESOURCE_DIMENSION_BUFFER) {
         D3D10DeviceLock lock = LockContext();
+        { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
         UnmapImage(GetCommonTexture(pResource), Subresource);
       }
     }
@@ -414,6 +422,7 @@ namespace dxvk {
     if (unlikely(m_mappedWorkerBuffer != nullptr
               && reinterpret_cast<ID3D11Resource*>(m_mappedWorkerBuffer) == pResource)) {
       D3D10DeviceLock lock = LockContext();
+      { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
 
       Rc<DxvkBuffer> workerBuffer = m_mappedWorkerBuffer->GetWorkerBuffer();
 
@@ -1061,6 +1070,7 @@ namespace dxvk {
           ID3D11Resource*             pResource,
           VkImageLayout               SrcLayout) {
     D3D10DeviceLock lock = LockContext();
+    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
 
     auto texture = GetCommonTexture(pResource);
     auto buffer = GetCommonBuffer(pResource);
@@ -1087,6 +1097,7 @@ namespace dxvk {
           ID3D11Resource*             pResource,
           VkImageLayout               DstLayout) {
     D3D10DeviceLock lock = LockContext();
+    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
 
     auto texture = GetCommonTexture(pResource);
     auto buffer = GetCommonBuffer(pResource);
@@ -1111,6 +1122,7 @@ namespace dxvk {
 
   void D3D11ImmediateContext::SynchronizeCsThread(uint64_t SequenceNumber) {
     D3D10DeviceLock lock = LockContext();
+    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
 
     // Dispatch current chunk so that all commands
     // recorded prior to this function will be run
@@ -1129,6 +1141,7 @@ namespace dxvk {
   void D3D11ImmediateContext::EndFrame(
           Rc<DxvkLatencyTracker>      LatencyTracker) {
     D3D10DeviceLock lock = LockContext();
+    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
 
     // Don't keep draw buffers alive indefinitely. This cannot be
     // done in ExecuteFlush because command recording itself might
@@ -2787,6 +2800,7 @@ namespace dxvk {
           D3D11_CONTEXT_TYPE          ContextType,
           HANDLE                      hEvent) {
     D3D10DeviceLock lock = LockContext();
+    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
 
     // If we're in tiler mode and a render pass hasn't been resolved yet,
     // ignore explicit flushes. This is a very dirty heuristic to work

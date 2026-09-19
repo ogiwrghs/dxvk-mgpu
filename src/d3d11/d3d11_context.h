@@ -23,6 +23,27 @@
 
 namespace dxvk {
 
+  // The D3D11 call census. Declared here rather than in
+  // d3d11_context.cpp so the immediate context can plant it too:
+  // Map, Unmap, ExecuteCommandList, Flush, Begin and End are
+  // D3D11ImmediateContext methods and were never instrumented, which
+  // is why 635cdbe1 had to find ExecuteCommandList through a DXVK
+  // warning instead of the census, and why a BeamNG run showed no
+  // Map or Unmap at all beside 4295228 invalidateBuffer calls.
+  //
+  // Self-registering: each counter adds itself to a global list on
+  // first call. One relaxed atomic increment per API call, no locks,
+  // no allocation after the first call to each method.
+  struct MgpuCallCounter {
+    const char*             name;
+    std::atomic<uint64_t>   count;
+    MgpuCallCounter*        next;
+
+    static std::atomic<MgpuCallCounter*> s_head;
+
+    MgpuCallCounter(const char* n);
+  };
+
   class D3D11DeferredContext;
   class D3D11ImmediateContext;
 

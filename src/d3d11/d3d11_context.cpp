@@ -11,30 +11,21 @@ namespace dxvk {
   // relaxed atomic increment per API call, no locks, no allocation after
   // the first call to each method. Exists to replace guessing about which
   // D3D11 entry points a failing application uses with a measured list.
-  struct MgpuCallCounter {
-    const char*             name;
-    std::atomic<uint64_t>   count;
-    MgpuCallCounter*        next;
-
-    static std::atomic<MgpuCallCounter*> s_head;
-
-    MgpuCallCounter(const char* n)
-    : name(n), count(0u), next(nullptr) {
-      MgpuCallCounter* head = s_head.load();
-      do {
-        next = head;
-      } while (!s_head.compare_exchange_weak(head, this));
-
-      static bool s_registered = false;
-      if (!s_registered) {
-        s_registered = true;
-        std::atexit([] {
-          void MgpuDumpCallCounters();
-          MgpuDumpCallCounters();
-        });
-      }
+  MgpuCallCounter::MgpuCallCounter(const char* n)
+  : name(n), count(0u), next(nullptr) {
+    MgpuCallCounter* head = s_head.load();
+    do {
+      next = head;
+    } while (!s_head.compare_exchange_weak(head, this));
+    static bool s_registered = false;
+    if (!s_registered) {
+      s_registered = true;
+      std::atexit([] {
+        void MgpuDumpCallCounters();
+        MgpuDumpCallCounters();
+      });
     }
-  };
+  }
 
   std::atomic<MgpuCallCounter*> MgpuCallCounter::s_head = { nullptr };
 

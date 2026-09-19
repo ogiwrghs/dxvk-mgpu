@@ -11,7 +11,6 @@
 #include "d3d11_video.h"
 
 namespace dxvk {
-  
   class D3D11Buffer;
   class D3D11CommonTexture;
 
