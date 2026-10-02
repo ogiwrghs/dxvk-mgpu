@@ -4,7 +4,21 @@
 #include "d3d11_device.h"
 
 namespace dxvk {
-  
+
+  // Every buffer with a worker copy, for the buffer dump. Allocated
+  // once and never freed, so buffers destroyed during process
+  // teardown never find it gone. Same shape as the texture registry.
+  struct MgpuWorkerBufferRegistry {
+    dxvk::mutex                 mutex;
+    std::vector<D3D11Buffer*>   buffers;
+  };
+
+  static MgpuWorkerBufferRegistry& GetMgpuWorkerBufferRegistry() {
+    static MgpuWorkerBufferRegistry* s_registry = new MgpuWorkerBufferRegistry();
+    return *s_registry;
+  }
+
+
   D3D11Buffer::D3D11Buffer(
           D3D11Device*                pDevice,
     const D3D11_BUFFER_DESC*          pDesc,
@@ -117,7 +131,8 @@ namespace dxvk {
       if (workerDevice != nullptr) {
         m_workerBuffer = workerDevice->createBuffer(info, memoryFlags);
         static std::atomic<uint32_t> s_workerBufferCount{0u};
-        Logger::info(str::format("D3D11Buffer: Created worker buffer #", ++s_workerBufferCount, " (", info.size, " bytes)"));
+        m_workerIndex = ++s_workerBufferCount;
+        Logger::info(str::format("D3D11Buffer: Created worker buffer #", m_workerIndex, " (", info.size, " bytes)"));
       }
     } else {
       m_sparseAllocator = m_parent->GetDXVKDevice()->createSparsePageAllocator();
@@ -131,12 +146,58 @@ namespace dxvk {
     // For Stream Output buffers we need a counter
     if (pDesc->BindFlags & D3D11_BIND_STREAM_OUTPUT)
       m_soCounter = CreateSoCounterBuffer();
+
+    // Last, so that nothing after it can throw and leave a dangling
+    // pointer in the registry.
+    if (m_workerBuffer != nullptr) {
+      auto& registry = GetMgpuWorkerBufferRegistry();
+      std::lock_guard<dxvk::mutex> lock(registry.mutex);
+      registry.buffers.push_back(this);
+    }
   }
-  
-  
+
+
   D3D11Buffer::~D3D11Buffer() {
+    if (m_workerBuffer != nullptr) {
+      auto& registry = GetMgpuWorkerBufferRegistry();
+      std::lock_guard<dxvk::mutex> lock(registry.mutex);
+
+      auto entry = std::find(registry.buffers.begin(), registry.buffers.end(), this);
+
+      if (entry != registry.buffers.end()) {
+        *entry = registry.buffers.back();
+        registry.buffers.pop_back();
+      }
+    }
+
     if (m_desc.CPUAccessFlags && m_11on12.Resource != nullptr)
       m_11on12.Resource->Unmap(0, nullptr);
+  }
+
+
+  std::vector<D3D11Buffer::WorkerBufferPair> D3D11Buffer::ListWorkerBuffers() {
+    std::vector<WorkerBufferPair> result;
+
+    auto& registry = GetMgpuWorkerBufferRegistry();
+    std::lock_guard<dxvk::mutex> lock(registry.mutex);
+
+    for (D3D11Buffer* buffer : registry.buffers) {
+      if (!buffer->m_desc.ByteWidth)
+        continue;
+
+      result.push_back({ buffer->m_workerIndex,
+        buffer->m_desc.BindFlags, buffer->m_desc.Usage,
+        buffer->m_desc.CPUAccessFlags, buffer->m_desc.MiscFlags,
+        VkDeviceSize(buffer->m_desc.ByteWidth),
+        buffer->m_buffer, buffer->m_workerBuffer });
+    }
+
+    std::sort(result.begin(), result.end(),
+      [] (const WorkerBufferPair& a, const WorkerBufferPair& b) {
+        return a.index < b.index;
+      });
+
+    return result;
   }
   
   

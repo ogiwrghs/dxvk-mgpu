@@ -392,6 +392,7 @@ namespace dxvk {
     immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
 
     immediateContext->DumpWorkerRenderTargets();
+    immediateContext->DumpWorkerBuffers();
 
     if (env::getEnvVar("DXVK_MGPU_NO_COMPOSITE") != "1") {
       auto backBufferTexture = GetCommonTexture(m_backBuffers[0].ptr());

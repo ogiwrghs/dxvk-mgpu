@@ -362,6 +362,8 @@ namespace dxvk {
 
     void DumpWorkerRenderTargets();
 
+    void DumpWorkerBuffers();
+
     void CompositeWorkerOutput(
       const Rc<DxvkImage>&              DstImage,
       const Rc<DxvkImage>&              SrcImage);

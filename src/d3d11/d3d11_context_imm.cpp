@@ -8,6 +8,7 @@
 #include "../util/util_win32_compat.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 
 constexpr static uint32_t MinFlushIntervalUs = 750;
@@ -2173,6 +2174,254 @@ namespace dxvk {
       MgpuWriteDds(base + "_gpu0.dds", pair.format, extent, primaryData + offsets[i], size);
       MgpuWriteDds(base + "_gpu1.dds", pair.format, extent, workerData  + offsets[i], size);
     }
+  }
+
+
+  void D3D11ImmediateContext::DumpWorkerBuffers() {
+    // DXVK_MGPU_DUMP_BUF=N: every N presents, copy every live buffer
+    // that has a worker copy on both devices, at the same point of
+    // each command stream, and compare them byte for byte. One line
+    // per differing buffer (first 40 per dump), one summary line per
+    // dump. RTDUMP checks what the GPUs drew; this checks what they
+    // were given. A mirror that delivers every command but not every
+    // byte shows up here and nowhere else.
+    //
+    // DXVK_MGPU_DUMP_BUF_SELFTEST=1 flips one byte of the first
+    // compared buffer on the host side, to prove the compare path
+    // reports a difference when one exists.
+    static const uint32_t s_every = [] {
+      std::string value = env::getEnvVar("DXVK_MGPU_DUMP_BUF");
+      return value.empty() ? 0u : uint32_t(std::strtoul(value.c_str(), nullptr, 10));
+    }();
+
+    static const bool s_selfTest =
+      env::getEnvVar("DXVK_MGPU_DUMP_BUF_SELFTEST") == "1";
+
+    if (!s_every || !m_workerCsThread)
+      return;
+
+    static uint32_t s_presents = 0;
+
+    if ((++s_presents % s_every) != 0u)
+      return;
+
+    static uint32_t s_events = 0;
+    uint32_t event = ++s_events;
+
+    auto pairs = D3D11Buffer::ListWorkerBuffers();
+
+    if (pairs.empty()) {
+      Logger::warn(str::format("BUFDUMP e=", event, ": no live buffers with a worker copy"));
+      return;
+    }
+
+    // Copies go in batches through one staging buffer per device, so
+    // a few hundred MB of buffers never needs a few hundred MB of
+    // staging. Between batches the application is blocked in Present,
+    // so both streams stay at the same point.
+    constexpr VkDeviceSize Alignment  = 256u;
+    constexpr VkDeviceSize BatchBytes = VkDeviceSize(64u) << 20;
+
+    auto alignUp = [] (VkDeviceSize v) {
+      return (v + Alignment - 1u) & ~(Alignment - 1u);
+    };
+
+    VkDeviceSize stagingSize = BatchBytes;
+
+    for (const auto& pair : pairs)
+      stagingSize = std::max(stagingSize, alignUp(pair.size));
+
+    DxvkBufferCreateInfo info;
+    info.size   = stagingSize;
+    info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT
+                | VK_PIPELINE_STAGE_HOST_BIT;
+    info.access = VK_ACCESS_TRANSFER_WRITE_BIT
+                | VK_ACCESS_HOST_READ_BIT;
+    info.debugName = "MGPU buffer dump";
+
+    // Cached, so the CPU reads below are not write-combined (358be5d9).
+    VkMemoryPropertyFlags memType = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                  | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                  | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    Rc<DxvkDevice> workerDevice   = m_parent->GetWorkerDXVKDevice();
+    Rc<DxvkBuffer> primaryStaging = m_device->createBuffer(info, memType);
+    Rc<DxvkBuffer> workerStaging  = workerDevice->createBuffer(info, memType);
+
+    uint64_t totalBytes   = 0u;
+    uint64_t nonzeroP     = 0u;
+    uint64_t nonzeroW     = 0u;
+    uint32_t differing    = 0u;
+    uint32_t diffCb       = 0u;
+    uint32_t diffVb       = 0u;
+    uint32_t diffIb       = 0u;
+    uint32_t diffOther    = 0u;
+    uint32_t logged       = 0u;
+    bool     selfTestDone = false;
+
+    size_t begin = 0;
+
+    while (begin < pairs.size()) {
+      std::vector<VkDeviceSize>   offsets;
+      std::vector<VkDeviceSize>   sizes;
+      std::vector<Rc<DxvkBuffer>> primarySrc;
+      std::vector<Rc<DxvkBuffer>> workerSrc;
+
+      VkDeviceSize used = 0u;
+      size_t end = begin;
+
+      while (end < pairs.size()) {
+        VkDeviceSize size = alignUp(pairs[end].size);
+
+        if (end > begin && used + size > stagingSize)
+          break;
+
+        offsets.push_back(used);
+        sizes.push_back(pairs[end].size);
+        primarySrc.push_back(pairs[end].primary);
+        workerSrc.push_back(pairs[end].worker);
+
+        used += size;
+        end  += 1;
+      }
+
+      // GPU1: send everything recorded so far first.
+      FlushWorkerCsChunk();
+
+      DxvkSubmitStatus workerStatus = { };
+      workerStatus.result.store(VK_NOT_READY);
+
+      DxvkCsChunkRef workerChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+
+      workerChunk->push([
+        cDst     = workerStaging,
+        cSrc     = std::move(workerSrc),
+        cOffsets = offsets,
+        cSizes   = sizes,
+        cStatus  = &workerStatus
+      ] (DxvkContext* ctx) {
+        for (size_t i = 0; i < cSrc.size(); i++)
+          ctx->copyBuffer(cDst, cOffsets[i], cSrc[i], 0u, cSizes[i]);
+
+        ctx->flushCommandList(nullptr, cStatus);
+      });
+
+      uint64_t workerSeq = m_workerCsThread->dispatchChunk(std::move(workerChunk));
+
+      // GPU0: the same copies at the same point of its own stream.
+      EmitCs([
+        cDst     = primaryStaging,
+        cSrc     = std::move(primarySrc),
+        cOffsets = offsets,
+        cSizes   = sizes
+      ] (DxvkContext* ctx) {
+        for (size_t i = 0; i < cSrc.size(); i++)
+          ctx->copyBuffer(cDst, cOffsets[i], cSrc[i], 0u, cSizes[i]);
+      });
+
+      ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
+      SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
+      m_device->waitForResource(*primaryStaging, DxvkAccess::Write);
+
+      m_workerCsThread->synchronize(workerSeq);
+      workerDevice->waitForSubmission(&workerStatus);
+      workerDevice->waitForResource(*workerStaging, DxvkAccess::Write);
+
+      const uint8_t* primaryData = reinterpret_cast<const uint8_t*>(primaryStaging->mapPtr(0));
+      uint8_t*       workerData  = reinterpret_cast<uint8_t*>(workerStaging->mapPtr(0));
+
+      if (!primaryData || !workerData) {
+        Logger::warn(str::format("BUFDUMP e=", event, ": staging not mapped, primary=",
+          primaryData != nullptr, " worker=", workerData != nullptr));
+        return;
+      }
+
+      for (size_t i = begin; i < end; i++) {
+        const auto& pair = pairs[i];
+
+        const uint8_t* p = primaryData + offsets[i - begin];
+        uint8_t*       w = workerData  + offsets[i - begin];
+
+        if (s_selfTest && !selfTestDone) {
+          w[0] ^= 0xFFu;
+          selfTestDone = true;
+        }
+
+        totalBytes += pair.size;
+
+        uint64_t diffBytes = 0u;
+        int64_t  first     = -1;
+
+        for (VkDeviceSize j = 0; j < pair.size; j++) {
+          nonzeroP += p[j] ? 1u : 0u;
+          nonzeroW += w[j] ? 1u : 0u;
+
+          if (p[j] != w[j]) {
+            diffBytes += 1u;
+
+            if (first < 0)
+              first = int64_t(j);
+          }
+        }
+
+        if (!diffBytes)
+          continue;
+
+        differing += 1u;
+
+        const char* kind = "other";
+
+        if (pair.bindFlags & D3D11_BIND_CONSTANT_BUFFER) {
+          kind = "cb";
+          diffCb += 1u;
+        } else if (pair.bindFlags & D3D11_BIND_VERTEX_BUFFER) {
+          kind = "vb";
+          diffVb += 1u;
+        } else if (pair.bindFlags & D3D11_BIND_INDEX_BUFFER) {
+          kind = "ib";
+          diffIb += 1u;
+        } else {
+          diffOther += 1u;
+        }
+
+        if (logged++ >= 40u)
+          continue;
+
+        // 16 bytes from each device around the first difference.
+        VkDeviceSize at  = VkDeviceSize(first) & ~VkDeviceSize(15u);
+        VkDeviceSize len = std::min<VkDeviceSize>(16u, pair.size - at);
+
+        char hexP[64] = { };
+        char hexW[64] = { };
+
+        for (VkDeviceSize j = 0; j < len; j++) {
+          std::snprintf(hexP + 3 * j, 4, "%02x ", p[at + j]);
+          std::snprintf(hexW + 3 * j, 4, "%02x ", w[at + j]);
+        }
+
+        Logger::warn(str::format("BUFDUMP e=", event,
+          " #", pair.index, " ", kind,
+          " size=", pair.size,
+          " bind=0x", std::hex, pair.bindFlags,
+          " cpu=0x", pair.cpuFlags,
+          " misc=0x", pair.miscFlags, std::dec,
+          " usage=", uint32_t(pair.usage),
+          ": diff bytes=", diffBytes,
+          " first=", first,
+          " @", at, " gpu0=[ ", hexP, "] gpu1=[ ", hexW, "]"));
+      }
+
+      begin = end;
+    }
+
+    Logger::warn(str::format("BUFDUMP e=", event, " summary:",
+      " buffers=", pairs.size(),
+      " bytes=", totalBytes,
+      " nonzero gpu0=", nonzeroP, " gpu1=", nonzeroW,
+      " differing=", differing,
+      " (cb=", diffCb, " vb=", diffVb, " ib=", diffIb, " other=", diffOther, ")",
+      s_selfTest ? " SELFTEST" : ""));
   }
 
 

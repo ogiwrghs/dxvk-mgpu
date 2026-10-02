@@ -215,6 +215,31 @@ namespace dxvk {
       const D3D11_RESOURCE_FLAGS*   pResourceFlags,
             D3D11_BUFFER_DESC*      pBufferDesc);
 
+    /**
+     * \brief A live buffer with storage on both devices
+     *
+     * Diagnostic, for the buffer dump. Holds references to both
+     * buffers, so the pair stays valid after the D3D11 buffer
+     * that owned it is destroyed.
+     */
+    struct WorkerBufferPair {
+      uint32_t        index;
+      UINT            bindFlags;
+      D3D11_USAGE     usage;
+      UINT            cpuFlags;
+      UINT            miscFlags;
+      VkDeviceSize    size;
+      Rc<DxvkBuffer>  primary;
+      Rc<DxvkBuffer>  worker;
+    };
+
+    /**
+     * \brief Lists every live buffer that has a worker copy
+     *
+     * Sorted by creation index.
+     */
+    static std::vector<WorkerBufferPair> ListWorkerBuffers();
+
   private:
     
     D3D11_BUFFER_DESC             m_desc;
@@ -223,6 +248,7 @@ namespace dxvk {
     
     Rc<DxvkBuffer>                m_buffer;
     Rc<DxvkBuffer>                m_workerBuffer;
+    uint32_t                      m_workerIndex = 0u;
     uint64_t                      m_cookie = 0u;
 
     Rc<DxvkBuffer>                m_soCounter;
