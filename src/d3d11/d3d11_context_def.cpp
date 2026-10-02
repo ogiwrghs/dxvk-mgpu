@@ -11,6 +11,14 @@ namespace dxvk {
   : D3D11CommonContext<D3D11DeferredContext>(pParent, Device, ContextFlags, 0u),
     m_commandList(CreateCommandList()),
     m_destructionNotifier(this) {
+    // Own staging on the worker device: deferred contexts record on
+    // several threads at once, so the immediate context's staging
+    // ring cannot be shared.
+    Rc<DxvkDevice> workerDevice = pParent->GetWorkerDXVKDevice();
+
+    if (workerDevice != nullptr)
+      m_workerStaging = std::make_unique<DxvkStagingBuffer>(workerDevice, 4ull << 20);
+
     ResetContextState();
   }
   
@@ -311,12 +319,35 @@ namespace dxvk {
           Logger::warn(str::format("CBREAD latched (deferred) length=", pBuffer->Desc()->ByteWidth));
         }
       }
+      // Stage and copyBuffer, not updateBuffer. updateBuffer is
+      // vkCmdUpdateBuffer, capped at 65536 bytes by the spec, and
+      // prepareOutOfOrderTransfer may hoist it ahead of the list's
+      // draws -- the same fault e8755983 fixed on the immediate path.
+      // BUFDUMP on Fire Strike: a 1 MB dynamic vertex buffer held a
+      // stale previous frame on GPU1 at every dump. The memcpy runs
+      // when the worker CS thread executes, after ExecuteCommandList,
+      // so NO_OVERWRITE appends made after this map are included.
+      VkDeviceSize    size    = VkDeviceSize(pBuffer->Desc()->ByteWidth);
+      DxvkBufferSlice staging = m_workerStaging->alloc(size);
+
+      {
+        static std::atomic<uint64_t> s_big = { 0u };
+        if (size > 65536u) {
+          uint64_t n = ++s_big;
+          if (n <= 4u || (n % 1000u) == 0u)
+            Logger::warn(str::format("DEFMAPMIRROR big=", n, " bytes=", size));
+        }
+      }
+
       EmitWorkerCs([
         cWorkerBuffer = pBuffer->GetWorkerBuffer(),
         cSrcSlice     = bufferSlice,
-        cSize         = VkDeviceSize(pBuffer->Desc()->ByteWidth)
+        cStaging      = std::move(staging),
+        cSize         = size
       ] (DxvkContext* ctx) {
-        ctx->updateBuffer(cWorkerBuffer, 0u, cSize, cSrcSlice->mapPtr());
+        std::memcpy(cStaging.mapPtr(0), cSrcSlice->mapPtr(), cSize);
+        ctx->copyBuffer(cWorkerBuffer, 0u,
+          cStaging.buffer(), cStaging.offset(), cSize);
       });
     }
     EmitCs([

@@ -82,6 +82,9 @@ namespace dxvk {
     
     // Command list that we're recording
     Com<D3D11CommandList> m_commandList;
+
+    // Worker-device staging for the deferred Map mirror
+    std::unique_ptr<DxvkStagingBuffer> m_workerStaging;
     
     // Info about currently mapped (sub)resources. Using a vector
     // here is reasonable since there will usually only be a small
