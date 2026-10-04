@@ -157,7 +157,73 @@ namespace dxvk {
   }
 
 
+  bool D3D11Buffer::EnsureShadow() {
+    if (m_shadowPtr)
+      return true;
+
+    if (!m_mapPtr)
+      return false;
+
+    SIZE_T size = SIZE_T(m_desc.ByteWidth);
+    void* ptr = VirtualAlloc(nullptr, size,
+      MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+
+    if (!ptr) {
+      Logger::warn(str::format("SHADOWMIRROR create failed size=", size));
+      return false;
+    }
+
+    std::memcpy(ptr, m_mapPtr, size);
+    ResetWriteWatch(ptr, size);
+
+    m_shadowPtr = ptr;
+    m_shadowPages.resize((size + 4095u) / 4096u);
+
+    static std::atomic<uint64_t> s_create = { 0u };
+    uint64_t n = ++s_create;
+    if (n <= 8u || (n % 100u) == 0u)
+      Logger::warn(str::format("SHADOWMIRROR create=", n, " size=", size));
+    return true;
+  }
+
+
+  void D3D11Buffer::DropShadow() {
+    if (m_shadowPtr) {
+      VirtualFree(m_shadowPtr, 0, MEM_RELEASE);
+      m_shadowPtr = nullptr;
+      m_shadowPages.clear();
+    }
+  }
+
+
+  void D3D11Buffer::CollectShadowDirtyRanges(std::vector<D3D11ShadowRange>& ranges) {
+    ranges.clear();
+
+    ULONG_PTR count = m_shadowPages.size();
+    DWORD granularity = 0u;
+
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, m_shadowPtr, SIZE_T(m_desc.ByteWidth),
+          m_shadowPages.data(), &count, &granularity) != 0u) {
+      ranges.push_back({ 0u, VkDeviceSize(m_desc.ByteWidth) });
+      return;
+    }
+
+    for (ULONG_PTR i = 0; i < count; i++) {
+      VkDeviceSize begin = VkDeviceSize(reinterpret_cast<uintptr_t>(m_shadowPages[i])
+                                      - reinterpret_cast<uintptr_t>(m_shadowPtr));
+      VkDeviceSize end = std::min<VkDeviceSize>(begin + granularity, m_desc.ByteWidth);
+
+      if (!ranges.empty() && ranges.back().end == begin)
+        ranges.back().end = end;
+      else
+        ranges.push_back({ begin, end });
+    }
+  }
+
+
   D3D11Buffer::~D3D11Buffer() {
+    DropShadow();
+
     if (m_workerBuffer != nullptr) {
       auto& registry = GetMgpuWorkerBufferRegistry();
       std::lock_guard<dxvk::mutex> lock(registry.mutex);

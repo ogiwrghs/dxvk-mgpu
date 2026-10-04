@@ -235,6 +235,11 @@ namespace dxvk {
     VkDeviceSize            m_mappedWorkerSize = 0u;
     bool                    m_mappedWorkerNoOverwrite = false;
 
+    std::vector<D3D11Buffer*>      m_shadowMapped;
+    std::vector<D3D11ShadowRange>  m_shadowRanges;
+
+    void FlushShadow(D3D11Buffer* pBuffer);
+
     Rc<DxvkBuffer>          m_cbReadBuffer = nullptr;
     VkDeviceSize            m_cbReadOffset = 0u;
     uint8_t                 m_cbReadExpect[16] = { };

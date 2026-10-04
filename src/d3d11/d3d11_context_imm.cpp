@@ -440,6 +440,18 @@ namespace dxvk {
       }
     }
 
+    if (unlikely(!m_shadowMapped.empty())) {
+      for (size_t i = 0; i < m_shadowMapped.size(); i++) {
+        if (reinterpret_cast<ID3D11Resource*>(m_shadowMapped[i]) == pResource) {
+          D3D10DeviceLock lock = LockContext();
+          FlushShadow(m_shadowMapped[i]);
+          m_shadowMapped[i] = m_shadowMapped.back();
+          m_shadowMapped.pop_back();
+          return;
+        }
+      }
+    }
+
     // Push the just-written contents to the worker's copy of the
     // buffer. Upstream Unmap is a no-op for buffers because the GPU
     // reads the host-visible allocation directly; the worker has its
@@ -501,6 +513,51 @@ namespace dxvk {
   }
 
 
+  void D3D11ImmediateContext::FlushShadow(D3D11Buffer* pBuffer) {
+    auto t0 = dxvk::high_resolution_clock::now();
+
+    pBuffer->CollectShadowDirtyRanges(m_shadowRanges);
+
+    auto src = static_cast<const char*>(pBuffer->GetShadowPtr());
+    auto dst = static_cast<char*>(pBuffer->GetMapPtr());
+    Rc<DxvkBuffer> workerBuffer = pBuffer->GetWorkerBuffer();
+    VkDeviceSize total = 0u;
+
+    for (const auto& r : m_shadowRanges) {
+      VkDeviceSize len = r.end - r.begin;
+      std::memcpy(dst + r.begin, src + r.begin, len);
+      total += len;
+
+      if (workerBuffer != nullptr) {
+        DxvkBufferSlice staging = m_workerStagingBuffer->alloc(len);
+        std::memcpy(staging.mapPtr(0), src + r.begin, len);
+
+        EmitWorkerCs([
+          cBuffer  = workerBuffer,
+          cStaging = std::move(staging),
+          cOffset  = r.begin,
+          cSize    = len
+        ] (DxvkContext* ctx) {
+          ctx->copyBuffer(cBuffer, cOffset,
+            cStaging.buffer(), cStaging.offset(), cSize);
+        });
+      }
+    }
+
+    auto t1 = dxvk::high_resolution_clock::now();
+
+    static std::atomic<uint64_t> s_flush = { 0u };
+    uint64_t n = ++s_flush;
+    if (n <= 4u || (n % 2000u) == 0u) {
+      Logger::warn(str::format("SHADOWMIRROR flush=", n,
+        " ranges=", m_shadowRanges.size(),
+        " bytes=", total,
+        " size=", pBuffer->Desc()->ByteWidth,
+        " us=", std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()));
+    }
+  }
+
+
   HRESULT D3D11ImmediateContext::MapBuffer(
           D3D11Buffer*                pResource,
           D3D11_MAP                   MapType,
@@ -545,7 +602,10 @@ namespace dxvk {
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
 
-      if (m_workerCsThread && pResource->GetWorkerBuffer() != nullptr) {
+      if (m_workerCsThread && pResource->GetShadowPtr() != nullptr) {
+        pMappedResource->pData = pResource->GetShadowPtr();
+        m_shadowMapped.push_back(pResource);
+      } else if (m_workerCsThread && pResource->GetWorkerBuffer() != nullptr) {
         if (m_mappedWorkerBuffer != nullptr) {
           static std::atomic<uint64_t> s_clobber = { 0u };
           uint64_t n = ++s_clobber;
@@ -577,7 +637,11 @@ namespace dxvk {
       pMappedResource->pData      = pResource->GetMapPtr();
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
-      if (m_workerCsThread && m_mirrorNoOverwrite && pResource->GetWorkerBuffer() != nullptr) {
+      if (m_workerCsThread && m_mirrorNoOverwrite && pResource->GetWorkerBuffer() != nullptr
+       && pResource->EnsureShadow()) {
+        pMappedResource->pData = pResource->GetShadowPtr();
+        m_shadowMapped.push_back(pResource);
+      } else if (m_workerCsThread && m_mirrorNoOverwrite && pResource->GetWorkerBuffer() != nullptr) {
         if (m_mappedWorkerBuffer != nullptr) {
           static std::atomic<uint64_t> s_clobber = { 0u };
           uint64_t n = ++s_clobber;
@@ -1048,6 +1112,9 @@ namespace dxvk {
     }
 
     std::memcpy(reinterpret_cast<char*>(mapPtr) + Offset, pSrcData, Length);
+
+    if (unlikely(pDstBuffer->GetShadowPtr() != nullptr))
+      std::memcpy(reinterpret_cast<char*>(pDstBuffer->GetShadowPtr()) + Offset, pSrcData, Length);
 
     // Mirror to the worker's copy of the buffer. This is the direct-map
     // fast path UpdateSubresource takes for constant buffers, and the

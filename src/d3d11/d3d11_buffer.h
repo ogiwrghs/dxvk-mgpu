@@ -36,6 +36,11 @@ namespace dxvk {
   };
   
   
+  struct D3D11ShadowRange {
+    VkDeviceSize begin;
+    VkDeviceSize end;
+  };
+
   class D3D11Buffer : public D3D11DeviceChild<ID3D11Buffer> {
     static constexpr VkDeviceSize BufferSliceAlignment = 64;
   public:
@@ -162,9 +167,19 @@ namespace dxvk {
       return allocation;
     }
 
-    void* GetMapPtr() const {
+     void* GetMapPtr() const {
       return m_mapPtr;
     }
+
+    void* GetShadowPtr() const {
+      return m_shadowPtr;
+    }
+
+    bool EnsureShadow();
+
+    void DropShadow();
+
+    void CollectShadowDirtyRanges(std::vector<D3D11ShadowRange>& ranges);
 
     D3D10Buffer* GetD3D10Iface() {
       return &m_d3d10;
@@ -256,6 +271,8 @@ namespace dxvk {
     uint64_t                      m_seq = 0ull;
 
     void*                         m_mapPtr = nullptr;
+    void*                         m_shadowPtr = nullptr;
+    std::vector<void*>            m_shadowPages;
 
     D3D11DXGIResource             m_resource;
     D3D10Buffer                   m_d3d10;
