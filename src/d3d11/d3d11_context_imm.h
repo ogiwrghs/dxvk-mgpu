@@ -135,6 +135,7 @@ namespace dxvk {
     bool                    m_noScissor = false;
     bool                    m_noCompletionWait = false;
     bool                    m_mirrorNoOverwrite = false;
+    bool                    m_noShadow = false;
     bool                    m_noWorkerFlush = false;
     VkExtent2D              m_presentExtent = { 0u, 0u };
     bool                    m_noLayout = false;
@@ -345,13 +346,15 @@ namespace dxvk {
         return;
 
       if (unlikely(!m_workerCsChunk->push(command))) {
-        m_workerCsThread->dispatchChunk(std::move(m_workerCsChunk));
+        DispatchWorkerChunkTimed(std::move(m_workerCsChunk));
         m_workerCsChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
         m_workerCsChunk->push(command);
       }
     }
 
     void FlushWorkerCsChunk();
+
+    uint64_t DispatchWorkerChunkTimed(DxvkCsChunkRef&& chunk);
 
     void EmitWorkerClearRenderTarget(
       const DxvkAttachment&             Attachment,

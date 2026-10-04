@@ -110,6 +110,7 @@ namespace dxvk {
       m_noLayout         = env::getEnvVar("DXVK_MGPU_NO_LAYOUT") == "1";
       m_noCompletionWait = env::getEnvVar("DXVK_MGPU_NO_COMPLETION_WAIT") == "1";
       m_mirrorNoOverwrite = env::getEnvVar("DXVK_MGPU_NO_MIRROR_NOOVERWRITE") != "1";
+      m_noShadow          = env::getEnvVar("DXVK_MGPU_NO_SHADOW") == "1";
       m_noWorkerFlush     = env::getEnvVar("DXVK_MGPU_NO_WORKER_FLUSH") == "1";
       m_cbReadEnabled    = env::getEnvVar("DXVK_MGPU_TEST_CBREAD") == "1";
       m_cbPoisonEnabled  = env::getEnvVar("DXVK_MGPU_TEST_CBPOISON") == "1";
@@ -637,7 +638,7 @@ namespace dxvk {
       pMappedResource->pData      = pResource->GetMapPtr();
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
-      if (m_workerCsThread && m_mirrorNoOverwrite && pResource->GetWorkerBuffer() != nullptr
+      if (m_workerCsThread && m_mirrorNoOverwrite && !m_noShadow && pResource->GetWorkerBuffer() != nullptr
        && pResource->EnsureShadow()) {
         pMappedResource->pData = pResource->GetShadowPtr();
         m_shadowMapped.push_back(pResource);
@@ -1367,12 +1368,66 @@ namespace dxvk {
   }
 
 
+  struct MgpuDispatchTimer {
+    const char* name;
+    uint64_t chunks    = 0u;
+    uint64_t blockedNs = 0u;
+    uint64_t maxNs     = 0u;
+    dxvk::high_resolution_clock::time_point windowStart;
+
+    explicit MgpuDispatchTimer(const char* n)
+    : name(n), windowStart(dxvk::high_resolution_clock::now()) { }
+
+    void record(
+            dxvk::high_resolution_clock::time_point t0,
+            dxvk::high_resolution_clock::time_point t1) {
+      uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+      chunks    += 1u;
+      blockedNs += ns;
+      maxNs      = std::max(maxNs, ns);
+
+      uint64_t elapsedNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - windowStart).count());
+
+      if (elapsedNs >= 2000000000ull) {
+        Logger::warn(str::format("DISPATCHWAIT ", name,
+          " blocked_ms_per_s=", double(blockedNs) * 1000.0 / double(elapsedNs),
+          " chunks_per_s=", double(chunks) * 1.0e9 / double(elapsedNs),
+          " max_us=", maxNs / 1000u));
+        chunks      = 0u;
+        blockedNs   = 0u;
+        maxNs       = 0u;
+        windowStart = t1;
+      }
+    }
+  };
+
+  static MgpuDispatchTimer g_mgpuPrimaryDispatch("primary");
+  static MgpuDispatchTimer g_mgpuWorkerDispatch("worker");
+
+
+  uint64_t D3D11ImmediateContext::DispatchWorkerChunkTimed(DxvkCsChunkRef&& chunk) {
+    // Same rule as EmitCsChunk on the primary: the initializer's worker
+    // commands (zero-fill and initial data of new resources) must reach
+    // the worker CS thread before any context command that touches them.
+    m_parent->FlushInitCommands();
+
+    auto t0 = dxvk::high_resolution_clock::now();
+    uint64_t seq = m_workerCsThread->dispatchChunk(std::move(chunk));
+    auto t1 = dxvk::high_resolution_clock::now();
+    g_mgpuWorkerDispatch.record(t0, t1);
+    return seq;
+  }
+
+
   void D3D11ImmediateContext::EmitCsChunk(DxvkCsChunkRef&& chunk) {
     // Flush init commands so that the CS thread
     // can processe them before the first use.
     m_parent->FlushInitCommands();
 
+    auto t0 = dxvk::high_resolution_clock::now();
     m_csSeqNum = m_csThread.dispatchChunk(std::move(chunk));
+    auto t1 = dxvk::high_resolution_clock::now();
+    g_mgpuPrimaryDispatch.record(t0, t1);
   }
 
   
@@ -1402,7 +1457,7 @@ namespace dxvk {
     if (isEmpty)
       return;
 
-    m_lastWorkerSeq = m_workerCsThread->dispatchChunk(std::move(m_workerCsChunk));
+    m_lastWorkerSeq = DispatchWorkerChunkTimed(std::move(m_workerCsChunk));
     m_workerCsChunk = m_parent->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
   }
 
