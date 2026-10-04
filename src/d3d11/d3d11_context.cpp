@@ -1197,6 +1197,62 @@ namespace dxvk {
       });
     }
 
+    if (GetTypedContext()->HasWorkerDevice()) {
+      Rc<DxvkImage> workerDst = dstTextureInfo->GetWorkerImage();
+      Rc<DxvkImage> workerSrc = srcTextureInfo->GetWorkerImage();
+      bool mirrored = workerDst != nullptr && workerSrc != nullptr;
+      bool isCopy = srcDesc.SampleDesc.Count == 1 || m_parent->GetOptions()->disableMsaa;
+      {
+        static std::atomic<uint64_t> s_hit  = { 0u };
+        static std::atomic<uint64_t> s_miss = { 0u };
+        uint64_t n = mirrored ? ++s_hit : ++s_miss;
+        if (n <= 4u || (n % 10000u) == 0u) {
+          Logger::warn(str::format("RESOLVEMIRROR ",
+            mirrored ? "hit=" : "miss=", n,
+            " copy=", isCopy ? 1 : 0,
+            " src=", srcDesc.Width, "x", srcDesc.Height,
+            " samples=", srcDesc.SampleDesc.Count,
+            " dstfmt=", uint32_t(dstDesc.Format)));
+        }
+      }
+      if (mirrored && isCopy) {
+        GetTypedContext()->EmitWorkerCs([
+          cDstImage  = std::move(workerDst),
+          cSrcImage  = std::move(workerSrc),
+          cDstLayers = dstSubresourceLayers,
+          cSrcLayers = srcSubresourceLayers
+        ] (DxvkContext* ctx) {
+          ctx->copyImage(
+            cDstImage, cDstLayers, VkOffset3D { 0, 0, 0 },
+            cSrcImage, cSrcLayers, VkOffset3D { 0, 0, 0 },
+            cDstImage->mipLevelExtent(cDstLayers.mipLevel));
+        });
+      } else if (mirrored) {
+        VkFormat format = m_parent->LookupFormat(
+          Format, DXGI_VK_FORMAT_MODE_ANY).Format;
+
+        GetTypedContext()->EmitWorkerCs([
+          cDstImage  = std::move(workerDst),
+          cSrcImage  = std::move(workerSrc),
+          cDstSubres = dstSubresourceLayers,
+          cSrcSubres = srcSubresourceLayers,
+          cFormat    = format
+        ] (DxvkContext* ctx) {
+          VkFormat format = cFormat ? cFormat : cSrcImage->info().format;
+
+          VkImageResolve region;
+          region.srcSubresource = cSrcSubres;
+          region.srcOffset      = VkOffset3D { 0, 0, 0 };
+          region.dstSubresource = cDstSubres;
+          region.dstOffset      = VkOffset3D { 0, 0, 0 };
+          region.extent         = cDstImage->mipLevelExtent(cDstSubres.mipLevel);
+
+          ctx->resolveImage(cDstImage, cSrcImage, region, format,
+            getDefaultResolveMode(format), VK_RESOLVE_MODE_NONE);
+        });
+      }
+    }
+
     if constexpr (!IsDeferred)
       GetTypedContext()->NotifyResolve();
 
