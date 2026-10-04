@@ -7001,6 +7001,45 @@ namespace dxvk {
       });
     }
 
+    if constexpr (!IsDeferred) {
+      if (GetTypedContext()->HasWorkerDevice()) {
+        DxvkBufferSlice workerSlice = pDstBuffer->GetWorkerBufferSlice(Offset, Length);
+        bool mirrored = workerSlice.defined();
+        {
+          static std::atomic<uint64_t> s_hit  = { 0u };
+          static std::atomic<uint64_t> s_miss = { 0u };
+          uint64_t n = mirrored ? ++s_hit : ++s_miss;
+          if (n <= 4u || (n % 2000u) == 0u) {
+            Logger::warn(str::format("UPDBUFMIRROR ",
+              mirrored ? "hit=" : "miss=", n,
+              " offset=", Offset, " length=", Length));
+          }
+        }
+        if (mirrored) {
+          DxvkBufferSlice staging = GetTypedContext()->m_workerStagingBuffer->alloc(Length);
+          std::memcpy(staging.mapPtr(0), pSrcData, Length);
+
+          GetTypedContext()->EmitWorkerCs([
+            cDst     = std::move(workerSlice),
+            cStaging = std::move(staging),
+            cSize    = VkDeviceSize(Length)
+          ] (DxvkContext* ctx) {
+            ctx->copyBuffer(
+              cDst.buffer(), cDst.offset(),
+              cStaging.buffer(), cStaging.offset(),
+              cSize);
+          });
+        }
+      }
+    } else {
+      if (GetTypedContext()->HasWorkerDevice()) {
+        static std::atomic<uint64_t> s_deferred = { 0u };
+        uint64_t n = ++s_deferred;
+        if (n <= 4u || (n % 2000u) == 0u)
+          Logger::warn(str::format("UPDBUFMIRROR deferred=", n, " unmirrored"));
+      }
+    }
+
     if (pDstBuffer->HasSequenceNumber())
       GetTypedContext()->TrackBufferSequenceNumber(pDstBuffer);
 
