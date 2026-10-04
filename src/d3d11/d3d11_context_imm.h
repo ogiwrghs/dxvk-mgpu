@@ -356,6 +356,8 @@ namespace dxvk {
 
     uint64_t DispatchWorkerChunkTimed(DxvkCsChunkRef&& chunk);
 
+
+
     void EmitWorkerClearRenderTarget(
       const DxvkAttachment&             Attachment,
       const VkClearValue&               ClearValue);

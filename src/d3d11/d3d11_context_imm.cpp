@@ -469,15 +469,20 @@ namespace dxvk {
 
       if (workerBuffer != nullptr) {
         DxvkBufferSlice staging = m_workerStagingBuffer->alloc(m_mappedWorkerSize);
-        auto tc0 = dxvk::high_resolution_clock::now();
-        std::memcpy(staging.mapPtr(0), m_mappedWorkerPtr, m_mappedWorkerSize);
-        auto tc1 = dxvk::high_resolution_clock::now();
-        if (m_mappedWorkerSize >= 65536u) {
-          static uint32_t s_cpyLog = 0;
-          if ((s_cpyLog++ % 200u) == 0u) {
-            Logger::warn(str::format("MAPMIRROR memcpy ", m_mappedWorkerSize, " bytes in ",
-              std::chrono::duration_cast<std::chrono::microseconds>(tc1 - tc0).count(), " us"));
-          }
+
+        // No clock reads on the common path: in this VM a clock read
+        // costs microseconds (CLOCKCOST), more than the 16-byte copy.
+        static uint32_t s_cpyLog = 0;
+        bool timed = m_mappedWorkerSize >= 65536u && (s_cpyLog++ % 200u) == 0u;
+
+        if (unlikely(timed)) {
+          auto tc0 = dxvk::high_resolution_clock::now();
+          std::memcpy(staging.mapPtr(0), m_mappedWorkerPtr, m_mappedWorkerSize);
+          auto tc1 = dxvk::high_resolution_clock::now();
+          Logger::warn(str::format("MAPMIRROR memcpy ", m_mappedWorkerSize, " bytes in ",
+            std::chrono::duration_cast<std::chrono::microseconds>(tc1 - tc0).count(), " us"));
+        } else {
+          std::memcpy(staging.mapPtr(0), m_mappedWorkerPtr, m_mappedWorkerSize);
         }
 
         {
@@ -515,7 +520,12 @@ namespace dxvk {
 
 
   void D3D11ImmediateContext::FlushShadow(D3D11Buffer* pBuffer) {
-    auto t0 = dxvk::high_resolution_clock::now();
+    static std::atomic<uint64_t> s_flush = { 0u };
+    uint64_t n = ++s_flush;
+    bool timed = n <= 4u || (n % 2000u) == 0u;
+
+    auto t0 = timed ? dxvk::high_resolution_clock::now()
+                    : dxvk::high_resolution_clock::time_point();
 
     pBuffer->CollectShadowDirtyRanges(m_shadowRanges);
 
@@ -545,11 +555,8 @@ namespace dxvk {
       }
     }
 
-    auto t1 = dxvk::high_resolution_clock::now();
-
-    static std::atomic<uint64_t> s_flush = { 0u };
-    uint64_t n = ++s_flush;
-    if (n <= 4u || (n % 2000u) == 0u) {
+    if (timed) {
+      auto t1 = dxvk::high_resolution_clock::now();
       Logger::warn(str::format("SHADOWMIRROR flush=", n,
         " ranges=", m_shadowRanges.size(),
         " bytes=", total,
@@ -1382,6 +1389,14 @@ namespace dxvk {
             dxvk::high_resolution_clock::time_point t0,
             dxvk::high_resolution_clock::time_point t1) {
       uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+      accumulate(ns, t1);
+    }
+
+    void recordNs(uint64_t ns) {
+      accumulate(ns, dxvk::high_resolution_clock::now());
+    }
+
+    void accumulate(uint64_t ns, dxvk::high_resolution_clock::time_point t1) {
       chunks    += 1u;
       blockedNs += ns;
       maxNs      = std::max(maxNs, ns);
@@ -1389,9 +1404,9 @@ namespace dxvk {
       uint64_t elapsedNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - windowStart).count());
 
       if (elapsedNs >= 2000000000ull) {
-        Logger::warn(str::format("DISPATCHWAIT ", name,
-          " blocked_ms_per_s=", double(blockedNs) * 1000.0 / double(elapsedNs),
-          " chunks_per_s=", double(chunks) * 1.0e9 / double(elapsedNs),
+        Logger::warn(str::format(name,
+          " ms_per_s=", double(blockedNs) * 1000.0 / double(elapsedNs),
+          " calls_per_s=", double(chunks) * 1.0e9 / double(elapsedNs),
           " max_us=", maxNs / 1000u));
         chunks      = 0u;
         blockedNs   = 0u;
@@ -1401,8 +1416,8 @@ namespace dxvk {
     }
   };
 
-  static MgpuDispatchTimer g_mgpuPrimaryDispatch("primary");
-  static MgpuDispatchTimer g_mgpuWorkerDispatch("worker");
+  static MgpuDispatchTimer g_mgpuPrimaryDispatch("DISPATCHWAIT primary");
+  static MgpuDispatchTimer g_mgpuWorkerDispatch("DISPATCHWAIT worker");
 
 
   uint64_t D3D11ImmediateContext::DispatchWorkerChunkTimed(DxvkCsChunkRef&& chunk) {
@@ -1410,6 +1425,17 @@ namespace dxvk {
     // commands (zero-fill and initial data of new resources) must reach
     // the worker CS thread before any context command that touches them.
     m_parent->FlushInitCommands();
+
+    static bool s_clockMeasured = false;
+    if (unlikely(!s_clockMeasured)) {
+      s_clockMeasured = true;
+      auto c0 = dxvk::high_resolution_clock::now();
+      for (uint32_t i = 0; i < 1000u; i++)
+        dxvk::high_resolution_clock::now();
+      auto c1 = dxvk::high_resolution_clock::now();
+      Logger::warn(str::format("CLOCKCOST ns_per_now=",
+        std::chrono::duration_cast<std::chrono::nanoseconds>(c1 - c0).count() / 1000));
+    }
 
     auto t0 = dxvk::high_resolution_clock::now();
     uint64_t seq = m_workerCsThread->dispatchChunk(std::move(chunk));
