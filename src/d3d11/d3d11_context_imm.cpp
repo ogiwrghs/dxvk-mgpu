@@ -1910,7 +1910,9 @@ namespace dxvk {
           VkDeviceSize                offset,
     const Rc<DxvkImage>&              image) {
     VkImageSubresourceLayers sub = { };
-    sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    sub.aspectMask = (lookupFormatInfo(image->info().format)->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT)
+      ? VK_IMAGE_ASPECT_DEPTH_BIT
+      : VK_IMAGE_ASPECT_COLOR_BIT;
     sub.layerCount = 1;
 
     // The image's own format as the buffer format keeps this a plain
@@ -2034,8 +2036,11 @@ namespace dxvk {
       primaryImages.push_back(pair.primary);
       workerImages.push_back(pair.worker);
 
-      totalSize += VkDeviceSize(extent.width) * extent.height
-        * lookupFormatInfo(pair.primary->info().format)->elementSize;
+      // Block count, so compressed formats size correctly (BC1: one
+      // 8-byte element per 4x4 block).
+      auto fi = lookupFormatInfo(pair.primary->info().format);
+      VkExtent3D blocks = util::computeBlockCount(extent, fi->blockSize);
+      totalSize += VkDeviceSize(blocks.width) * blocks.height * blocks.depth * fi->elementSize;
     }
 
     DxvkBufferCreateInfo info;
@@ -2111,8 +2116,9 @@ namespace dxvk {
     for (size_t i = 0; i < pairs.size(); i++) {
       const auto& pair = pairs[i];
 
-      VkExtent3D   extent = pair.primary->info().extent;
-      VkDeviceSize size   = lookupFormatInfo(pair.primary->info().format)->elementSize;
+      auto         fi     = lookupFormatInfo(pair.primary->info().format);
+      VkExtent3D   extent = util::computeBlockCount(pair.primary->info().extent, fi->blockSize);
+      VkDeviceSize size   = fi->elementSize;
 
       const uint8_t* p = primaryData + offsets[i];
       const uint8_t* w = workerData  + offsets[i];
@@ -2124,12 +2130,14 @@ namespace dxvk {
       int32_t  firstX     = -1;
       int32_t  firstY     = -1;
 
-      for (uint32_t y = 0; y < extent.height; y++) {
+      uint32_t rows = extent.height * extent.depth;
+
+      for (uint32_t y = 0; y < rows; y++) {
         for (uint32_t x = 0; x < extent.width; x++) {
           VkDeviceSize at = (VkDeviceSize(y) * extent.width + x) * size;
 
           if (std::memcmp(p + at, w + at, size)) {
-            if (y < extent.height / 2u)
+            if (y < rows / 2u)
               diffTop += 1;
             else
               diffBottom += 1;

@@ -85,6 +85,36 @@ namespace dxvk {
         cCounterSlice.offset(),
         sizeof(zero), &zero);
     });
+
+    // The worker's counter starts as whatever the allocator handed
+    // back. An append/consume buffer driven by a garbage counter
+    // spawns nothing, silently. Fire Strike: 17 of 18 per-chunk
+    // particle state buffers stayed zero on GPU1 with matching
+    // constants, matching inputs, matching UAV binds and matching
+    // dispatch counts (CHUNKIN, UAV45K, NULLCPIPE, BUFDUMP).
+    Rc<DxvkBufferView> workerView = pUav->GetWorkerCounterView();
+
+    {
+      static std::atomic<uint64_t> s_hit  = { 0u };
+      static std::atomic<uint64_t> s_miss = { 0u };
+      uint64_t n = workerView != nullptr ? ++s_hit : ++s_miss;
+      if (n <= 4u || (n % 1000u) == 0u) {
+        Logger::warn(str::format("CTRINITMIRROR ",
+          workerView != nullptr ? "hit=" : "miss=", n));
+      }
+    }
+
+    if (m_workerDevice != nullptr && workerView != nullptr) {
+      EmitWorkerCs([
+        cCounterSlice = DxvkBufferSlice(workerView)
+      ] (DxvkContext* ctx) {
+        const uint32_t zero = 0;
+        ctx->updateBuffer(
+          cCounterSlice.buffer(),
+          cCounterSlice.offset(),
+          sizeof(zero), &zero);
+      });
+    }
   }
 
 

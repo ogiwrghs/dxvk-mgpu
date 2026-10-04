@@ -11,6 +11,38 @@ namespace dxvk {
   // relaxed atomic increment per API call, no locks, no allocation after
   // the first call to each method. Exists to replace guessing about which
   // D3D11 entry points a failing application uses with a measured list.
+  // TESSIN: what a tessellated draw reads. Fire Strike's rock and
+  // ground draw on GPU1 in matching numbers and produce nothing;
+  // constants, vertex and index buffers match. Prints the HS and DS
+  // SRVs of the first few draws with a hull shader bound.
+  #define MGPU_TESSIN_LOG()                                                              \
+    if (m_state.hs != nullptr) {                                                          \
+      static std::atomic<uint32_t> s_tessin = { 0u };                                     \
+      uint32_t tn = ++s_tessin;                                                            \
+      if (tn <= 8u || (tn % 50000u) == 0u) {                                               \
+        std::string line = str::format("TESSIN #", tn, IsDeferred ? " def" : " imm");    \
+        for (auto stage : { D3D11ShaderType::eVertex, D3D11ShaderType::eHull, D3D11ShaderType::eDomain }) { \
+          const auto& views = m_state.srv[stage].views;                                   \
+          for (uint32_t i = 0; i < views.size(); i++) {                                   \
+            auto v = views[i].ptr();                                                      \
+            if (!v) continue;                                                             \
+            line += str::format(stage == D3D11ShaderType::eVertex ? " vs"                 \
+              : stage == D3D11ShaderType::eHull ? " hs" : " ds", i, "=");                \
+            if (v->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {          \
+              line += str::format("buf:", v->GetViewInfo().Buffer.Length);               \
+            } else {                                                                      \
+              Com<ID3D11Resource> res;                                                    \
+              v->GetResource(&res);                                                       \
+              auto d = GetCommonTexture(res.ptr())->Desc();                               \
+              line += str::format("img:", d->Width, "x", d->Height, "x", d->Depth,       \
+                ":f", uint32_t(d->Format));                                               \
+            }                                                                             \
+          }                                                                               \
+        }                                                                                 \
+        Logger::warn(line);                                                               \
+      }                                                                                   \
+    }
+
   MgpuCallCounter::MgpuCallCounter(const char* n)
   : name(n), count(0u), next(nullptr) {
     MgpuCallCounter* head = s_head.load();
@@ -1298,6 +1330,8 @@ namespace dxvk {
     if (unlikely(!IndexCount))
       return;
 
+    MGPU_TESSIN_LOG();
+
     VkDrawIndexedIndirectCommand draw = { };
     draw.indexCount    = IndexCount;
     draw.instanceCount = 1u;
@@ -1343,6 +1377,8 @@ namespace dxvk {
 
     if (unlikely(!IndexCountPerInstance || !InstanceCount))
       return;
+
+    MGPU_TESSIN_LOG();
 
     VkDrawIndexedIndirectCommand draw = { };
     draw.indexCount    = IndexCountPerInstance;
@@ -1451,6 +1487,58 @@ namespace dxvk {
       return;
 
     AddCost(GpuCostEstimate::Dispatch);
+
+    // CHUNKIN: inputs of the pass that writes Fire Strike's 45056-byte
+    // per-chunk buffers. GPU1 runs these dispatches and writes nothing
+    // into 17 of 18 chunks while binding the right UAVs, so an input
+    // differs. Prints every bound compute SRV and UAV for the first
+    // few such dispatches.
+    {
+      auto uav0 = m_state.uav.views[0].ptr();
+
+      if (uav0 && uav0->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER
+       && uav0->GetViewInfo().Buffer.Length == 45056u) {
+        static std::atomic<uint32_t> s_n = { 0u };
+        uint32_t n = ++s_n;
+
+        if (n <= 6u) {
+          std::string line = str::format("CHUNKIN #", n, " groups=",
+            ThreadGroupCountX, "x", ThreadGroupCountY, "x", ThreadGroupCountZ);
+
+          for (uint32_t i = 0; i < D3D11_1_UAV_SLOT_COUNT; i++) {
+            auto v = m_state.uav.views[i].ptr();
+            if (!v) continue;
+            line += str::format(" uav", i, "=");
+            if (v->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+              line += str::format("buf:", v->GetViewInfo().Buffer.Length);
+            } else {
+              Com<ID3D11Resource> res;
+              v->GetResource(&res);
+              auto d = GetCommonTexture(res.ptr())->Desc();
+              line += str::format("img:", d->Width, "x", d->Height, "x", d->Depth, ":f", uint32_t(d->Format));
+            }
+          }
+
+          const auto& srvs = m_state.srv[D3D11ShaderType::eCompute].views;
+
+          for (uint32_t i = 0; i < srvs.size(); i++) {
+            auto v = srvs[i].ptr();
+            if (!v) continue;
+            line += str::format(" srv", i, "=");
+            if (v->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+              line += str::format("buf:", v->GetViewInfo().Buffer.Length);
+            } else {
+              Com<ID3D11Resource> res;
+              v->GetResource(&res);
+              auto d = GetCommonTexture(res.ptr())->Desc();
+              line += str::format("img:", d->Width, "x", d->Height, "x", d->Depth, ":f", uint32_t(d->Format));
+            }
+          }
+
+          Logger::warn(line);
+        }
+      }
+    }
 
 
     if (unlikely(HasDirtyComputeBindings()))
@@ -4998,6 +5086,23 @@ namespace dxvk {
         });
         if (GetTypedContext()->HasWorkerDevice()) {
           Rc<DxvkBufferView> workerUav = pUav->GetWorkerBufferView();
+
+          // UAV45K: Fire Strike's 18 per-chunk 45056-byte structured
+          // buffers. GPU1 fills only the first; the other 17 stay zero.
+          // Prints which primary and worker views each bind resolves
+          // to, so "worker always binds chunk 0" can be seen or ruled
+          // out directly.
+          if (pUav->GetViewInfo().Buffer.Length == 45056u) {
+            static std::atomic<uint32_t> s_n = { 0u };
+            uint32_t n = ++s_n;
+            if (n <= 60u || (n % 20000u) == 0u) {
+              Logger::warn(str::format("UAV45K #", n,
+                " stage=", uint32_t(ShaderStage), " slot=", Slot,
+                " off=", pUav->GetViewInfo().Buffer.Offset,
+                " pv=", reinterpret_cast<uintptr_t>(pUav->GetBufferView().ptr()),
+                " wv=", reinterpret_cast<uintptr_t>(workerUav.ptr())));
+            }
+          }
           {
             static std::atomic<uint64_t> s_hit  = { 0u };
             static std::atomic<uint64_t> s_miss = { 0u };

@@ -7020,8 +7020,18 @@ namespace dxvk {
     auto newPipeline = lookupComputePipeline(m_state.cp.shaders);
     m_state.cp.pipeline = newPipeline;
 
-    if (unlikely(!newPipeline))
+    if (unlikely(!newPipeline)) {
+      // NULLCPIPE: the compute twin of NULLPIPE. A skipped dispatch
+      // leaves its UAVs untouched with no error anywhere.
+      static std::atomic<uint32_t> s_n = { 0u };
+      uint32_t n = ++s_n;
+      if (n <= 8u || (n % 1000u) == 0u) {
+        Logger::warn(str::format("NULLCPIPE lookup #", n,
+          " dev=", reinterpret_cast<uintptr_t>(m_device->handle()),
+          " cs=", (m_state.cp.shaders.cs != nullptr)));
+      }
       return false;
+    }
 
     auto newLayout = newPipeline->getLayout()->getLayout(DxvkPipelineLayoutType::Merged);
 
@@ -7033,9 +7043,16 @@ namespace dxvk {
 
     // Look up Vulkan pipeline handle for the given compute state
     auto pipelineHandle = newPipeline->getPipelineHandle(m_state.cp.state);
-    
-    if (unlikely(!pipelineHandle))
+
+    if (unlikely(!pipelineHandle)) {
+      static std::atomic<uint32_t> s_n = { 0u };
+      uint32_t n = ++s_n;
+      if (n <= 8u || (n % 1000u) == 0u) {
+        Logger::warn(str::format("NULLCPIPE handle #", n,
+          " dev=", reinterpret_cast<uintptr_t>(m_device->handle())));
+      }
       return false;
+    }
 
     m_cmd->cmdBindPipeline(DxvkCmdBuffer::ExecBuffer,
       VK_PIPELINE_BIND_POINT_COMPUTE, pipelineHandle);
@@ -8868,13 +8885,34 @@ namespace dxvk {
       uint32_t slot = (s_dev0.load() == dev) ? 0u : 1u;
       bool tess = m_state.gp.shaders.tcs != nullptr;
 
+      static std::atomic<uint32_t> s_patch[2] = { { 0u }, { 0u } };
+      static std::atomic<uint32_t> s_topo[2]  = { { 0u }, { 0u } };
+
       s_counts[slot][tess ? 1u : 0u]++;
+
+      static std::atomic<uint64_t> s_patchHist[2][33] = { };
+
+      if (tess) {
+        uint32_t pv = std::min(m_state.gp.state.ia.patchVertexCount(), 32u);
+        s_patch[slot] = pv;
+        s_topo[slot]  = uint32_t(m_state.gp.state.ia.primitiveTopology());
+        s_patchHist[slot][pv]++;
+      }
 
       if ((++s_calls % 200000u) == 0u) {
         for (uint32_t d = 0; d < 2u; d++) {
           Logger::warn(str::format("TESSDRAW dev", d,
             " plain=", s_counts[d][0].load(),
-            " tess=", s_counts[d][1].load()));
+            " tess=", s_counts[d][1].load(),
+            " lastTopo=", s_topo[d].load(),
+            " lastPatchVerts=", s_patch[d].load()));
+
+          std::string hist;
+          for (uint32_t pv = 0; pv <= 32u; pv++) {
+            uint64_t c = s_patchHist[d][pv].load();
+            if (c) hist += str::format(" p", pv, "=", c);
+          }
+          Logger::warn(str::format("TESSPATCH dev", d, hist));
         }
       }
     }

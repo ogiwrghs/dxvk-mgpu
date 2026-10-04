@@ -330,14 +330,19 @@ namespace dxvk {
     for (D3D11CommonTexture* texture : registry.textures) {
       const D3D11_COMMON_TEXTURE_DESC& desc = texture->m_desc;
 
-      if (desc.Width != Width || desc.Height != Height || desc.Depth != 1
+      // Render targets and UAV images, 2D or 3D, single layer and
+      // sample. 3D images are compared slice by slice below.
+      if (desc.Width != Width || desc.Height != Height
        || desc.ArraySize != 1 || desc.SampleDesc.Count != 1
-       || !(desc.BindFlags & D3D11_BIND_RENDER_TARGET))
+       || !(desc.BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS
+                            | D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_DEPTH_STENCIL)))
         continue;
 
       const DxvkFormatInfo* formatInfo = lookupFormatInfo(texture->m_image->info().format);
 
-      if (formatInfo->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT
+      // Colour, or the depth aspect of a depth(-stencil) image. The
+      // dump copies depth only; for D24S8 that is 4 bytes per texel.
+      if (!(formatInfo->aspectMask & (VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_DEPTH_BIT))
        || formatInfo->elementSize == 0)
         continue;
 
