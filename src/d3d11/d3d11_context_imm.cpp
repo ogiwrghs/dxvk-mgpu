@@ -971,6 +971,55 @@ namespace dxvk {
       });
     }
 
+    if (HasWorkerDevice()) {
+      Rc<DxvkImage>  workerImage = pResource->GetWorkerImage();
+      Rc<DxvkBuffer> srcBuffer   = pResource->GetMappedBuffer(Subresource);
+      bool mirrored = workerImage != nullptr && srcBuffer != nullptr;
+      VkDeviceSize stageSize = mirrored ? srcBuffer->info().size : VkDeviceSize(0u);
+      {
+        static std::atomic<uint64_t> s_hit  = { 0u };
+        static std::atomic<uint64_t> s_miss = { 0u };
+        uint64_t n = mirrored ? ++s_hit : ++s_miss;
+        if (n <= 4u || (n % 500u) == 0u) {
+          Logger::warn(str::format("IMGUNMAPMIRROR ",
+            mirrored ? "hit=" : "miss=", n,
+            " bytes=", stageSize,
+            " region=", region.Extent.width, "x", region.Extent.height, "x", region.Extent.depth,
+            " offset=", region.Offset.x, ",", region.Offset.y,
+            " mip=", subresource.mipLevel));
+        }
+      }
+      if (mirrored) {
+        DxvkBufferSlice staging = m_workerStagingBuffer->alloc(stageSize);
+        std::memcpy(staging.mapPtr(0), srcBuffer->mapPtr(0), stageSize);
+
+        for (uint32_t i = 0; i < pResource->GetPlaneCount(); i++) {
+          VkImageSubresourceLayers workerSubresource = subresource;
+          workerSubresource.aspectMask = formatInfo->aspectMask;
+
+          if (formatInfo->flags.test(DxvkFormatFlag::MultiPlane))
+            workerSubresource.aspectMask = vk::getPlaneAspect(i);
+
+          EmitWorkerCs([
+            cDstImage       = workerImage,
+            cDstSubresource = workerSubresource,
+            cDstOffset      = region.Offset,
+            cDstExtent      = region.Extent,
+            cStaging        = staging,
+            cSrcOffset      = pResource->ComputeMappedOffset(Subresource, i, region.Offset),
+            cSrcRowPitch    = subresourceLayout.RowPitch,
+            cSrcDepthPitch  = subresourceLayout.DepthPitch,
+            cPackedFormat   = pResource->GetPackedFormat()
+          ] (DxvkContext* ctx) {
+            ctx->copyBufferToImage(
+              cDstImage, cDstSubresource, cDstOffset, cDstExtent,
+              cStaging.buffer(), cStaging.offset() + cSrcOffset,
+              cSrcRowPitch, cSrcDepthPitch, cPackedFormat);
+          });
+        }
+      }
+    }
+
     if (pResource->HasSequenceNumber())
       TrackTextureSequenceNumber(pResource, Subresource);
   }

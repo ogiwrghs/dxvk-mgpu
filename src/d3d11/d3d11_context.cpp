@@ -5662,6 +5662,53 @@ namespace dxvk {
                 cSrcBuffer, cSrcOffset, cSrcLayout.RowPitch, cSrcLayout.DepthPitch,
                 cDstFormat);
             });
+
+            if constexpr (!IsDeferred) {
+              if (GetTypedContext()->HasWorkerDevice()) {
+                Rc<DxvkImage>  workerDst = pDstTexture->GetWorkerImage();
+                Rc<DxvkBuffer> srcBuffer = pSrcTexture->GetMappedBuffer(srcSubresource);
+                bool mirrored = workerDst != nullptr && srcBuffer != nullptr;
+                VkDeviceSize stageSize = mirrored ? srcBuffer->info().size : VkDeviceSize(0u);
+                {
+                  static std::atomic<uint64_t> s_hit  = { 0u };
+                  static std::atomic<uint64_t> s_miss = { 0u };
+                  uint64_t n = mirrored ? ++s_hit : ++s_miss;
+                  if (n <= 4u || (n % 500u) == 0u) {
+                    Logger::warn(str::format("STAGINGMIRROR ",
+                      mirrored ? "hit=" : "miss=", n,
+                      " bytes=", stageSize,
+                      " extent=", dstExtent.width, "x", dstExtent.height, "x", dstExtent.depth,
+                      " mip=", pDstLayers->mipLevel));
+                  }
+                }
+                if (mirrored) {
+                  DxvkBufferSlice staging = GetTypedContext()->m_workerStagingBuffer->alloc(stageSize);
+                  std::memcpy(staging.mapPtr(0), srcBuffer->mapPtr(0), stageSize);
+
+                  GetTypedContext()->EmitWorkerCs([
+                    cDstImage  = std::move(workerDst),
+                    cDstLayers = dstLayer,
+                    cDstOffset = DstOffset,
+                    cDstExtent = dstExtent,
+                    cDstFormat = pDstTexture->GetPackedFormat(),
+                    cStaging   = std::move(staging),
+                    cSrcLayout = pSrcTexture->GetSubresourceLayout(srcAspectMask, srcSubresource),
+                    cSrcOffset = pSrcTexture->ComputeMappedOffset(srcSubresource, j, SrcOffset)
+                  ] (DxvkContext* ctx) {
+                    ctx->copyBufferToImage(cDstImage, cDstLayers, cDstOffset, cDstExtent,
+                      cStaging.buffer(), cStaging.offset() + cSrcOffset,
+                      cSrcLayout.RowPitch, cSrcLayout.DepthPitch, cDstFormat);
+                  });
+                }
+              }
+            } else {
+              if (GetTypedContext()->HasWorkerDevice()) {
+                static std::atomic<uint64_t> s_deferred = { 0u };
+                uint64_t n = ++s_deferred;
+                if (n <= 4u || (n % 500u) == 0u)
+                  Logger::warn(str::format("STAGINGMIRROR deferred=", n, " unmirrored"));
+              }
+            }
           } else if (srcIsImage) {
             VkImageSubresourceLayers srcLayer = { srcAspectMask,
               pSrcLayers->mipLevel, pSrcLayers->baseArrayLayer + i, 1 };
