@@ -76,6 +76,33 @@ namespace dxvk {
       m_workerStagingBuffer = std::make_unique<DxvkStagingBuffer>(
         workerDevice, 32ull << 20);
 
+      // The hull shader's max tess factor is push data, set once in
+      // D3D11CommonContext's constructor on the primary only -- and
+      // there it would be too early anyway, before the worker thread
+      // exists. Without it GPU1's hull shaders read 0 and clamp every
+      // tessellation factor to 0: every patch culled, no triangles,
+      // no depth, no error. Fire Strike's rock, ground and characters.
+      {
+        int32_t maxTessFactor = int32_t(std::min(
+          workerDevice->properties().core.properties.limits.maxTessellationGenerationLevel, 64u));
+
+        if (pParent->GetOptions()->maxTessFactor > 0)
+          maxTessFactor = std::min(maxTessFactor, pParent->GetOptions()->maxTessFactor);
+
+        Logger::warn(str::format("TESSFACTORMIRROR max=", maxTessFactor,
+          " workerThread=", m_workerCsThread != nullptr));
+
+        EmitWorkerCs([
+          cMaxTessFactor = maxTessFactor
+        ] (DxvkContext* ctx) {
+          D3D11HsPushData pushData = {};
+          pushData.maxTessFactor = float(cMaxTessFactor);
+
+          ctx->pushData(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+            0, sizeof(pushData), &pushData);
+        });
+      }
+
       m_workerFlushDebug = env::getEnvVar("DXVK_MGPU_DEBUG_FLUSH") == "1";
       m_workerDrawDebug  = env::getEnvVar("DXVK_MGPU_DEBUG_DRAW") == "1";
       m_workerMapDebug   = env::getEnvVar("DXVK_MGPU_DEBUG_MAP") == "1";
