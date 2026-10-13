@@ -11,6 +11,11 @@
 #include <d3d11_composition_frag.h>
 
 namespace dxvk {
+  void MgpuRecordPresent(dxvk::high_resolution_clock::time_point t0);
+  void MgpuRecordPresentPhase(uint32_t phase, dxvk::high_resolution_clock::time_point t0);
+}
+
+namespace dxvk {
 
   static uint16_t MapGammaControlPoint(float x) {
     if (x < 0.0f) x = 0.0f;
@@ -274,12 +279,16 @@ namespace dxvk {
       return hr;
     }
 
+    auto presentT0 = dxvk::high_resolution_clock::now();
+
     try {
       hr = PresentImage(SyncInterval, pPresentParameters);
     } catch (const DxvkError& e) {
       Logger::err(e.message());
       hr = E_FAIL;
     }
+
+    MgpuRecordPresent(presentT0);
 
     // Ensure to synchronize and release the frame latency semaphore
     // even if presentation failed with STATUS_OCCLUDED, or otherwise
@@ -388,12 +397,15 @@ namespace dxvk {
     auto immediateContext = m_parent->GetContext();
     auto immediateContextLock = immediateContext->LockContext();
 
+    auto phaseT0 = dxvk::high_resolution_clock::now();
     immediateContext->EndFrame(m_latency);
     immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
+    MgpuRecordPresentPhase(0u, phaseT0);
 
     immediateContext->DumpWorkerRenderTargets();
     immediateContext->DumpWorkerBuffers();
 
+    phaseT0 = dxvk::high_resolution_clock::now();
     if (env::getEnvVar("DXVK_MGPU_NO_COMPOSITE") != "1") {
       auto backBufferTexture = GetCommonTexture(m_backBuffers[0].ptr());
       if (env::getEnvVar("DXVK_MGPU_NO_PIPELINE") != "1") {
@@ -407,6 +419,8 @@ namespace dxvk {
       }
     }
 
+    MgpuRecordPresentPhase(1u, phaseT0);
+
     m_presenter->setSyncInterval(SyncInterval);
 
     // Presentation semaphores and WSI swap chain image
@@ -416,7 +430,9 @@ namespace dxvk {
     PresenterSync sync;
     Rc<DxvkImage> backBuffer;
 
+    phaseT0 = dxvk::high_resolution_clock::now();
     VkResult status = m_presenter->acquireNextImage(sync, backBuffer);
+    MgpuRecordPresentPhase(2u, phaseT0);
 
     if (status != VK_SUCCESS && m_latency)
       m_latency->discardTimings();

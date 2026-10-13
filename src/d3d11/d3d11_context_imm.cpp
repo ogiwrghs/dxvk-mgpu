@@ -424,6 +424,9 @@ namespace dxvk {
   }
   
   
+  void MgpuRecordUnmapMirror(dxvk::high_resolution_clock::time_point t0);
+
+
   void STDMETHODCALLTYPE D3D11ImmediateContext::Unmap(
           ID3D11Resource*             pResource,
           UINT                        Subresource) {
@@ -441,6 +444,8 @@ namespace dxvk {
       }
     }
 
+    auto mirrorT0 = dxvk::high_resolution_clock::now();
+
     if (unlikely(!m_shadowMapped.empty())) {
       for (size_t i = 0; i < m_shadowMapped.size(); i++) {
         if (reinterpret_cast<ID3D11Resource*>(m_shadowMapped[i]) == pResource) {
@@ -448,6 +453,7 @@ namespace dxvk {
           FlushShadow(m_shadowMapped[i]);
           m_shadowMapped[i] = m_shadowMapped.back();
           m_shadowMapped.pop_back();
+          MgpuRecordUnmapMirror(mirrorT0);
           return;
         }
       }
@@ -515,6 +521,7 @@ namespace dxvk {
       m_mappedWorkerPtr         = nullptr;
       m_mappedWorkerSize        = 0u;
       m_mappedWorkerNoOverwrite = false;
+      MgpuRecordUnmapMirror(mirrorT0);
     }
   }
 
@@ -1418,7 +1425,33 @@ namespace dxvk {
 
   static MgpuDispatchTimer g_mgpuPrimaryDispatch("DISPATCHWAIT primary");
   static MgpuDispatchTimer g_mgpuWorkerDispatch("DISPATCHWAIT worker");
+  static MgpuDispatchTimer g_mgpuUnmapMirror("MIRRORTIME unmap");
 
+
+  void MgpuRecordUnmapMirror(dxvk::high_resolution_clock::time_point t0) {
+    g_mgpuUnmapMirror.record(t0, dxvk::high_resolution_clock::now());
+  }
+
+
+  static MgpuDispatchTimer g_mgpuPresentTime("PRESENTTIME");
+  static MgpuDispatchTimer g_mgpuPresentPhase[9] = {
+    MgpuDispatchTimer("PRESENTTIME flush"),
+    MgpuDispatchTimer("PRESENTTIME composite"),
+    MgpuDispatchTimer("PRESENTTIME acquire"),
+    MgpuDispatchTimer("PRESENTTIME gpu0wait"),
+    MgpuDispatchTimer("PRESENTTIME readback"),
+    MgpuDispatchTimer("PRESENTTIME c-setup"),
+    MgpuDispatchTimer("PRESENTTIME c-step1"),
+    MgpuDispatchTimer("PRESENTTIME c-step3"),
+    MgpuDispatchTimer("PRESENTTIME c-step4") };
+
+  void MgpuRecordPresent(dxvk::high_resolution_clock::time_point t0) {
+    g_mgpuPresentTime.record(t0, dxvk::high_resolution_clock::now());
+  }
+
+  void MgpuRecordPresentPhase(uint32_t phase, dxvk::high_resolution_clock::time_point t0) {
+    g_mgpuPresentPhase[phase].record(t0, dxvk::high_resolution_clock::now());
+  }
 
   uint64_t D3D11ImmediateContext::DispatchWorkerChunkTimed(DxvkCsChunkRef&& chunk) {
     // Same rule as EmitCsChunk on the primary: the initializer's worker
@@ -1877,9 +1910,13 @@ namespace dxvk {
   }
 
 
+  void MgpuRecordPresentPhase(uint32_t phase, dxvk::high_resolution_clock::time_point t0);
+
+
   void D3D11ImmediateContext::CompositeWorkerOutputPipelined(
     const Rc<DxvkImage>&        DstImage,
     const Rc<DxvkImage>&        SrcImage) {
+    auto stepT0 = dxvk::high_resolution_clock::now();
     FlushWorkerCsChunk();
 
     if (!m_workerCsThread || DstImage == nullptr || SrcImage == nullptr)
@@ -1930,6 +1967,9 @@ namespace dxvk {
     sub.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     sub.layerCount = 1;
 
+    MgpuRecordPresentPhase(5u, stepT0);
+    stepT0 = dxvk::high_resolution_clock::now();
+
     // 1. GPU0 saves the application's finished frame N before it is
     //    overwritten below with frame N-1.
     EmitCs([
@@ -1945,7 +1985,11 @@ namespace dxvk {
     // 2. GPU0 last read block[cur] three frames ago. Cross-device, so
     //    the ordering is a CPU wait; with three blocks it is normally
     //    already satisfied.
+    MgpuRecordPresentPhase(6u, stepT0);
+    auto waitT0 = dxvk::high_resolution_clock::now();
     m_device->waitForResource(*m_pipeBlocks[cur].primary, DxvkAccess::Read);
+    MgpuRecordPresentPhase(3u, waitT0);
+    stepT0 = dxvk::high_resolution_clock::now();
 
     // 3. GPU1 copies its half of frame N into block[cur] and submits.
     //    Nothing waits for it here.
@@ -1962,6 +2006,7 @@ namespace dxvk {
     });
     FlushWorkerCsChunk();
     m_pipeBlocks[cur].workerSeq = m_lastWorkerSeq;
+    MgpuRecordPresentPhase(7u, stepT0);
 
     // 4. Present frame N-1: restore GPU0's saved half, composite GPU1's
     //    half from block[prev]. That copy was dispatched a frame ago;
@@ -1970,17 +2015,22 @@ namespace dxvk {
     if (m_pipeValid) {
       auto t0 = dxvk::high_resolution_clock::now();
       m_workerCsThread->synchronize(m_pipeBlocks[prev].workerSeq);
+      auto tm = dxvk::high_resolution_clock::now();
       workerDevice->waitForResource(*m_pipeBlocks[prev].worker, DxvkAccess::Write);
       auto t1 = dxvk::high_resolution_clock::now();
       {
-        static uint64_t s_acc = 0; static uint32_t s_n = 0;
-        s_acc += std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        static uint64_t s_sync = 0; static uint64_t s_gpu = 0; static uint32_t s_n = 0;
+        s_sync += std::chrono::duration_cast<std::chrono::microseconds>(tm - t0).count();
+        s_gpu  += std::chrono::duration_cast<std::chrono::microseconds>(t1 - tm).count();
         if ((++s_n % 600u) == 0u) {
-          Logger::warn(str::format("PIPEWAIT avg over 600: ", s_acc / 600u, " us"));
-          s_acc = 0;
+          Logger::warn(str::format("PIPEWAIT avg over 600: cs_sync=", s_sync / 600u,
+            " us gpu1=", s_gpu / 600u, " us"));
+          s_sync = 0;
+          s_gpu  = 0;
         }
       }
 
+      stepT0 = dxvk::high_resolution_clock::now();
       EmitCs([
         cDst    = DstImage,
         cSaved  = m_pipeImages[prevImg],
@@ -1998,10 +2048,12 @@ namespace dxvk {
           cBuffer, srcOffset, 0, 0,
           VK_FORMAT_R8G8B8A8_UNORM);
       });
+      MgpuRecordPresentPhase(8u, stepT0);
 
       if (unlikely(m_workerDrawDebug)) {
         static uint32_t s_rb = 0;
         if ((s_rb++ % 30u) == 0u) {
+          auto rbT0 = dxvk::high_resolution_clock::now();
           const uint8_t* px = reinterpret_cast<const uint8_t*>(m_pipeBlocks[prev].mem);
           uint32_t w = extent.width;
           uint32_t h = extent.height;
@@ -2025,6 +2077,7 @@ namespace dxvk {
             " topleft ", sample(w / 8u, h / 8u),
             " corner ", sample(2u, 2u),
             " bottomLit=", litBottom, "/", totalBottom, " topLit=", litTop));
+          MgpuRecordPresentPhase(4u, rbT0);
         }
       }
     }
