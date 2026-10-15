@@ -137,6 +137,9 @@ namespace dxvk {
     bool                    m_mirrorNoOverwrite = false;
     bool                    m_noShadow = false;
     bool                    m_workerSlices = true;
+    bool                    m_fixedSplit = false;
+    uint64_t                m_splitAccUs = 0u;
+    uint32_t                m_splitAccN  = 0u;
 
     struct SliceMapped {
       D3D11Buffer*  buffer;
@@ -224,6 +227,7 @@ namespace dxvk {
       VkDeviceMemory        primaryVkMemory = VK_NULL_HANDLE;
       Rc<DxvkBuffer>        worker;
       Rc<DxvkBuffer>        primary;
+      uint32_t              splitY          = 0u;
       uint64_t              workerSeq       = 0u;
     };
     static constexpr uint32_t PipeBlocks = 3u;

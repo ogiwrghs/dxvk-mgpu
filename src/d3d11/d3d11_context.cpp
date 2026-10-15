@@ -4126,9 +4126,13 @@ namespace dxvk {
   }
 
 
+  float MgpuGetSplitRatio();
+
+
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::ApplyViewportState() {
     uint32_t viewportCount = m_state.rs.numViewports;
+    float splitRatio = MgpuGetSplitRatio();
 
     // Split-frame rendering only makes sense for passes whose pixels
     // map onto the final frame. Shadow maps, reflection probes,
@@ -4204,7 +4208,7 @@ namespace dxvk {
           dst->scissor.extent = VkExtent2D {
             D3D11_VIEWPORT_BOUNDS_MAX,
             splitFrame
-              ? uint32_t(std::max(1.0f, vp.Height * 0.5f))
+              ? uint32_t(std::max(1.0f, vp.Height * splitRatio))
               : D3D11_VIEWPORT_BOUNDS_MAX };
         } else if (i < m_state.rs.numScissors) {
           const auto& sr = m_state.rs.scissors[i];
@@ -4240,7 +4244,7 @@ namespace dxvk {
           if (!enableScissorTest) {
             bool workerSplit = !GetTypedContext()->NoScissor()
                              && ViewportIsScreenSpace(vp);
-            int32_t splitY = workerSplit ? int32_t(vp.Height * 0.5f) : 0;
+            int32_t splitY = workerSplit ? int32_t(vp.Height * splitRatio) : 0;
 
             dst.scissor.offset = VkOffset2D { 0, splitY };
             dst.scissor.extent = VkExtent2D {

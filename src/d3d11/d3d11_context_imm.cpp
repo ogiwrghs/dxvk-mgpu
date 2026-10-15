@@ -112,6 +112,7 @@ namespace dxvk {
       m_mirrorNoOverwrite = env::getEnvVar("DXVK_MGPU_NO_MIRROR_NOOVERWRITE") != "1";
       m_noShadow          = env::getEnvVar("DXVK_MGPU_NO_SHADOW") == "1";
       m_workerSlices      = env::getEnvVar("DXVK_MGPU_NO_WORKER_SLICES") != "1";
+      m_fixedSplit        = env::getEnvVar("DXVK_MGPU_FIXED_SPLIT") == "1";
       m_noWorkerFlush     = env::getEnvVar("DXVK_MGPU_NO_WORKER_FLUSH") == "1";
       m_cbReadEnabled    = env::getEnvVar("DXVK_MGPU_TEST_CBREAD") == "1";
       m_cbPoisonEnabled  = env::getEnvVar("DXVK_MGPU_TEST_CBPOISON") == "1";
@@ -1492,6 +1493,20 @@ namespace dxvk {
     g_mgpuPresentPhase[phase].record(t0, dxvk::high_resolution_clock::now());
   }
 
+
+  // Share of the screen-space frame rendered by the primary, from the
+  // top. Set only by the pipelined composite's balancer on the
+  // application thread; read by ApplyViewportState on any context.
+  static std::atomic<float> g_mgpuSplitRatio = { 0.5f };
+
+  float MgpuGetSplitRatio() {
+    return g_mgpuSplitRatio.load(std::memory_order_relaxed);
+  }
+
+  void MgpuSetSplitRatio(float ratio) {
+    g_mgpuSplitRatio.store(ratio, std::memory_order_relaxed);
+  }
+
   uint64_t D3D11ImmediateContext::DispatchWorkerChunkTimed(DxvkCsChunkRef&& chunk) {
     // Same rule as EmitCsChunk on the primary: the initializer's worker
     // commands (zero-fill and initial data of new resources) must reach
@@ -2032,19 +2047,29 @@ namespace dxvk {
 
     // 3. GPU1 copies its half of frame N into block[cur] and submits.
     //    Nothing waits for it here.
+    // Only the rows below the split are ever pasted, so only those are
+    // read back. Same offsets in the block as a full copy, so the paste
+    // in step 4 is unchanged. At 4K a full copy is 33 MB per frame over
+    // the worker's link regardless of how small its share is.
+    uint32_t curSplitY = uint32_t(float(extent.height) * MgpuGetSplitRatio());
+
     EmitWorkerCs([
       cBuffer = m_pipeBlocks[cur].worker,
       cImage  = SrcImage,
       cSub    = sub,
-      cExtent = extent
+      cExtent = extent,
+      cSplitY = curSplitY
     ] (DxvkContext* ctx) {
-      ctx->copyImageToBuffer(cBuffer, 0, 0, 0,
+      VkExtent3D region = { cExtent.width, cExtent.height - cSplitY, 1u };
+      VkDeviceSize dstOffset = VkDeviceSize(cSplitY) * cExtent.width * 4u;
+      ctx->copyImageToBuffer(cBuffer, dstOffset, 0, 0,
         VK_FORMAT_R8G8B8A8_UNORM, cImage, cSub,
-        VkOffset3D { 0, 0, 0 }, cExtent);
+        VkOffset3D { 0, int32_t(cSplitY), 0 }, region);
       ctx->flushCommandList(nullptr, nullptr);
     });
     FlushWorkerCsChunk();
     m_pipeBlocks[cur].workerSeq = m_lastWorkerSeq;
+    m_pipeBlocks[cur].splitY    = curSplitY;
     MgpuRecordPresentPhase(7u, stepT0);
 
     // 4. Present frame N-1: restore GPU0's saved half, composite GPU1's
@@ -2069,17 +2094,49 @@ namespace dxvk {
         }
       }
 
+      // Move the split line until both devices finish together. A long
+      // wait for GPU1 means it has too much of the screen; no wait means
+      // it could take more. The deadband keeps it from oscillating.
+      if (!m_fixedSplit && !m_noScissor) {
+        m_splitAccUs += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(t1 - tm).count());
+
+        if (++m_splitAccN >= 30u) {
+          uint64_t avgUs = m_splitAccUs / m_splitAccN;
+          m_splitAccUs = 0u;
+          m_splitAccN  = 0u;
+
+          float ratio = MgpuGetSplitRatio();
+          float next  = ratio;
+
+          if (avgUs > 5000u)
+            next += 0.02f;
+          else if (avgUs > 1000u)
+            next += 0.01f;
+          else if (avgUs < 200u)
+            next -= 0.01f;
+
+          next = std::clamp(next, 0.2f, 0.8f);
+
+          if (next != ratio) {
+            MgpuSetSplitRatio(next);
+            ApplyViewportState();
+            Logger::warn(str::format("SPLITBALANCE ratio=", next, " gpu1wait_us=", avgUs));
+          }
+        }
+      }
+
       stepT0 = dxvk::high_resolution_clock::now();
       EmitCs([
         cDst    = DstImage,
         cSaved  = m_pipeImages[prevImg],
         cBuffer = m_pipeBlocks[prev].primary,
         cSub    = sub,
-        cExtent = extent
+        cExtent = extent,
+        cSplitY = m_pipeBlocks[prev].splitY
       ] (DxvkContext* ctx) {
         ctx->copyImage(cDst, cSub, VkOffset3D { 0, 0, 0 },
           cSaved, cSub, VkOffset3D { 0, 0, 0 }, cExtent);
-        uint32_t splitY = cExtent.height / 2u;
+        uint32_t splitY = cSplitY;
         VkExtent3D half = { cExtent.width, cExtent.height - splitY, 1u };
         VkDeviceSize srcOffset = VkDeviceSize(splitY) * cExtent.width * 4u;
         ctx->copyBufferToImage(cDst, cSub,
