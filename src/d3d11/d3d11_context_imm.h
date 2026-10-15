@@ -136,6 +136,16 @@ namespace dxvk {
     bool                    m_noCompletionWait = false;
     bool                    m_mirrorNoOverwrite = false;
     bool                    m_noShadow = false;
+    bool                    m_workerSlices = true;
+
+    struct SliceMapped {
+      D3D11Buffer*  buffer;
+      const void*   src;
+      void*         dst;
+      VkDeviceSize  size;
+    };
+
+    std::vector<SliceMapped>       m_sliceMapped;
     bool                    m_noWorkerFlush = false;
     VkExtent2D              m_presentExtent = { 0u, 0u };
     bool                    m_noLayout = false;

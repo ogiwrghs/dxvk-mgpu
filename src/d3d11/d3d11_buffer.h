@@ -167,8 +167,22 @@ namespace dxvk {
       return allocation;
     }
 
-     void* GetMapPtr() const {
+    void* GetMapPtr() const {
       return m_mapPtr;
+    }
+
+    Rc<DxvkResourceAllocation> DiscardWorkerSlice(DxvkLocalAllocationCache* cache) {
+      auto allocation = m_workerBuffer->allocateStorage(cache);
+      m_workerMapPtr = allocation->mapPtr();
+      return allocation;
+    }
+
+    void* GetWorkerMapPtr() const {
+      return m_workerMapPtr;
+    }
+
+    bool HasWorkerMapping() const {
+      return m_workerBuffer != nullptr && m_workerMapPtr != nullptr;
     }
 
     void* GetShadowPtr() const {
@@ -271,6 +285,7 @@ namespace dxvk {
     uint64_t                      m_seq = 0ull;
 
     void*                         m_mapPtr = nullptr;
+    void*                         m_workerMapPtr = nullptr;
     void*                         m_shadowPtr = nullptr;
     std::vector<void*>            m_shadowPages;
 

@@ -128,6 +128,9 @@ namespace dxvk {
 
     m_allocationCache = m_device->createAllocationCache(bufferUsage, memoryFlags);
 
+    if (Rc<DxvkDevice> workerDevice = pParent->GetWorkerDXVKDevice())
+      m_workerAllocationCache = workerDevice->createAllocationCache(bufferUsage, memoryFlags);
+
     // Determine maximum tess factor based on device options
     if (!IsDeferred) {
       int32_t maxTessFactor = int32_t(std::min(m_device->properties().core.properties.limits.maxTessellationGenerationLevel, 64u));

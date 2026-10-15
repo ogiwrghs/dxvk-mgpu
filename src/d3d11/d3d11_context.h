@@ -822,6 +822,7 @@ namespace dxvk {
     uint64_t                    m_estimatedCost = 0u;
 
     DxvkLocalAllocationCache    m_allocationCache;
+    DxvkLocalAllocationCache    m_workerAllocationCache;
 
     D3D11ShaderStageState<Rc<DxvkBuffer>> m_instanceData;
 

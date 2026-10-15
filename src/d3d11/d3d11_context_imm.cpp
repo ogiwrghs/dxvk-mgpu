@@ -111,6 +111,7 @@ namespace dxvk {
       m_noCompletionWait = env::getEnvVar("DXVK_MGPU_NO_COMPLETION_WAIT") == "1";
       m_mirrorNoOverwrite = env::getEnvVar("DXVK_MGPU_NO_MIRROR_NOOVERWRITE") != "1";
       m_noShadow          = env::getEnvVar("DXVK_MGPU_NO_SHADOW") == "1";
+      m_workerSlices      = env::getEnvVar("DXVK_MGPU_NO_WORKER_SLICES") != "1";
       m_noWorkerFlush     = env::getEnvVar("DXVK_MGPU_NO_WORKER_FLUSH") == "1";
       m_cbReadEnabled    = env::getEnvVar("DXVK_MGPU_TEST_CBREAD") == "1";
       m_cbPoisonEnabled  = env::getEnvVar("DXVK_MGPU_TEST_CBPOISON") == "1";
@@ -446,6 +447,25 @@ namespace dxvk {
 
     auto mirrorT0 = dxvk::high_resolution_clock::now();
 
+    if (likely(!m_sliceMapped.empty())) {
+      for (size_t i = 0; i < m_sliceMapped.size(); i++) {
+        if (reinterpret_cast<ID3D11Resource*>(m_sliceMapped[i].buffer) == pResource) {
+          D3D10DeviceLock lock = LockContext();
+          std::memcpy(m_sliceMapped[i].dst, m_sliceMapped[i].src, m_sliceMapped[i].size);
+          m_sliceMapped[i] = m_sliceMapped.back();
+          m_sliceMapped.pop_back();
+
+          static std::atomic<uint64_t> s_slice = { 0u };
+          uint64_t n = ++s_slice;
+          if (n <= 2u || (n % 200000u) == 0u)
+            Logger::warn(str::format("SLICEMIRROR discard=", n));
+
+          MgpuRecordUnmapMirror(mirrorT0);
+          return;
+        }
+      }
+    }
+
     if (unlikely(!m_shadowMapped.empty())) {
       for (size_t i = 0; i < m_shadowMapped.size(); i++) {
         if (reinterpret_cast<ID3D11Resource*>(m_shadowMapped[i]) == pResource) {
@@ -546,7 +566,9 @@ namespace dxvk {
       std::memcpy(dst + r.begin, src + r.begin, len);
       total += len;
 
-      if (workerBuffer != nullptr) {
+      if (m_workerSlices && pBuffer->HasWorkerMapping()) {
+        std::memcpy(static_cast<char*>(pBuffer->GetWorkerMapPtr()) + r.begin, src + r.begin, len);
+      } else if (workerBuffer != nullptr) {
         DxvkBufferSlice staging = m_workerStagingBuffer->alloc(len);
         std::memcpy(staging.mapPtr(0), src + r.begin, len);
 
@@ -617,9 +639,26 @@ namespace dxvk {
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
 
+      bool workerSliceSwapped = false;
+
+      if (m_workerCsThread && m_workerSlices && pResource->HasWorkerMapping()) {
+        auto workerSlice = pResource->DiscardWorkerSlice(&m_workerAllocationCache);
+        workerSliceSwapped = true;
+
+        EmitWorkerCs([
+          cBuffer      = pResource->GetWorkerBuffer(),
+          cBufferSlice = std::move(workerSlice)
+        ] (DxvkContext* ctx) mutable {
+          ctx->invalidateBuffer(cBuffer, std::move(cBufferSlice));
+        });
+      }
+
       if (m_workerCsThread && pResource->GetShadowPtr() != nullptr) {
         pMappedResource->pData = pResource->GetShadowPtr();
         m_shadowMapped.push_back(pResource);
+      } else if (workerSliceSwapped) {
+        m_sliceMapped.push_back({ pResource, bufferSlice->mapPtr(),
+          pResource->GetWorkerMapPtr(), bufferSize });
       } else if (m_workerCsThread && pResource->GetWorkerBuffer() != nullptr) {
         if (m_mappedWorkerBuffer != nullptr) {
           static std::atomic<uint64_t> s_clobber = { 0u };

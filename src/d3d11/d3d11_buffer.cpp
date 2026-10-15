@@ -130,6 +130,7 @@ namespace dxvk {
       Rc<DxvkDevice> workerDevice = m_parent->GetWorkerDXVKDevice();
       if (workerDevice != nullptr) {
         m_workerBuffer = workerDevice->createBuffer(info, memoryFlags);
+        m_workerMapPtr = m_workerBuffer->mapPtr(0);
         static std::atomic<uint32_t> s_workerBufferCount{0u};
         m_workerIndex = ++s_workerBufferCount;
         Logger::info(str::format("D3D11Buffer: Created worker buffer #", m_workerIndex, " (", info.size, " bytes)"));
