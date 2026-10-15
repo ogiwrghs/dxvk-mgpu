@@ -398,6 +398,7 @@ namespace dxvk {
     auto immediateContextLock = immediateContext->LockContext();
 
     auto phaseT0 = dxvk::high_resolution_clock::now();
+    immediateContext->MgpuFrameSpanEnd();
     immediateContext->EndFrame(m_latency);
     immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
     MgpuRecordPresentPhase(0u, phaseT0);
@@ -542,6 +543,7 @@ namespace dxvk {
       }
     }
 
+    immediateContext->MgpuFrameSpanStart();
     return S_OK;
   }
 

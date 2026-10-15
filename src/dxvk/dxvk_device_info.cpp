@@ -32,6 +32,7 @@ namespace dxvk {
     HANDLE_EXT(extHdrMetadata);                    \
     HANDLE_EXT(extLineRasterization);              \
     HANDLE_EXT(extMemoryBudget);                   \
+    HANDLE_EXT(extCalibratedTimestamps);           \
     HANDLE_EXT(extMemoryPriority);                 \
     HANDLE_EXT(extMultiDraw);                      \
     HANDLE_EXT(extNonSeamlessCubeMap);             \
@@ -973,6 +974,7 @@ namespace dxvk {
 
       /* Memory budget and priority for improved memory management */
       ENABLE_EXT(extMemoryBudget, false),
+      ENABLE_EXT(extCalibratedTimestamps, false),
       ENABLE_EXT_FEATURE(extMemoryPriority, memoryPriority, false),
 
       /* Optionally used to batch consecutive draws */

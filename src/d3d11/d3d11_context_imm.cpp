@@ -3464,4 +3464,185 @@ namespace dxvk {
       return GpuFlushType::ImplicitWeakHint;
   }
 
+
+  bool D3D11ImmediateContext::MgpuSpanCalibrate(uint32_t Index) {
+    const Rc<DxvkDevice>& dev = m_spanDev[Index];
+
+    VkCalibratedTimestampInfoEXT info[2] = { };
+    info[0].sType      = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT;
+    info[0].timeDomain = VK_TIME_DOMAIN_DEVICE_EXT;
+    info[1].sType      = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT;
+    info[1].timeDomain = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT;
+
+    uint64_t ts[2] = { };
+    uint64_t maxDev = 0u;
+
+    auto callT0 = dxvk::high_resolution_clock::now();
+
+    VkResult vr = dev->vkd()->vkGetCalibratedTimestampsEXT(
+      dev->handle(), 2u, info, ts, &maxDev);
+
+    auto callT1 = dxvk::high_resolution_clock::now();
+
+    if (vr != VK_SUCCESS)
+      return false;
+
+    m_spanCallNs += double(std::chrono::duration_cast<std::chrono::nanoseconds>(callT1 - callT0).count());
+    m_spanDevSum += double(maxDev);
+    m_spanCalls  += 1u;
+
+    m_spanMaxDev = std::max(m_spanMaxDev, maxDev);
+
+    if (maxDev > 100000u && m_spanCalib[Index].gpuTicks != 0u)
+      return true;
+
+    m_spanCalib[Index].gpuTicks = ts[0];
+    m_spanCalib[Index].qpcNs    = double(ts[1]) * m_spanQpcNs;
+    return true;
+  }
+
+
+  double D3D11ImmediateContext::MgpuSpanToNs(uint32_t Index, uint64_t Ticks) const {
+    const MgpuSpanCalib& c = m_spanCalib[Index];
+    return c.qpcNs + double(int64_t(Ticks - c.gpuTicks)) * c.period;
+  }
+
+
+  void D3D11ImmediateContext::MgpuFrameSpanEnd() {
+    if (!HasWorkerDevice())
+      return;
+
+    if (!m_spanInit) {
+      m_spanInit = true;
+      m_spanDev[0] = m_device;
+      m_spanDev[1] = m_parent->GetWorkerDXVKDevice();
+
+      LARGE_INTEGER freq;
+      QueryPerformanceFrequency(&freq);
+      m_spanQpcNs = 1.0e9 / double(freq.QuadPart);
+
+      m_spanOk = m_spanDev[1] != nullptr;
+
+      for (uint32_t i = 0; i < 2u && m_spanOk; i++) {
+        bool ext = m_spanDev[i]->features().extCalibratedTimestamps;
+        bool fn  = m_spanDev[i]->vkd()->vkGetCalibratedTimestampsEXT != nullptr;
+        m_spanCalib[i].period = m_spanDev[i]->properties().core.properties.limits.timestampPeriod;
+        bool cal = ext && fn && MgpuSpanCalibrate(i);
+
+        Logger::warn(str::format("FRAMESPAN init dev=", i,
+          " ext=", ext ? 1 : 0, " fn=", fn ? 1 : 0, " calib=", cal ? 1 : 0,
+          " period=", m_spanCalib[i].period, " qpc_ns=", m_spanQpcNs));
+
+        m_spanOk = cal;
+      }
+
+      if (m_spanOk) {
+        for (auto& s : m_spanRing) {
+          s.s0 = m_spanDev[0]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+          s.e0 = m_spanDev[0]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+          s.s1 = m_spanDev[1]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+          s.e1 = m_spanDev[1]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+        }
+      }
+    }
+
+    if (!m_spanOk || !m_spanHaveStart)
+      return;
+
+    m_spanHaveStart = false;
+
+    MgpuSpanSlot& cur = m_spanRing[m_spanFrame % 8u];
+
+    EmitCs([cQuery = cur.e0] (DxvkContext* ctx) {
+      ctx->writeTimestamp(cQuery);
+    });
+
+    EmitWorkerCs([cQuery = cur.e1] (DxvkContext* ctx) {
+      ctx->writeTimestamp(cQuery);
+    });
+
+    cur.valid = true;
+
+    if ((m_spanFrame % 16u) == 0u) {
+      MgpuSpanCalibrate(0u);
+      MgpuSpanCalibrate(1u);
+    }
+
+    if (m_spanFrame < 6u)
+      return;
+
+    MgpuSpanSlot& old = m_spanRing[(m_spanFrame - 6u) % 8u];
+
+    if (old.valid) {
+      DxvkQueryData d[4] = { };
+
+      bool ready = old.s0->getData(d[0]) == DxvkGpuQueryStatus::Available
+                && old.e0->getData(d[1]) == DxvkGpuQueryStatus::Available
+                && old.s1->getData(d[2]) == DxvkGpuQueryStatus::Available
+                && old.e1->getData(d[3]) == DxvkGpuQueryStatus::Available;
+
+      if (ready) {
+        double s0 = MgpuSpanToNs(0u, d[0].timestamp.time);
+        double e0 = MgpuSpanToNs(0u, d[1].timestamp.time);
+        double s1 = MgpuSpanToNs(1u, d[2].timestamp.time);
+        double e1 = MgpuSpanToNs(1u, d[3].timestamp.time);
+
+        m_spanSum[0] += s1 - s0;
+        m_spanSum[1] += e1 - e0;
+        m_spanSum[2] += e0 - s0;
+        m_spanSum[3] += e1 - s1;
+        m_spanCount += 1u;
+      } else {
+        m_spanSkipped += 1u;
+      }
+
+      old.valid = false;
+    } else {
+      m_spanSkipped += 1u;
+    }
+
+    if (m_spanCount + m_spanSkipped >= 600u) {
+      double n = double(std::max(m_spanCount, 1u)) * 1000.0;
+
+      Logger::warn(str::format("FRAMESPAN n=", m_spanCount,
+        " skipped=", m_spanSkipped,
+        " start_lag_us=", m_spanSum[0] / n,
+        " end_lag_us=", m_spanSum[1] / n,
+        " busy0_us=", m_spanSum[2] / n,
+        " busy1_us=", m_spanSum[3] / n,
+        " maxdev_us=", double(m_spanMaxDev) / 1000.0,
+        " avgdev_us=", m_spanDevSum / double(std::max(m_spanCalls, 1u)) / 1000.0,
+        " call_us=", m_spanCallNs / double(std::max(m_spanCalls, 1u)) / 1000.0));
+
+      m_spanSum[0] = m_spanSum[1] = m_spanSum[2] = m_spanSum[3] = 0.0;
+      m_spanCount   = 0u;
+      m_spanSkipped = 0u;
+      m_spanMaxDev  = 0u;
+      m_spanDevSum  = 0.0;
+      m_spanCallNs  = 0.0;
+      m_spanCalls   = 0u;
+    }
+  }
+
+
+  void D3D11ImmediateContext::MgpuFrameSpanStart() {
+    if (!m_spanOk)
+      return;
+
+    m_spanFrame += 1u;
+
+    MgpuSpanSlot& cur = m_spanRing[m_spanFrame % 8u];
+    cur.valid = false;
+
+    EmitCs([cQuery = cur.s0] (DxvkContext* ctx) {
+      ctx->writeTimestamp(cQuery);
+    });
+
+    EmitWorkerCs([cQuery = cur.s1] (DxvkContext* ctx) {
+      ctx->writeTimestamp(cQuery);
+    });
+
+    m_spanHaveStart = true;
+  }
+
 }

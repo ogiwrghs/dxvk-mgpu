@@ -75,6 +75,7 @@ namespace dxvk {
     VkBool32                                                  extHdrMetadata                  = VK_FALSE;
     VkPhysicalDeviceLineRasterizationFeaturesEXT              extLineRasterization            = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT };
     VkBool32                                                  extMemoryBudget                 = VK_FALSE;
+    VkBool32                                                  extCalibratedTimestamps         = VK_FALSE;
     VkPhysicalDeviceMemoryPriorityFeaturesEXT                 extMemoryPriority               = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT };
     VkPhysicalDeviceMultiDrawFeaturesEXT                      extMultiDraw                    = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT };
     VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT             extNonSeamlessCubeMap           = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT };
@@ -151,6 +152,7 @@ namespace dxvk {
     VkExtensionProperties extHdrMetadata                    = vk::makeExtension(VK_EXT_HDR_METADATA_EXTENSION_NAME);
     VkExtensionProperties extLineRasterization              = vk::makeExtension(VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME);
     VkExtensionProperties extMemoryBudget                   = vk::makeExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    VkExtensionProperties extCalibratedTimestamps           = vk::makeExtension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
     VkExtensionProperties extMemoryPriority                 = vk::makeExtension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
     VkExtensionProperties extMultiDraw                      = vk::makeExtension(VK_EXT_MULTI_DRAW_EXTENSION_NAME);
     VkExtensionProperties extNonSeamlessCubeMap             = vk::makeExtension(VK_EXT_NON_SEAMLESS_CUBE_MAP_EXTENSION_NAME);

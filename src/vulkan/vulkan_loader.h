@@ -203,6 +203,7 @@ namespace dxvk::vk {
     VULKAN_FN(vkGetDeviceMemoryCommitment);
 
     VULKAN_FN(vkGetMemoryHostPointerPropertiesEXT);
+    VULKAN_FN(vkGetCalibratedTimestampsEXT);
     
     VULKAN_FN(vkBindBufferMemory);
     VULKAN_FN(vkBindImageMemory);

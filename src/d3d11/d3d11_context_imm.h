@@ -395,6 +395,40 @@ namespace dxvk {
     void CompositeWorkerOutputPipelined(
       const Rc<DxvkImage>&        DstImage,
       const Rc<DxvkImage>&        SrcImage);
+
+    void MgpuFrameSpanEnd();
+    void MgpuFrameSpanStart();
+
+    struct MgpuSpanSlot {
+      Rc<DxvkQuery> s0, e0, s1, e1;
+      bool          valid = false;
+    };
+
+    struct MgpuSpanCalib {
+      uint64_t gpuTicks = 0u;
+      double   qpcNs    = 0.0;
+      double   period   = 1.0;
+    };
+
+    MgpuSpanSlot      m_spanRing[8];
+    MgpuSpanCalib     m_spanCalib[2];
+    Rc<DxvkDevice>    m_spanDev[2];
+    uint64_t          m_spanFrame     = 0u;
+    bool              m_spanInit      = false;
+    bool              m_spanOk        = false;
+    bool              m_spanHaveStart = false;
+    double            m_spanQpcNs     = 0.0;
+    double            m_spanSum[4]    = { };
+    uint64_t          m_spanMaxDev    = 0u;
+    double            m_spanDevSum    = 0.0;
+    double            m_spanCallNs    = 0.0;
+    uint32_t          m_spanCalls     = 0u;
+    uint32_t          m_spanCount     = 0u;
+    uint32_t          m_spanSkipped   = 0u;
+
+    bool MgpuSpanCalibrate(uint32_t Index);
+    double MgpuSpanToNs(uint32_t Index, uint64_t Ticks) const;
+
     bool StealSharedBlock(SharedBlock& Block);
     void ReleaseSharedBlock(SharedBlock& Block);
     void ReleasePipeline();
