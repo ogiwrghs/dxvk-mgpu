@@ -404,6 +404,9 @@ namespace dxvk {
       Rc<DxvkQuery> c0a, c0b, c0c, c0d, c1a, c1b;
       bool          valid     = false;
       bool          compValid = false;
+      double        cpuPw     = 0.0;
+      double        cpuRet    = 0.0;
+      double        cpuFirst  = 0.0;
     };
 
     struct MgpuSpanCalib {
@@ -423,6 +426,18 @@ namespace dxvk {
     double            m_spanSum[4]    = { };
     double            m_spanComp[7]   = { };
     uint32_t          m_spanTailCount = 0u;
+    double            m_spanCpu[5]    = { };
+    uint32_t          m_spanCpuCount  = 0u;
+    bool              m_spanWantFirst = false;
+
+    double MgpuSpanNowNs() const;
+
+    void MgpuSpanMarkFirst() {
+      if (unlikely(m_spanWantFirst)) {
+        m_spanWantFirst = false;
+        m_spanRing[m_spanFrame % 8u].cpuFirst = MgpuSpanNowNs();
+      }
+    }
     uint32_t          m_spanCompCount = 0u;
     double            m_spanPeriodSum = 0.0;
     uint32_t          m_spanPeriodCount = 0u;

@@ -369,6 +369,7 @@ namespace dxvk {
     // work lands after whatever was mirrored before this call.
     if (m_workerCsThread) {
       FlushWorkerCsChunk();
+      MgpuSpanMarkFirst();
       static std::atomic<uint64_t> s_lists = { 0u };
       static std::atomic<uint64_t> s_chunks = { 0u };
       uint64_t lists = ++s_lists;
@@ -1527,6 +1528,7 @@ namespace dxvk {
     // commands (zero-fill and initial data of new resources) must reach
     // the worker CS thread before any context command that touches them.
     m_parent->FlushInitCommands();
+    MgpuSpanMarkFirst();
 
     static bool s_clockMeasured = false;
     if (unlikely(!s_clockMeasured)) {
@@ -2116,6 +2118,9 @@ namespace dxvk {
       auto tm = dxvk::high_resolution_clock::now();
       workerDevice->waitForResource(*m_pipeBlocks[prev].worker, DxvkAccess::Write);
       auto t1 = dxvk::high_resolution_clock::now();
+
+      if (m_spanOk)
+        m_spanRing[m_spanFrame % 8u].cpuPw = MgpuSpanNowNs();
       {
         static uint64_t s_sync = 0; static uint64_t s_gpu = 0; static uint32_t s_n = 0;
         s_sync += std::chrono::duration_cast<std::chrono::microseconds>(tm - t0).count();
@@ -3546,6 +3551,13 @@ namespace dxvk {
   }
 
 
+  double D3D11ImmediateContext::MgpuSpanNowNs() const {
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    return double(q.QuadPart) * m_spanQpcNs;
+  }
+
+
   double D3D11ImmediateContext::MgpuSpanToNs(uint32_t Index, uint64_t Ticks) const {
     const MgpuSpanCalib& c = m_spanCalib[Index];
     return c.qpcNs + double(int64_t(Ticks - c.gpuTicks)) * c.period;
@@ -3690,6 +3702,17 @@ namespace dxvk {
               m_spanComp[5] += MgpuSpanToNs(0u, ns[0].timestamp.time) - t0d;
               m_spanComp[6] += MgpuSpanToNs(1u, ns[1].timestamp.time) - t1b;
               m_spanTailCount += 1u;
+
+              if (old.cpuPw != 0.0 && old.cpuRet != 0.0 && nxt.cpuFirst != 0.0) {
+                double s1n = MgpuSpanToNs(1u, ns[1].timestamp.time);
+
+                m_spanCpu[0] += old.cpuRet   - t1b;
+                m_spanCpu[1] += nxt.cpuFirst - old.cpuRet;
+                m_spanCpu[2] += nxt.cpuFirst - t1b;
+                m_spanCpu[3] += s1n          - nxt.cpuFirst;
+                m_spanCpu[4] += old.cpuRet   - old.cpuPw;
+                m_spanCpuCount += 1u;
+              }
             }
           }
         }
@@ -3727,6 +3750,15 @@ namespace dxvk {
         " tail0_us=", m_spanComp[5] / double(std::max(m_spanTailCount, 1u)) / 1000.0,
         " tail1_us=", m_spanComp[6] / double(std::max(m_spanTailCount, 1u)) / 1000.0));
 
+      double nu = double(std::max(m_spanCpuCount, 1u)) * 1000.0;
+
+      Logger::warn(str::format("FRAMESPAN cpu n=", m_spanCpuCount,
+        " ret_vs_copy1_us=", m_spanCpu[0] / nu,
+        " ret_to_first_us=", m_spanCpu[1] / nu,
+        " first_vs_copy1_us=", m_spanCpu[2] / nu,
+        " gpu1start_after_first_us=", m_spanCpu[3] / nu,
+        " pw_to_ret_us=", m_spanCpu[4] / nu));
+
       m_spanSum[0] = m_spanSum[1] = m_spanSum[2] = m_spanSum[3] = 0.0;
       m_spanCount   = 0u;
       m_spanSkipped = 0u;
@@ -3740,6 +3772,10 @@ namespace dxvk {
 
       m_spanCompCount   = 0u;
       m_spanTailCount   = 0u;
+      m_spanCpuCount    = 0u;
+
+      for (auto& v : m_spanCpu)
+        v = 0.0;
       m_spanPeriodSum   = 0.0;
       m_spanPeriodCount = 0u;
     }
@@ -3750,11 +3786,16 @@ namespace dxvk {
     if (!m_spanOk)
       return;
 
+    m_spanRing[m_spanFrame % 8u].cpuRet = MgpuSpanNowNs();
+
     m_spanFrame += 1u;
 
     MgpuSpanSlot& cur = m_spanRing[m_spanFrame % 8u];
     cur.valid     = false;
     cur.compValid = false;
+    cur.cpuPw     = 0.0;
+    cur.cpuRet    = 0.0;
+    cur.cpuFirst  = 0.0;
 
     EmitCs([cQuery = cur.s0] (DxvkContext* ctx) {
       ctx->writeTimestamp(cQuery);
@@ -3765,6 +3806,7 @@ namespace dxvk {
     });
 
     m_spanHaveStart = true;
+    m_spanWantFirst = true;
   }
 
 }
