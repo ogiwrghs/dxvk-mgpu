@@ -159,6 +159,15 @@ namespace dxvk {
 
 
   bool D3D11Buffer::EnsureShadow() {
+    // A buffer that deferred contexts map gets no shadow: their
+    // DISCARD maps write new slices the shadow never sees, and its
+    // dirty pages would then carry stale bytes to GPU1 (Fire Strike
+    // buffer #1, BUFDUMP).
+    DropShadowIfDeferred();
+
+    if (IsDeferredMapped())
+      return false;
+
     if (m_shadowPtr)
       return true;
 
@@ -193,6 +202,18 @@ namespace dxvk {
       VirtualFree(m_shadowPtr, 0, MEM_RELEASE);
       m_shadowPtr = nullptr;
       m_shadowPages.clear();
+    }
+  }
+
+
+  void D3D11Buffer::DropShadowIfDeferred() {
+    if (m_shadowPtr && IsDeferredMapped()) {
+      DropShadow();
+
+      static std::atomic<uint64_t> s_drop = { 0u };
+      uint64_t n = ++s_drop;
+      if (n <= 8u || (n % 1000u) == 0u)
+        Logger::warn(str::format("SHADOWDROP n=", n, " size=", m_desc.ByteWidth));
     }
   }
 

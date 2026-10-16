@@ -640,6 +640,8 @@ namespace dxvk {
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
 
+      pResource->DropShadowIfDeferred();
+
       bool workerSliceSwapped = false;
 
       if (m_workerCsThread && m_workerSlices && pResource->HasWorkerMapping()) {
@@ -657,6 +659,19 @@ namespace dxvk {
       if (m_workerCsThread && pResource->GetShadowPtr() != nullptr) {
         pMappedResource->pData = pResource->GetShadowPtr();
         m_shadowMapped.push_back(pResource);
+
+        // Diagnostic: mark every page dirty so the flush copies the
+        // whole buffer. Without it, a DISCARD through the shadow sends
+        // only the pages the application writes, and the rest of each
+        // device's fresh slice is whatever that memory held before.
+        static const bool s_shadowFullDiscard =
+          env::getEnvVar("DXVK_MGPU_SHADOW_FULL_DISCARD") == "1";
+
+        if (unlikely(s_shadowFullDiscard)) {
+          volatile char* p = static_cast<volatile char*>(pResource->GetShadowPtr());
+          for (VkDeviceSize off = 0; off < bufferSize; off += 4096u)
+            p[off] = p[off];
+        }
       } else if (workerSliceSwapped) {
         m_sliceMapped.push_back({ pResource, bufferSlice->mapPtr(),
           pResource->GetWorkerMapPtr(), bufferSize });

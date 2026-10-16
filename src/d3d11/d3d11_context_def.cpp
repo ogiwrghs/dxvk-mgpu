@@ -302,6 +302,8 @@ namespace dxvk {
     // complete. updateBuffer stages through the worker context's own
     // staging on the worker device; the read is from cached memory.
     if (HasWorkerDevice() && pBuffer->GetWorkerBuffer() != nullptr) {
+      pBuffer->MarkDeferredMapped();
+
       {
         static std::atomic<uint64_t> s_n = { 0u };
         uint64_t n = ++s_n;

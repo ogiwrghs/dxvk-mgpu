@@ -193,6 +193,18 @@ namespace dxvk {
 
     void DropShadow();
 
+    void DropShadowIfDeferred();
+
+    void MarkDeferredMapped() {
+      m_deferredMapped.store(true, std::memory_order_release);
+    }
+
+    bool IsDeferredMapped() const {
+      return m_deferredMapped.load(std::memory_order_acquire);
+    }
+
+    std::atomic<bool> m_deferredMapped = { false };
+
     void CollectShadowDirtyRanges(std::vector<D3D11ShadowRange>& ranges);
 
     D3D10Buffer* GetD3D10Iface() {
