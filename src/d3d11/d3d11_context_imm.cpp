@@ -2039,16 +2039,29 @@ namespace dxvk {
     MgpuRecordPresentPhase(5u, stepT0);
     stepT0 = dxvk::high_resolution_clock::now();
 
+    // FRAMESPAN composite markers for this frame's slot when the
+    // instrument runs: GPU0 around steps 1 and 4, GPU1 around step 3.
+    MgpuSpanSlot* spanSlot = m_spanOk ? &m_spanRing[m_spanFrame % 8u] : nullptr;
+
+    if (spanSlot)
+      spanSlot->compValid = false;
+
     // 1. GPU0 saves the application's finished frame N before it is
     //    overwritten below with frame N-1.
     EmitCs([
       cDst    = m_pipeImages[curImg],
       cSrc    = DstImage,
       cSub    = sub,
-      cExtent = extent
+      cExtent = extent,
+      cQa     = spanSlot ? spanSlot->c0a : Rc<DxvkQuery>(),
+      cQb     = spanSlot ? spanSlot->c0b : Rc<DxvkQuery>()
     ] (DxvkContext* ctx) {
+      if (cQa != nullptr)
+        ctx->writeTimestamp(cQa);
       ctx->copyImage(cDst, cSub, VkOffset3D { 0, 0, 0 },
         cSrc, cSub, VkOffset3D { 0, 0, 0 }, cExtent);
+      if (cQb != nullptr)
+        ctx->writeTimestamp(cQb);
     });
 
     // 2. GPU0 last read block[cur] three frames ago. Cross-device, so
@@ -2073,13 +2086,19 @@ namespace dxvk {
       cImage  = SrcImage,
       cSub    = sub,
       cExtent = extent,
-      cSplitY = curSplitY
+      cSplitY = curSplitY,
+      cQa     = spanSlot ? spanSlot->c1a : Rc<DxvkQuery>(),
+      cQb     = spanSlot ? spanSlot->c1b : Rc<DxvkQuery>()
     ] (DxvkContext* ctx) {
       VkExtent3D region = { cExtent.width, cExtent.height - cSplitY, 1u };
       VkDeviceSize dstOffset = VkDeviceSize(cSplitY) * cExtent.width * 4u;
+      if (cQa != nullptr)
+        ctx->writeTimestamp(cQa);
       ctx->copyImageToBuffer(cBuffer, dstOffset, 0, 0,
         VK_FORMAT_R8G8B8A8_UNORM, cImage, cSub,
         VkOffset3D { 0, int32_t(cSplitY), 0 }, region);
+      if (cQb != nullptr)
+        ctx->writeTimestamp(cQb);
       ctx->flushCommandList(nullptr, nullptr);
     });
     FlushWorkerCsChunk();
@@ -2147,8 +2166,12 @@ namespace dxvk {
         cBuffer = m_pipeBlocks[prev].primary,
         cSub    = sub,
         cExtent = extent,
-        cSplitY = m_pipeBlocks[prev].splitY
+        cSplitY = m_pipeBlocks[prev].splitY,
+        cQc     = spanSlot ? spanSlot->c0c : Rc<DxvkQuery>(),
+        cQd     = spanSlot ? spanSlot->c0d : Rc<DxvkQuery>()
       ] (DxvkContext* ctx) {
+        if (cQc != nullptr)
+          ctx->writeTimestamp(cQc);
         ctx->copyImage(cDst, cSub, VkOffset3D { 0, 0, 0 },
           cSaved, cSub, VkOffset3D { 0, 0, 0 }, cExtent);
         uint32_t splitY = cSplitY;
@@ -2158,7 +2181,13 @@ namespace dxvk {
           VkOffset3D { 0, int32_t(splitY), 0 }, half,
           cBuffer, srcOffset, 0, 0,
           VK_FORMAT_R8G8B8A8_UNORM);
+        if (cQd != nullptr)
+          ctx->writeTimestamp(cQd);
       });
+
+      if (spanSlot)
+        spanSlot->compValid = true;
+
       MgpuRecordPresentPhase(8u, stepT0);
 
       if (unlikely(m_workerDrawDebug)) {
@@ -3557,6 +3586,12 @@ namespace dxvk {
           s.e0 = m_spanDev[0]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
           s.s1 = m_spanDev[1]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
           s.e1 = m_spanDev[1]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+          s.c0a = m_spanDev[0]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+          s.c0b = m_spanDev[0]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+          s.c0c = m_spanDev[0]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+          s.c0d = m_spanDev[0]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+          s.c1a = m_spanDev[1]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+          s.c1b = m_spanDev[1]->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
         }
       }
     }
@@ -3607,6 +3642,57 @@ namespace dxvk {
         m_spanSum[2] += e0 - s0;
         m_spanSum[3] += e1 - s1;
         m_spanCount += 1u;
+
+        uint64_t r = m_spanFrame - 6u;
+
+        if (m_spanPrevFrame != 0u && m_spanPrevFrame + 1u == r) {
+          m_spanPeriodSum   += e0 - m_spanPrevE0;
+          m_spanPeriodCount += 1u;
+        }
+
+        m_spanPrevE0    = e0;
+        m_spanPrevFrame = r;
+
+        if (old.compValid) {
+          DxvkQueryData c[6] = { };
+
+          bool compReady = old.c0a->getData(c[0]) == DxvkGpuQueryStatus::Available
+                        && old.c0b->getData(c[1]) == DxvkGpuQueryStatus::Available
+                        && old.c0c->getData(c[2]) == DxvkGpuQueryStatus::Available
+                        && old.c0d->getData(c[3]) == DxvkGpuQueryStatus::Available
+                        && old.c1a->getData(c[4]) == DxvkGpuQueryStatus::Available
+                        && old.c1b->getData(c[5]) == DxvkGpuQueryStatus::Available;
+
+          if (compReady) {
+            double t0a = MgpuSpanToNs(0u, c[0].timestamp.time);
+            double t0b = MgpuSpanToNs(0u, c[1].timestamp.time);
+            double t0c = MgpuSpanToNs(0u, c[2].timestamp.time);
+            double t0d = MgpuSpanToNs(0u, c[3].timestamp.time);
+            double t1a = MgpuSpanToNs(1u, c[4].timestamp.time);
+            double t1b = MgpuSpanToNs(1u, c[5].timestamp.time);
+
+            m_spanComp[0] += (t0b - t0a) + (t0d - t0c);
+            m_spanComp[1] += t0c - t0b;
+            m_spanComp[2] += t1b - t1a;
+            m_spanComp[3] += t1a - e1;
+            m_spanComp[4] += t0a - e0;
+            m_spanCompCount += 1u;
+
+            // From the end of this frame's composite to the start of the
+            // next frame on each device: present, HUD, and any idle time
+            // while the CPU waits in the composite.
+            MgpuSpanSlot& nxt = m_spanRing[(r + 1u) % 8u];
+            DxvkQueryData ns[2] = { };
+
+            if (nxt.valid
+             && nxt.s0->getData(ns[0]) == DxvkGpuQueryStatus::Available
+             && nxt.s1->getData(ns[1]) == DxvkGpuQueryStatus::Available) {
+              m_spanComp[5] += MgpuSpanToNs(0u, ns[0].timestamp.time) - t0d;
+              m_spanComp[6] += MgpuSpanToNs(1u, ns[1].timestamp.time) - t1b;
+              m_spanTailCount += 1u;
+            }
+          }
+        }
       } else {
         m_spanSkipped += 1u;
       }
@@ -3629,6 +3715,18 @@ namespace dxvk {
         " avgdev_us=", m_spanDevSum / double(std::max(m_spanCalls, 1u)) / 1000.0,
         " call_us=", m_spanCallNs / double(std::max(m_spanCalls, 1u)) / 1000.0));
 
+      double nc = double(std::max(m_spanCompCount, 1u)) * 1000.0;
+
+      Logger::warn(str::format("FRAMESPAN composite n=", m_spanCompCount,
+        " period0_us=", m_spanPeriodSum / double(std::max(m_spanPeriodCount, 1u)) / 1000.0,
+        " comp0_us=", m_spanComp[0] / nc,
+        " wait0_us=", m_spanComp[1] / nc,
+        " pre0_us=", m_spanComp[4] / nc,
+        " comp1_us=", m_spanComp[2] / nc,
+        " pre1_us=", m_spanComp[3] / nc,
+        " tail0_us=", m_spanComp[5] / double(std::max(m_spanTailCount, 1u)) / 1000.0,
+        " tail1_us=", m_spanComp[6] / double(std::max(m_spanTailCount, 1u)) / 1000.0));
+
       m_spanSum[0] = m_spanSum[1] = m_spanSum[2] = m_spanSum[3] = 0.0;
       m_spanCount   = 0u;
       m_spanSkipped = 0u;
@@ -3636,6 +3734,14 @@ namespace dxvk {
       m_spanDevSum  = 0.0;
       m_spanCallNs  = 0.0;
       m_spanCalls   = 0u;
+
+      for (auto& v : m_spanComp)
+        v = 0.0;
+
+      m_spanCompCount   = 0u;
+      m_spanTailCount   = 0u;
+      m_spanPeriodSum   = 0.0;
+      m_spanPeriodCount = 0u;
     }
   }
 
@@ -3647,7 +3753,8 @@ namespace dxvk {
     m_spanFrame += 1u;
 
     MgpuSpanSlot& cur = m_spanRing[m_spanFrame % 8u];
-    cur.valid = false;
+    cur.valid     = false;
+    cur.compValid = false;
 
     EmitCs([cQuery = cur.s0] (DxvkContext* ctx) {
       ctx->writeTimestamp(cQuery);

@@ -401,7 +401,9 @@ namespace dxvk {
 
     struct MgpuSpanSlot {
       Rc<DxvkQuery> s0, e0, s1, e1;
-      bool          valid = false;
+      Rc<DxvkQuery> c0a, c0b, c0c, c0d, c1a, c1b;
+      bool          valid     = false;
+      bool          compValid = false;
     };
 
     struct MgpuSpanCalib {
@@ -419,6 +421,13 @@ namespace dxvk {
     bool              m_spanHaveStart = false;
     double            m_spanQpcNs     = 0.0;
     double            m_spanSum[4]    = { };
+    double            m_spanComp[7]   = { };
+    uint32_t          m_spanTailCount = 0u;
+    uint32_t          m_spanCompCount = 0u;
+    double            m_spanPeriodSum = 0.0;
+    uint32_t          m_spanPeriodCount = 0u;
+    double            m_spanPrevE0    = 0.0;
+    uint64_t          m_spanPrevFrame = 0u;
     uint64_t          m_spanMaxDev    = 0u;
     double            m_spanDevSum    = 0.0;
     double            m_spanCallNs    = 0.0;
