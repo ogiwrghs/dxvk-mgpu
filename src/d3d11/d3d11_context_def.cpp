@@ -328,7 +328,6 @@ namespace dxvk {
       // when the worker CS thread executes, after ExecuteCommandList,
       // so NO_OVERWRITE appends made after this map are included.
       VkDeviceSize    size    = VkDeviceSize(pBuffer->Desc()->ByteWidth);
-      DxvkBufferSlice staging = m_workerStaging->alloc(size);
 
       {
         static std::atomic<uint64_t> s_big = { 0u };
@@ -339,16 +338,55 @@ namespace dxvk {
         }
       }
 
-      EmitWorkerCs([
-        cWorkerBuffer = pBuffer->GetWorkerBuffer(),
-        cSrcSlice     = bufferSlice,
-        cStaging      = std::move(staging),
-        cSize         = size
-      ] (DxvkContext* ctx) {
-        std::memcpy(cStaging.mapPtr(0), cSrcSlice->mapPtr(), cSize);
-        ctx->copyBuffer(cWorkerBuffer, 0u,
-          cStaging.buffer(), cStaging.offset(), cSize);
-      });
+      // Worker-side slice, as on the immediate path: a fresh slice of
+      // the worker buffer, filled and swapped in by invalidateBuffer on
+      // the worker CS thread at execution time. No transfer, so no
+      // render pass break; the staged copyBuffer below broke one per
+      // map (Fire Strike: beginRenderPass 5x on the worker). Allocated
+      // uncached inside the lambda because deferred contexts record on
+      // several threads and the worker CS thread is the only one that
+      // runs this. Skipped for shadowed buffers, whose immediate-path
+      // writes target m_workerMapPtr, which this swap cannot update.
+      static const bool s_noWorkerSlices =
+        env::getEnvVar("DXVK_MGPU_NO_WORKER_SLICES") == "1";
+
+      bool useSlice = !s_noWorkerSlices
+                   && pBuffer->HasWorkerMapping()
+                   && pBuffer->GetShadowPtr() == nullptr;
+
+      {
+        static std::atomic<uint64_t> s_slice = { 0u };
+        static std::atomic<uint64_t> s_staged = { 0u };
+        uint64_t n = useSlice ? ++s_slice : ++s_staged;
+        if (n <= 2u || (n % 200000u) == 0u)
+          Logger::warn(str::format("DEFSLICEMIRROR slice=", s_slice.load(),
+            " staged=", s_staged.load()));
+      }
+
+      if (useSlice) {
+        EmitWorkerCs([
+          cWorkerBuffer = pBuffer->GetWorkerBuffer(),
+          cSrcSlice     = bufferSlice,
+          cSize         = size
+        ] (DxvkContext* ctx) {
+          Rc<DxvkResourceAllocation> slice = cWorkerBuffer->allocateStorage(nullptr);
+          std::memcpy(slice->mapPtr(), cSrcSlice->mapPtr(), cSize);
+          ctx->invalidateBuffer(cWorkerBuffer, std::move(slice));
+        });
+      } else {
+        DxvkBufferSlice staging = m_workerStaging->alloc(size);
+
+        EmitWorkerCs([
+          cWorkerBuffer = pBuffer->GetWorkerBuffer(),
+          cSrcSlice     = bufferSlice,
+          cStaging      = std::move(staging),
+          cSize         = size
+        ] (DxvkContext* ctx) {
+          std::memcpy(cStaging.mapPtr(0), cSrcSlice->mapPtr(), cSize);
+          ctx->copyBuffer(cWorkerBuffer, 0u,
+            cStaging.buffer(), cStaging.offset(), cSize);
+        });
+      }
     }
     EmitCs([
       cDstBuffer = pBuffer->GetBuffer(),
