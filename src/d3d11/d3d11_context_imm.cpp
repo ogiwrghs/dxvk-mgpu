@@ -112,6 +112,7 @@ namespace dxvk {
       m_mirrorNoOverwrite = env::getEnvVar("DXVK_MGPU_NO_MIRROR_NOOVERWRITE") != "1";
       m_noShadow          = env::getEnvVar("DXVK_MGPU_NO_SHADOW") == "1";
       m_workerSlices      = env::getEnvVar("DXVK_MGPU_NO_WORKER_SLICES") != "1";
+      m_syncSliceCopy     = env::getEnvVar("DXVK_MGPU_SYNC_SLICE_COPY") == "1";
       m_fixedSplit        = env::getEnvVar("DXVK_MGPU_FIXED_SPLIT") == "1";
       m_noWorkerFlush     = env::getEnvVar("DXVK_MGPU_NO_WORKER_FLUSH") == "1";
       m_cbReadEnabled    = env::getEnvVar("DXVK_MGPU_TEST_CBREAD") == "1";
@@ -429,6 +430,17 @@ namespace dxvk {
   
   void MgpuRecordUnmapMirror(dxvk::high_resolution_clock::time_point t0);
 
+  // UNMAPSLICE: where a slice-path Unmap spends its time after the
+  // copy left the application thread. One Unmap in eight is split into
+  // search (finding the buffer in m_sliceMapped), lock, emit (queueing
+  // the worker copy) and rest (list removal and counters).
+  void MgpuRecordUnmapSlice(
+          dxvk::high_resolution_clock::time_point t0,
+          dxvk::high_resolution_clock::time_point tFound,
+          dxvk::high_resolution_clock::time_point tLocked,
+          dxvk::high_resolution_clock::time_point tEmitted,
+          size_t listSize, size_t index);
+
 
   void STDMETHODCALLTYPE D3D11ImmediateContext::Unmap(
           ID3D11Resource*             pResource,
@@ -458,15 +470,59 @@ namespace dxvk {
     if (likely(!m_sliceMapped.empty())) {
       for (size_t i = 0; i < m_sliceMapped.size(); i++) {
         if (reinterpret_cast<ID3D11Resource*>(m_sliceMapped[i].buffer) == pResource) {
+          static uint32_t s_splitN = 0u;
+          bool split = ((++s_splitN) & 7u) == 0u;
+          size_t listSize = m_sliceMapped.size();
+
+          auto tFound = split ? dxvk::high_resolution_clock::now()
+                              : dxvk::high_resolution_clock::time_point();
+
           D3D10DeviceLock lock = LockContext();
-          std::memcpy(m_sliceMapped[i].dst, m_sliceMapped[i].src, m_sliceMapped[i].size);
-          m_sliceMapped[i] = m_sliceMapped.back();
+
+          auto tLocked = split ? dxvk::high_resolution_clock::now()
+                               : dxvk::high_resolution_clock::time_point();
+
+          SliceMapped& e = m_sliceMapped[i];
+
+          if (unlikely(m_syncSliceCopy)) {
+            std::memcpy(e.dst, e.src, e.size);
+          } else {
+            // The whole-buffer copy was 5.2 ms per frame of application
+            // thread time in BeamNG West Coast (2,300 Unmaps per frame,
+            // ~2.3 us each). It now runs on the worker CS thread, in
+            // stream order: after the worker's invalidateBuffer emitted
+            // at Map, before any later draw that reads the buffer.
+            // Later NO_OVERWRITE writes into the same primary slice may
+            // be copied early; their own mirror runs after this in the
+            // stream and leaves the final contents. The buffer ref keeps
+            // the pending counter alive until the copy has run.
+            e.buffer->AddWorkerCopyPending();
+
+            EmitWorkerCs([
+              cBuffer = Com<D3D11Buffer, false>(e.buffer),
+              cSrc    = std::move(e.srcSlice),
+              cDst    = std::move(e.dstSlice),
+              cSize   = e.size
+            ] (DxvkContext* ctx) {
+              std::memcpy(cDst->mapPtr(), cSrc->mapPtr(), cSize);
+              cBuffer->DoneWorkerCopy();
+            });
+          }
+
+          auto tEmitted = split ? dxvk::high_resolution_clock::now()
+                                : dxvk::high_resolution_clock::time_point();
+
+          if (i + 1u != m_sliceMapped.size())
+            m_sliceMapped[i] = std::move(m_sliceMapped.back());
           m_sliceMapped.pop_back();
 
           static std::atomic<uint64_t> s_slice = { 0u };
           uint64_t n = ++s_slice;
           if (n <= 2u || (n % 200000u) == 0u)
             Logger::warn(str::format("SLICEMIRROR discard=", n));
+
+          if (unlikely(split))
+            MgpuRecordUnmapSlice(mirrorT0, tFound, tLocked, tEmitted, listSize, i);
 
           MgpuRecordUnmapMirror(mirrorT0);
           return;
@@ -650,9 +706,11 @@ namespace dxvk {
       pResource->DropShadowIfDeferred();
 
       bool workerSliceSwapped = false;
+      Rc<DxvkResourceAllocation> workerSliceRef;
 
       if (m_workerCsThread && m_workerSlices && pResource->HasWorkerMapping()) {
         auto workerSlice = pResource->DiscardWorkerSlice(&m_workerAllocationCache);
+        workerSliceRef = workerSlice;
         workerSliceSwapped = true;
 
         EmitWorkerCs([
@@ -681,7 +739,8 @@ namespace dxvk {
         }
       } else if (workerSliceSwapped) {
         m_sliceMapped.push_back({ pResource, bufferSlice->mapPtr(),
-          pResource->GetWorkerMapPtr(), bufferSize });
+          pResource->GetWorkerMapPtr(), bufferSize,
+          bufferSlice, std::move(workerSliceRef) });
       } else if (m_workerCsThread && pResource->GetWorkerBuffer() != nullptr) {
         if (m_mappedWorkerBuffer != nullptr) {
           static std::atomic<uint64_t> s_clobber = { 0u };
@@ -714,8 +773,17 @@ namespace dxvk {
       pMappedResource->pData      = pResource->GetMapPtr();
       pMappedResource->RowPitch   = bufferSize;
       pMappedResource->DepthPitch = bufferSize;
+      bool copyPending = m_workerCsThread && pResource->HasWorkerCopyPending();
+
+      if (unlikely(copyPending)) {
+        static std::atomic<uint64_t> s_defer = { 0u };
+        uint64_t n = ++s_defer;
+        if (n <= 4u || (n % 10000u) == 0u)
+          Logger::warn(str::format("SLICEASYNC noshadow=", n));
+      }
+
       if (m_workerCsThread && m_mirrorNoOverwrite && !m_noShadow && pResource->GetWorkerBuffer() != nullptr
-       && pResource->EnsureShadow()) {
+       && !copyPending && pResource->EnsureShadow()) {
         pMappedResource->pData = pResource->GetShadowPtr();
         m_shadowMapped.push_back(pResource);
       } else if (m_workerCsThread && m_mirrorNoOverwrite && pResource->GetWorkerBuffer() != nullptr) {
@@ -1488,6 +1556,48 @@ namespace dxvk {
   static MgpuDispatchTimer g_mgpuPrimaryDispatch("DISPATCHWAIT primary");
   static MgpuDispatchTimer g_mgpuWorkerDispatch("DISPATCHWAIT worker");
   static MgpuDispatchTimer g_mgpuUnmapMirror("MIRRORTIME unmap");
+
+
+  void MgpuRecordUnmapSlice(
+          dxvk::high_resolution_clock::time_point t0,
+          dxvk::high_resolution_clock::time_point tFound,
+          dxvk::high_resolution_clock::time_point tLocked,
+          dxvk::high_resolution_clock::time_point tEmitted,
+          size_t listSize, size_t index) {
+    auto ns = [] (auto a, auto b) {
+      return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+    };
+
+    auto t1 = dxvk::high_resolution_clock::now();
+
+    static uint64_t s_n = 0u, s_search = 0u, s_lock = 0u, s_emit = 0u, s_rest = 0u;
+    static uint64_t s_listSum = 0u, s_listMax = 0u, s_idxSum = 0u;
+    static auto s_window = t1;
+
+    s_n      += 1u;
+    s_search += ns(t0, tFound);
+    s_lock   += ns(tFound, tLocked);
+    s_emit   += ns(tLocked, tEmitted);
+    s_rest   += ns(tEmitted, t1);
+    s_listSum += listSize;
+    s_listMax  = std::max<uint64_t>(s_listMax, listSize);
+    s_idxSum  += index;
+
+    if (ns(s_window, t1) >= 2000000000ull) {
+      double n = double(s_n);
+      Logger::warn(str::format("UNMAPSLICE samples=", s_n,
+        " search_ns=", double(s_search) / n,
+        " lock_ns=", double(s_lock) / n,
+        " emit_ns=", double(s_emit) / n,
+        " rest_ns=", double(s_rest) / n,
+        " list_avg=", double(s_listSum) / n,
+        " list_max=", s_listMax,
+        " idx_avg=", double(s_idxSum) / n));
+      s_n = s_search = s_lock = s_emit = s_rest = 0u;
+      s_listSum = s_listMax = s_idxSum = 0u;
+      s_window = t1;
+    }
+  }
 
 
   void MgpuRecordUnmapMirror(dxvk::high_resolution_clock::time_point t0) {

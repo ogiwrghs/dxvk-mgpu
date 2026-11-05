@@ -137,15 +137,22 @@ namespace dxvk {
     bool                    m_mirrorNoOverwrite = false;
     bool                    m_noShadow = false;
     bool                    m_workerSlices = true;
+    bool                    m_syncSliceCopy = false;
     bool                    m_fixedSplit = false;
     uint64_t                m_splitAccUs = 0u;
     uint32_t                m_splitAccN  = 0u;
 
+    // A DISCARD-mapped buffer with a worker slice, waiting for its
+    // Unmap. The allocations are held so the queued worker copy can
+    // read the primary slice and write the worker slice after the
+    // application has moved on to newer slices of the same buffer.
     struct SliceMapped {
-      D3D11Buffer*  buffer;
-      const void*   src;
-      void*         dst;
-      VkDeviceSize  size;
+      D3D11Buffer*                buffer;
+      const void*                 src;
+      void*                       dst;
+      VkDeviceSize                size;
+      Rc<DxvkResourceAllocation>  srcSlice;
+      Rc<DxvkResourceAllocation>  dstSlice;
     };
 
     std::vector<SliceMapped>       m_sliceMapped;

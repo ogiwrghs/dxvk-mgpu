@@ -185,6 +185,22 @@ namespace dxvk {
       return m_workerBuffer != nullptr && m_workerMapPtr != nullptr;
     }
 
+    // Worker slice copies queued on the worker CS thread and not yet
+    // run. While one is pending, FlushShadow must not write the worker
+    // slice from the application thread: the queued copy would land
+    // after it and overwrite the flushed pages with older contents.
+    void AddWorkerCopyPending() {
+      m_workerCopiesPending.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    void DoneWorkerCopy() {
+      m_workerCopiesPending.fetch_sub(1u, std::memory_order_release);
+    }
+
+    bool HasWorkerCopyPending() const {
+      return m_workerCopiesPending.load(std::memory_order_acquire) != 0u;
+    }
+
     void* GetShadowPtr() const {
       return m_shadowPtr;
     }
@@ -298,6 +314,7 @@ namespace dxvk {
 
     void*                         m_mapPtr = nullptr;
     void*                         m_workerMapPtr = nullptr;
+    std::atomic<uint32_t>         m_workerCopiesPending = { 0u };
     void*                         m_shadowPtr = nullptr;
     std::vector<void*>            m_shadowPages;
 
