@@ -1,6 +1,10 @@
 #include <algorithm>
 
 #include <atomic>
+#include <vector>
+
+#include "../util/util_env.h"
+#include "../util/util_time.h"
 
 #include "d3d11_context.h"
 
@@ -60,6 +64,124 @@ namespace dxvk {
   }
 
   std::atomic<MgpuCallCounter*> MgpuCallCounter::s_head = { nullptr };
+
+  bool g_mgpuCallTime = env::getEnvVar("DXVK_MGPU_CALLTIME") == "1";
+
+  thread_local uint32_t t_mgpuCallDepth = 0u;
+
+  int64_t MgpuCallTimeNow() {
+    return dxvk::high_resolution_clock::now().time_since_epoch().count();
+  }
+
+  static std::atomic<int64_t>   g_mgpuCallTimeWindow  = { 0 };
+  static std::atomic<uint64_t>  g_mgpuCallTimeNested  = { 0u };
+  static std::atomic<uint64_t>  g_mgpuCallTimeTopAll  = { 0u };
+  static std::atomic<uint64_t>  g_mgpuCallTimeTopNs   = { 0u };
+  static std::atomic<uint64_t>  g_mgpuCallTimeTopN    = { 0u };
+
+  void MgpuCallTimeCountTop() {
+    g_mgpuCallTimeTopAll.fetch_add(1u, std::memory_order_relaxed);
+  }
+
+  struct MgpuCallTimeRow {
+    const char* name;
+    double      callsPerS;
+    double      msPerS;
+    double      nsPerCall;
+  };
+
+  // Prints every method with time in the window, largest first, then
+  // one total line. ms_per_s for a method is its measured ns per timed
+  // call times its full call rate, so the sampling does not bias it.
+  static void MgpuCallTimeReport(int64_t now, int64_t windowStart) {
+    double elapsedS = double(now - windowStart) * 1.0e-9;
+
+    std::vector<MgpuCallTimeRow> rows;
+    double sumMs      = 0.0;
+
+    for (auto* c = MgpuCallCounter::s_head.load(); c; c = c->next) {
+      uint64_t count = c->count.load(std::memory_order_relaxed);
+      uint64_t ns    = c->timedNs.load(std::memory_order_relaxed);
+      uint64_t timed = c->timedCalls.load(std::memory_order_relaxed);
+
+      uint64_t dCount = count - c->lastCount;
+      uint64_t dNs    = ns    - c->lastNs;
+      uint64_t dTimed = timed - c->lastTimed;
+
+      c->lastCount = count;
+      c->lastNs    = ns;
+      c->lastTimed = timed;
+
+      if (!dCount || !dTimed)
+        continue;
+
+      MgpuCallTimeRow row;
+      row.name      = c->name;
+      row.callsPerS = double(dCount) / elapsedS;
+      row.nsPerCall = double(dNs) / double(dTimed);
+      row.msPerS    = row.callsPerS * row.nsPerCall * 1.0e-6;
+      rows.push_back(row);
+
+      sumMs += row.msPerS;
+    }
+
+    std::sort(rows.begin(), rows.end(), [] (const MgpuCallTimeRow& a, const MgpuCallTimeRow& b) {
+      return a.msPerS > b.msPerS;
+    });
+
+    for (const auto& r : rows) {
+      if (r.msPerS < 1.0)
+        break;
+
+      Logger::warn(str::format("CALLTIME ", r.name,
+        " ms_per_s=", r.msPerS,
+        " calls_per_s=", r.callsPerS,
+        " ns_per_call=", r.nsPerCall));
+    }
+
+    // Outermost calls only: their measured ns per timed call times
+    // their full rate. sum_ms_per_s adds every row and exceeds the
+    // total by the time spent in nested calls.
+    uint64_t nested = g_mgpuCallTimeNested.exchange(0u, std::memory_order_relaxed);
+    uint64_t topAll = g_mgpuCallTimeTopAll.exchange(0u, std::memory_order_relaxed);
+    uint64_t topNs  = g_mgpuCallTimeTopNs.exchange(0u, std::memory_order_relaxed);
+    uint64_t topN   = g_mgpuCallTimeTopN.exchange(0u, std::memory_order_relaxed);
+
+    double topPerS  = double(topAll) / elapsedS;
+    double totalMs  = topN ? topPerS * double(topNs) / double(topN) * 1.0e-6 : 0.0;
+
+    Logger::warn(str::format("CALLTIME total ms_per_s=", totalMs,
+      " calls_per_s=", topPerS,
+      " sum_ms_per_s=", sumMs,
+      " nested_timed_per_s=", double(nested) / elapsedS));
+  }
+
+  void MgpuCallTimeRecord(MgpuCallCounter& counter, int64_t t0, bool top) {
+    int64_t t1 = MgpuCallTimeNow();
+
+    counter.timedNs.fetch_add(uint64_t(t1 - t0), std::memory_order_relaxed);
+    counter.timedCalls.fetch_add(1u, std::memory_order_relaxed);
+
+    if (!top) {
+      g_mgpuCallTimeNested.fetch_add(1u, std::memory_order_relaxed);
+      return;
+    }
+
+    g_mgpuCallTimeTopNs.fetch_add(uint64_t(t1 - t0), std::memory_order_relaxed);
+    g_mgpuCallTimeTopN.fetch_add(1u, std::memory_order_relaxed);
+
+    int64_t windowStart = g_mgpuCallTimeWindow.load(std::memory_order_relaxed);
+
+    if (unlikely(!windowStart)) {
+      g_mgpuCallTimeWindow.compare_exchange_strong(windowStart, t1);
+      return;
+    }
+
+    if (unlikely(t1 - windowStart >= 2000000000ll)) {
+      if (g_mgpuCallTimeWindow.compare_exchange_strong(windowStart, t1))
+        MgpuCallTimeReport(t1, windowStart);
+    }
+  }
 
   void MgpuDumpCtxCounters();
 
@@ -213,7 +335,7 @@ namespace dxvk {
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::ClearState() {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     ResetCommandListState();
     ResetContextState();
@@ -223,7 +345,7 @@ namespace dxvk {
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::DiscardResource(ID3D11Resource* pResource) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (!pResource)
       return;
@@ -294,7 +416,7 @@ namespace dxvk {
     const D3D11_RECT*              pRects,
           UINT                     NumRects) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     // We don't support discarding individual rectangles
     if (!pResourceView || (NumRects && pRects))
@@ -421,7 +543,7 @@ namespace dxvk {
     const D3D11_BOX*                        pSrcBox,
           UINT                              CopyFlags) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
 
     
@@ -496,7 +618,7 @@ namespace dxvk {
           ID3D11Resource*                   pDstResource,
           ID3D11Resource*                   pSrcResource) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
 
 
@@ -554,7 +676,7 @@ namespace dxvk {
           UINT                              DstAlignedByteOffset,
           ID3D11UnorderedAccessView*        pSrcView) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto buf = static_cast<D3D11Buffer*>(pDstBuffer);
     auto uav = static_cast<D3D11UnorderedAccessView*>(pSrcView);
@@ -616,7 +738,7 @@ namespace dxvk {
           ID3D11RenderTargetView*           pRenderTargetView,
     const FLOAT                             ColorRGBA[4]) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto rtv = static_cast<D3D11RenderTargetView*>(pRenderTargetView);
 
@@ -660,7 +782,7 @@ namespace dxvk {
           ID3D11UnorderedAccessView*        pUnorderedAccessView,
     const UINT                              Values[4]) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (!pUnorderedAccessView)
       return;
@@ -806,7 +928,7 @@ namespace dxvk {
           ID3D11UnorderedAccessView*        pUnorderedAccessView,
     const FLOAT                             Values[4]) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto uav = static_cast<D3D11UnorderedAccessView*>(pUnorderedAccessView);
 
@@ -892,7 +1014,7 @@ namespace dxvk {
           FLOAT                             Depth,
           UINT8                             Stencil) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto dsv = static_cast<D3D11DepthStencilView*>(pDepthStencilView);
 
@@ -964,7 +1086,7 @@ namespace dxvk {
     const D3D11_RECT*                       pRect,
           UINT                              NumRects) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (NumRects && !pRect)
       return;
@@ -1051,7 +1173,7 @@ namespace dxvk {
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::GenerateMips(ID3D11ShaderResourceView* pShaderResourceView) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto view = static_cast<D3D11ShaderResourceView*>(pShaderResourceView);
 
@@ -1098,7 +1220,7 @@ namespace dxvk {
           UINT                              SrcSubresource,
           DXGI_FORMAT                       Format) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
  
 
@@ -1322,7 +1444,7 @@ namespace dxvk {
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::DrawAuto() {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     D3D11Buffer* buffer = m_state.ia.vertexBuffers[0].buffer.ptr();
 
@@ -1363,7 +1485,7 @@ namespace dxvk {
           UINT            VertexCount,
           UINT            StartVertexLocation) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (unlikely(!VertexCount))
       return;
@@ -1384,7 +1506,7 @@ namespace dxvk {
           UINT            StartIndexLocation,
           INT             BaseVertexLocation) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (unlikely(!IndexCount))
       return;
@@ -1409,7 +1531,7 @@ namespace dxvk {
           UINT            StartVertexLocation,
           UINT            StartInstanceLocation) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (unlikely(!VertexCountPerInstance || !InstanceCount))
       return;
@@ -1432,7 +1554,7 @@ namespace dxvk {
           INT             BaseVertexLocation,
           UINT            StartInstanceLocation) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (unlikely(!IndexCountPerInstance || !InstanceCount))
       return;
@@ -1455,7 +1577,7 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (unlikely(HasDirtyGraphicsBindings()))
@@ -1497,7 +1619,7 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (unlikely(HasDirtyGraphicsBindings()))
@@ -1540,7 +1662,7 @@ namespace dxvk {
           UINT            ThreadGroupCountY,
           UINT            ThreadGroupCountZ) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (unlikely(!ThreadGroupCountX || !ThreadGroupCountY || !ThreadGroupCountZ))
       return;
@@ -1631,7 +1753,7 @@ namespace dxvk {
           ID3D11Buffer*   pBufferForArgs,
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     AddCost(GpuCostEstimate::DispatchIndirect);
@@ -1655,7 +1777,7 @@ namespace dxvk {
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::IASetInputLayout(ID3D11InputLayout* pInputLayout) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto inputLayout = static_cast<D3D11InputLayout*>(pInputLayout);
 
@@ -1679,7 +1801,7 @@ namespace dxvk {
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY Topology) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (m_state.ia.primitiveTopology != Topology) {
       m_state.ia.primitiveTopology = Topology;
@@ -1696,7 +1818,7 @@ namespace dxvk {
     const UINT*                             pStrides,
     const UINT*                             pOffsets) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
       auto newBuffer = static_cast<D3D11Buffer*>(ppVertexBuffers[i]);
@@ -1727,7 +1849,7 @@ namespace dxvk {
           DXGI_FORMAT                       Format,
           UINT                              Offset) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto newBuffer = static_cast<D3D11Buffer*>(pIndexBuffer);
 
@@ -1750,7 +1872,7 @@ namespace dxvk {
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::IAGetInputLayout(ID3D11InputLayout** ppInputLayout) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     *ppInputLayout = m_state.ia.inputLayout.ref();
   }
@@ -1759,7 +1881,7 @@ namespace dxvk {
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::IAGetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY* pTopology) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     *pTopology = m_state.ia.primitiveTopology;
   }
@@ -1773,7 +1895,7 @@ namespace dxvk {
           UINT*                             pStrides,
           UINT*                             pOffsets) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
       const bool inRange = StartSlot + i < m_state.ia.vertexBuffers.size();
@@ -1805,7 +1927,7 @@ namespace dxvk {
           DXGI_FORMAT*                      pFormat,
           UINT*                             pOffset) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppIndexBuffer)
       *ppIndexBuffer = m_state.ia.indexBuffer.buffer.ref();
@@ -1824,7 +1946,7 @@ namespace dxvk {
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto shader = static_cast<D3D11VertexShader*>(pVertexShader);
     SetClassInstances<D3D11ShaderType::eVertex>(
@@ -1844,7 +1966,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers<D3D11ShaderType::eVertex>(
       StartSlot, NumBuffers, ppConstantBuffers);
@@ -1859,7 +1981,7 @@ namespace dxvk {
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers1<D3D11ShaderType::eVertex>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -1873,7 +1995,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetShaderResources<D3D11ShaderType::eVertex>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -1886,7 +2008,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetSamplers<D3D11ShaderType::eVertex>(
       StartSlot, NumSamplers, ppSamplers);
@@ -1899,7 +2021,7 @@ namespace dxvk {
           ID3D11ClassInstance**             ppClassInstances,
           UINT*                             pNumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppVertexShader)
       *ppVertexShader = m_state.vs.ref();
@@ -1914,7 +2036,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer**                    ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::eVertex>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -1930,7 +2052,7 @@ namespace dxvk {
           UINT*                             pFirstConstant,
           UINT*                             pNumConstants) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::eVertex>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -1944,7 +2066,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView**        ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetShaderResources<D3D11ShaderType::eVertex>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -1957,7 +2079,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState**              ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetSamplers<D3D11ShaderType::eVertex>(
       StartSlot, NumSamplers, ppSamplers);
@@ -1970,7 +2092,7 @@ namespace dxvk {
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto shader = static_cast<D3D11HullShader*>(pHullShader);
     SetClassInstances<D3D11ShaderType::eHull>(
@@ -1990,7 +2112,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers<D3D11ShaderType::eHull>(
       StartSlot, NumBuffers, ppConstantBuffers);
@@ -2005,7 +2127,7 @@ namespace dxvk {
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers1<D3D11ShaderType::eHull>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2019,7 +2141,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetShaderResources<D3D11ShaderType::eHull>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -2032,7 +2154,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetSamplers<D3D11ShaderType::eHull>(
       StartSlot, NumSamplers, ppSamplers);
@@ -2045,7 +2167,7 @@ namespace dxvk {
           ID3D11ClassInstance**             ppClassInstances,
           UINT*                             pNumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppHullShader)
       *ppHullShader = m_state.hs.ref();
@@ -2060,7 +2182,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer**                    ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::eHull>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2076,7 +2198,7 @@ namespace dxvk {
           UINT*                             pFirstConstant,
           UINT*                             pNumConstants) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::eHull>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2090,7 +2212,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView**        ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetShaderResources<D3D11ShaderType::eHull>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -2103,7 +2225,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState**              ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetSamplers<D3D11ShaderType::eHull>(
       StartSlot, NumSamplers, ppSamplers);
@@ -2116,7 +2238,7 @@ namespace dxvk {
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto shader = static_cast<D3D11DomainShader*>(pDomainShader);
     SetClassInstances<D3D11ShaderType::eDomain>(
@@ -2136,7 +2258,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers<D3D11ShaderType::eDomain>(
       StartSlot, NumBuffers, ppConstantBuffers);
@@ -2151,7 +2273,7 @@ namespace dxvk {
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers1<D3D11ShaderType::eDomain>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2165,7 +2287,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetShaderResources<D3D11ShaderType::eDomain>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -2178,7 +2300,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetSamplers<D3D11ShaderType::eDomain>(
       StartSlot, NumSamplers, ppSamplers);
@@ -2191,7 +2313,7 @@ namespace dxvk {
           ID3D11ClassInstance**             ppClassInstances,
           UINT*                             pNumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppDomainShader)
       *ppDomainShader = m_state.ds.ref();
@@ -2206,7 +2328,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer**                    ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::eDomain>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2222,7 +2344,7 @@ namespace dxvk {
           UINT*                             pFirstConstant,
           UINT*                             pNumConstants) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::eDomain>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2236,7 +2358,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView**        ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetShaderResources<D3D11ShaderType::eDomain>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -2249,7 +2371,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState**              ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetSamplers<D3D11ShaderType::eDomain>(
       StartSlot, NumSamplers, ppSamplers);
@@ -2262,7 +2384,7 @@ namespace dxvk {
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto shader = static_cast<D3D11GeometryShader*>(pShader);
     SetClassInstances<D3D11ShaderType::eGeometry>(
@@ -2282,7 +2404,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers<D3D11ShaderType::eGeometry>(
       StartSlot, NumBuffers, ppConstantBuffers);
@@ -2297,7 +2419,7 @@ namespace dxvk {
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {  
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers1<D3D11ShaderType::eGeometry>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2311,7 +2433,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetShaderResources<D3D11ShaderType::eGeometry>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -2324,7 +2446,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetSamplers<D3D11ShaderType::eGeometry>(
       StartSlot, NumSamplers, ppSamplers);
@@ -2337,7 +2459,7 @@ namespace dxvk {
           ID3D11ClassInstance**             ppClassInstances,
           UINT*                             pNumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppGeometryShader)
       *ppGeometryShader = m_state.gs.ref();
@@ -2352,7 +2474,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer**                    ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::eGeometry>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2368,7 +2490,7 @@ namespace dxvk {
           UINT*                             pFirstConstant,
           UINT*                             pNumConstants) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::eGeometry>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2382,7 +2504,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView**        ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetShaderResources<D3D11ShaderType::eGeometry>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -2395,7 +2517,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState**              ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetSamplers<D3D11ShaderType::eGeometry>(
       StartSlot, NumSamplers, ppSamplers);
@@ -2408,7 +2530,7 @@ namespace dxvk {
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto shader = static_cast<D3D11PixelShader*>(pPixelShader);
     SetClassInstances<D3D11ShaderType::ePixel>(
@@ -2428,7 +2550,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers<D3D11ShaderType::ePixel>(
       StartSlot, NumBuffers, ppConstantBuffers);
@@ -2443,7 +2565,7 @@ namespace dxvk {
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers1<D3D11ShaderType::ePixel>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2457,7 +2579,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetShaderResources<D3D11ShaderType::ePixel>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -2470,7 +2592,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetSamplers<D3D11ShaderType::ePixel>(
       StartSlot, NumSamplers, ppSamplers);
@@ -2483,7 +2605,7 @@ namespace dxvk {
           ID3D11ClassInstance**             ppClassInstances,
           UINT*                             pNumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppPixelShader)
       *ppPixelShader = m_state.ps.ref();
@@ -2498,7 +2620,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer**                    ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::ePixel>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2514,7 +2636,7 @@ namespace dxvk {
           UINT*                             pFirstConstant,
           UINT*                             pNumConstants) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::ePixel>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2528,7 +2650,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView**        ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetShaderResources<D3D11ShaderType::ePixel>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -2541,7 +2663,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState**              ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetSamplers<D3D11ShaderType::ePixel>(
       StartSlot, NumSamplers, ppSamplers);
@@ -2554,7 +2676,7 @@ namespace dxvk {
           ID3D11ClassInstance* const*       ppClassInstances,
           UINT                              NumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto shader = static_cast<D3D11ComputeShader*>(pComputeShader);
     SetClassInstances<D3D11ShaderType::eCompute>(
@@ -2574,7 +2696,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer* const*              ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers<D3D11ShaderType::eCompute>(
       StartSlot, NumBuffers, ppConstantBuffers);
@@ -2589,7 +2711,7 @@ namespace dxvk {
     const UINT*                             pFirstConstant,
     const UINT*                             pNumConstants) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetConstantBuffers1<D3D11ShaderType::eCompute>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2603,7 +2725,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView* const*  ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetShaderResources<D3D11ShaderType::eCompute>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -2616,7 +2738,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState* const*        ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetSamplers<D3D11ShaderType::eCompute>(
       StartSlot, NumSamplers, ppSamplers);
@@ -2630,7 +2752,7 @@ namespace dxvk {
           ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
     const UINT*                             pUAVInitialCounts) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
 
 
@@ -2690,7 +2812,7 @@ namespace dxvk {
           ID3D11ClassInstance**             ppClassInstances,
           UINT*                             pNumClassInstances) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppComputeShader)
       *ppComputeShader = m_state.cs.ref();
@@ -2705,7 +2827,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer**                    ppConstantBuffers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::eCompute>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2721,7 +2843,7 @@ namespace dxvk {
           UINT*                             pFirstConstant,
           UINT*                             pNumConstants) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetConstantBuffers<D3D11ShaderType::eCompute>(
       StartSlot, NumBuffers, ppConstantBuffers,
@@ -2735,7 +2857,7 @@ namespace dxvk {
           UINT                              NumViews,
           ID3D11ShaderResourceView**        ppShaderResourceViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetShaderResources<D3D11ShaderType::eCompute>(
       StartSlot, NumViews, ppShaderResourceViews);
@@ -2748,7 +2870,7 @@ namespace dxvk {
           UINT                              NumSamplers,
           ID3D11SamplerState**              ppSamplers) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     GetSamplers<D3D11ShaderType::eCompute>(
       StartSlot, NumSamplers, ppSamplers);
@@ -2761,7 +2883,7 @@ namespace dxvk {
           UINT                              NumUAVs,
           ID3D11UnorderedAccessView**       ppUnorderedAccessViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     for (uint32_t i = 0; i < NumUAVs; i++) {
       ppUnorderedAccessViews[i] = StartSlot + i < m_state.uav.views.size()
@@ -2777,7 +2899,7 @@ namespace dxvk {
           ID3D11RenderTargetView* const*    ppRenderTargetViews,
           ID3D11DepthStencilView*           pDepthStencilView) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetRenderTargetsAndUnorderedAccessViews(
       NumViews, ppRenderTargetViews, pDepthStencilView,
@@ -2795,7 +2917,7 @@ namespace dxvk {
           ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
     const UINT*                             pUAVInitialCounts) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     SetRenderTargetsAndUnorderedAccessViews(
       NumRTVs, ppRenderTargetViews, pDepthStencilView,
@@ -2809,7 +2931,7 @@ namespace dxvk {
     const FLOAT                             BlendFactor[4],
           UINT                              SampleMask) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto blendState = static_cast<D3D11BlendState*>(pBlendState);
 
@@ -2835,7 +2957,7 @@ namespace dxvk {
           ID3D11DepthStencilState*          pDepthStencilState,
           UINT                              StencilRef) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto depthStencilState = static_cast<D3D11DepthStencilState*>(pDepthStencilState);
 
@@ -2875,7 +2997,7 @@ namespace dxvk {
           UINT                              NumUAVs,
           ID3D11UnorderedAccessView**       ppUnorderedAccessViews) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppRenderTargetViews) {
       for (UINT i = 0; i < NumRTVs; i++) {
@@ -2904,7 +3026,7 @@ namespace dxvk {
           FLOAT                             BlendFactor[4],
           UINT*                             pSampleMask) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppBlendState)
       *ppBlendState = m_state.om.cbState.ref();
@@ -2922,7 +3044,7 @@ namespace dxvk {
           ID3D11DepthStencilState**         ppDepthStencilState,
           UINT*                             pStencilRef) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppDepthStencilState)
       *ppDepthStencilState = m_state.om.dsState.ref();
@@ -2935,7 +3057,7 @@ namespace dxvk {
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::RSSetState(ID3D11RasterizerState* pRasterizerState) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto newRasterizerState = static_cast<D3D11RasterizerState*>(pRasterizerState);
 
@@ -2969,7 +3091,7 @@ namespace dxvk {
           UINT                              NumViewports,
     const D3D11_VIEWPORT*                   pViewports) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (unlikely(NumViewports > m_state.rs.viewports.size()))
       return;
@@ -3011,7 +3133,7 @@ namespace dxvk {
           UINT                              NumRects,
     const D3D11_RECT*                       pRects) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (unlikely(NumRects > m_state.rs.scissors.size()))
       return;
@@ -3041,7 +3163,7 @@ namespace dxvk {
   template<typename ContextType>
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::RSGetState(ID3D11RasterizerState** ppRasterizerState) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppRasterizerState)
       *ppRasterizerState = m_state.rs.state.ref();
@@ -3053,7 +3175,7 @@ namespace dxvk {
           UINT*                             pNumViewports,
           D3D11_VIEWPORT*                   pViewports) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
     uint32_t numWritten = m_state.rs.numViewports;
 
     if (pViewports) {
@@ -3082,7 +3204,7 @@ namespace dxvk {
           UINT*                             pNumRects,
           D3D11_RECT*                       pRects) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
     uint32_t numWritten = m_state.rs.numScissors;
 
     if (pRects) {
@@ -3110,7 +3232,7 @@ namespace dxvk {
           ID3D11Buffer* const*              ppSOTargets,
     const UINT*                             pOffsets) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
       D3D11Buffer* buffer = static_cast<D3D11Buffer*>(ppSOTargets[i]);
@@ -3138,7 +3260,7 @@ namespace dxvk {
           UINT                              NumBuffers,
           ID3D11Buffer**                    ppSOTargets) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
       ppSOTargets[i] = i < m_state.so.targets.size()
@@ -3154,7 +3276,7 @@ namespace dxvk {
           ID3D11Buffer**                    ppSOTargets,
           UINT*                             pOffsets) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     for (uint32_t i = 0; i < NumBuffers; i++) {
       const bool inRange = i < m_state.so.targets.size();
@@ -3179,7 +3301,7 @@ namespace dxvk {
           ID3D11Predicate*                  pPredicate,
           BOOL                              PredicateValue) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     auto predicate = D3D11Query::FromPredicate(pPredicate);
     m_state.pr.predicateObject = predicate;
@@ -3197,7 +3319,7 @@ namespace dxvk {
           ID3D11Predicate**                 ppPredicate,
           BOOL*                             pPredicateValue) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (ppPredicate)
       *ppPredicate = D3D11Query::AsPredicate(m_state.pr.predicateObject.ref());
@@ -3238,7 +3360,7 @@ namespace dxvk {
           UINT64                            BufferStartOffsetInBytes,
           UINT                              Flags) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (!pTiledResource || !pBuffer)
       return;
@@ -3271,7 +3393,7 @@ namespace dxvk {
     const D3D11_TILE_REGION_SIZE*           pTileRegionSize,
           UINT                              Flags) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (!pDestTiledResource || !pSourceTiledResource)
       return E_INVALIDARG;
@@ -3352,7 +3474,7 @@ namespace dxvk {
           ID3D11Buffer*                     pTilePool,
           UINT64                            NewSizeInBytes) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (NewSizeInBytes % SparseMemoryPageSize)
       return E_INVALIDARG;
@@ -3380,7 +3502,7 @@ namespace dxvk {
           ID3D11DeviceChild*                pTiledResourceOrViewAccessBeforeBarrier,
           ID3D11DeviceChild*                pTiledResourceOrViewAccessAfterBarrier) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     DxvkGlobalPipelineBarrier srcBarrier = GetTiledResourceDependency(pTiledResourceOrViewAccessBeforeBarrier);
     DxvkGlobalPipelineBarrier dstBarrier = GetTiledResourceDependency(pTiledResourceOrViewAccessAfterBarrier);
@@ -3411,7 +3533,7 @@ namespace dxvk {
     const UINT*                             pRangeTileCounts,
           UINT                              Flags) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (!pTiledResource || !NumRegions || !NumRanges)
       return E_INVALIDARG;
@@ -3567,7 +3689,7 @@ namespace dxvk {
     const void*                             pSourceTileData,
           UINT                              Flags) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (!pDestTiledResource || !pSourceTileData)
       return;
@@ -3652,7 +3774,7 @@ namespace dxvk {
           VkImageLayout             OldLayout,
           VkImageLayout             NewLayout) {
     D3D10DeviceLock lock = LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     // Get the underlying D3D11 resource
     Com<ID3D11Resource> resource;
@@ -7207,7 +7329,7 @@ namespace dxvk {
           UINT                              CopyFlags) {
     auto context = static_cast<ContextType*>(this);
     D3D10DeviceLock lock = context->LockContext();
-    { static MgpuCallCounter s_mgpuCallCnt(__func__); s_mgpuCallCnt.count.fetch_add(1u, std::memory_order_relaxed); }
+    MGPU_CALL_TIMED(__func__);
 
     if (!pDstResource)
       return;

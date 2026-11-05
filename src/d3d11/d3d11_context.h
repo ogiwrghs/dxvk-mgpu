@@ -39,10 +39,80 @@ namespace dxvk {
     std::atomic<uint64_t>   count;
     MgpuCallCounter*        next;
 
+    // CALLTIME (DXVK_MGPU_CALLTIME=1): one call in four of each method
+    // is timed with two clock reads. The reporter alone touches the
+    // last* fields, so they need no atomics.
+    std::atomic<uint64_t>   timedNs     = { 0u };
+    std::atomic<uint64_t>   timedCalls  = { 0u };
+    uint64_t                lastCount   = 0u;
+    uint64_t                lastNs      = 0u;
+    uint64_t                lastTimed   = 0u;
+
     static std::atomic<MgpuCallCounter*> s_head;
 
     MgpuCallCounter(const char* n);
   };
+
+  // CALLTIME: where the application thread's time inside D3D11 goes.
+  // Off by default; when off, a scope costs the census increment plus
+  // one predictable branch. When on, each call also adjusts a
+  // thread-local nesting depth, and one call in four of each method
+  // reads the clock twice (13 ns each in this VM). Nested calls are
+  // timed into their own method's row; the total line counts only
+  // outermost calls, so it never double-counts.
+  extern bool g_mgpuCallTime;
+
+  void MgpuCallTimeRecord(MgpuCallCounter& counter, int64_t t0, bool top);
+
+  void MgpuCallTimeCountTop();
+
+  int64_t MgpuCallTimeNow();
+
+  extern thread_local uint32_t t_mgpuCallDepth;
+
+  struct MgpuCallScope {
+    MgpuCallCounter*  counter = nullptr;
+    int64_t           t0      = 0;
+    bool              top     = false;
+
+    explicit MgpuCallScope(MgpuCallCounter& c) {
+      uint64_t n = c.count.fetch_add(1u, std::memory_order_relaxed);
+
+      if (likely(!g_mgpuCallTime))
+        return;
+
+      top = (t_mgpuCallDepth++ == 0u);
+
+      if (top)
+        MgpuCallTimeCountTop();
+
+      // Sample one call in four, by a multiplicative hash of the call
+      // number rather than n % 4: applications call methods in fixed
+      // patterns (Map/Unmap pairs, a set per draw), and a plain modulo
+      // would always land on the same position in such a pattern.
+      if (((n * 0x9E3779B97F4A7C15ull) >> 62) == 0u) {
+        counter = &c;
+        t0      = MgpuCallTimeNow();
+      }
+    }
+
+    ~MgpuCallScope() {
+      if (likely(!g_mgpuCallTime))
+        return;
+
+      t_mgpuCallDepth -= 1u;
+
+      if (counter)
+        MgpuCallTimeRecord(*counter, t0, top);
+    }
+
+    MgpuCallScope(const MgpuCallScope&) = delete;
+    MgpuCallScope& operator = (const MgpuCallScope&) = delete;
+  };
+
+  #define MGPU_CALL_TIMED(nameLit)                              \
+    static MgpuCallCounter s_mgpuCallCnt(nameLit);              \
+    MgpuCallScope s_mgpuCallScope(s_mgpuCallCnt)
 
   class D3D11DeferredContext;
   class D3D11ImmediateContext;

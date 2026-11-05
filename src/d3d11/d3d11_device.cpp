@@ -90,6 +90,7 @@ namespace dxvk {
     const D3D11_BUFFER_DESC*      pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData,
           ID3D11Buffer**          ppBuffer) {
+    MGPU_CALL_TIMED("CreateBuffer");
     InitReturnPtr(ppBuffer);
     
     if (!pDesc)
@@ -173,6 +174,7 @@ namespace dxvk {
     const D3D11_TEXTURE2D_DESC*   pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData,
           ID3D11Texture2D**       ppTexture2D) {
+    MGPU_CALL_TIMED("CreateTexture2D");
     InitReturnPtr(ppTexture2D);
 
     if (!pDesc)
@@ -348,6 +350,7 @@ namespace dxvk {
           ID3D11Resource*                   pResource,
     const D3D11_SHADER_RESOURCE_VIEW_DESC*  pDesc,
           ID3D11ShaderResourceView**        ppSRView) {
+    MGPU_CALL_TIMED("CreateShaderResourceView");
     InitReturnPtr(ppSRView);
 
     if (!pResource)
@@ -436,6 +439,7 @@ namespace dxvk {
           ID3D11Resource*                   pResource,
     const D3D11_UNORDERED_ACCESS_VIEW_DESC* pDesc,
           ID3D11UnorderedAccessView**       ppUAView) {
+    MGPU_CALL_TIMED("CreateUnorderedAccessView");
     InitReturnPtr(ppUAView);
 
     if (!pResource)
@@ -526,6 +530,7 @@ namespace dxvk {
           ID3D11Resource*                   pResource,
     const D3D11_RENDER_TARGET_VIEW_DESC*    pDesc,
           ID3D11RenderTargetView**          ppRTView) {
+    MGPU_CALL_TIMED("CreateRenderTargetView");
     InitReturnPtr(ppRTView);
 
     if (!pResource)
