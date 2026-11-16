@@ -164,6 +164,13 @@ namespace dxvk {
     bool NoLayout() const;
     VkExtent2D PresentExtent() const;
 
+    // PASSTIME is immediate-only; a deferred context records nothing.
+    void MgpuPassDraw() { }
+    bool MgpuPassProfiling() const { return false; }
+    void MgpuPassCompute(uint32_t, uint32_t, uint32_t, uint32_t) { }
+    void MgpuPassViewport(float, float, bool, bool) { }
+    void MgpuPassBind(uint32_t, uint32_t, uint32_t, bool, bool) { }
+
     uint64_t GetCurrentChunkId() const;
 
     void TrackTextureSequenceNumber(

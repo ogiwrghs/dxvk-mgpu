@@ -2,6 +2,10 @@
 
 #include <memory>
 #include <vector>
+#include <algorithm>
+#include <array>
+#include <deque>
+#include <map>
 #include "../util/util_time.h"
 
 #include "../util/sync/sync_signal.h"
@@ -405,6 +409,140 @@ namespace dxvk {
 
     void MgpuFrameSpanEnd();
     void MgpuFrameSpanStart();
+
+    // PASSTIME (DXVK_MGPU_PASSTIME=1): GPU time per render target, on
+    // both devices. One frame in 32 is profiled: every render target
+    // change, and every switch between draws and compute, writes a
+    // timestamp on each device. A segment runs from its timestamp to
+    // the next one. Segments are summed by what they rendered to
+    // (target size, attachment kinds, viewport size, whether the split
+    // scissor applied) and printed every 16 profiled frames. Works
+    // without a worker too, so single and dual runs can be compared.
+    enum : uint32_t {
+      MgpuPassKindRt      = 0u,
+      MgpuPassKindCompute = 1u,
+      MgpuPassKindPresent = 2u,
+    };
+
+    enum : uint32_t {
+      MgpuPassVpAppScissor = 1u,  // application scissor on: never split
+      MgpuPassVpSplit      = 2u,  // split scissor applied
+      MgpuPassVpFull       = 4u,  // no scissor at all: whole target
+    };
+
+    struct MgpuPassSeg {
+      Rc<DxvkQuery> q[2];
+      uint32_t      kind    = 0u;
+      uint32_t      rtW     = 0u;
+      uint32_t      rtH     = 0u;
+      uint32_t      colors  = 0u;
+      bool          depth   = false;
+      bool          msaa    = false;
+      uint32_t      vpW     = 0u;
+      uint32_t      vpH     = 0u;
+      uint32_t      vpFlags = 0u;
+      bool          drawn   = false;
+      uint32_t      groups[3] = { 0u, 0u, 0u };
+      uint32_t      uav     = 0u;
+    };
+
+    struct MgpuPassRecord {
+      std::vector<MgpuPassSeg>  segs;
+      Rc<DxvkQuery>             end[2];
+      uint64_t                  frame = 0u;
+    };
+
+    struct MgpuPassAgg {
+      double    ns[2] = { 0.0, 0.0 };
+      uint64_t  segs  = 0u;
+    };
+
+    void MgpuPassDraw() {
+      if (unlikely(m_passActive)) {
+        if (m_passKind != MgpuPassKindRt)
+          MgpuPassOpen(MgpuPassKindRt);
+
+        if (!m_passCur.segs.empty())
+          m_passCur.segs.back().drawn = true;
+      }
+    }
+
+    bool MgpuPassProfiling() const {
+      return m_passActive;
+    }
+
+    // Consecutive dispatches with the same group counts and the same
+    // first UAV share a segment; anything else starts a new one, so
+    // the report says what each kind of dispatch costs.
+    void MgpuPassCompute(uint32_t X, uint32_t Y, uint32_t Z, uint32_t Uav) {
+      if (m_passKind == MgpuPassKindCompute && !m_passCur.segs.empty()) {
+        const MgpuPassSeg& seg = m_passCur.segs.back();
+
+        if (seg.groups[0] == X && seg.groups[1] == Y
+         && seg.groups[2] == Z && seg.uav == Uav)
+          return;
+      }
+
+      MgpuPassOpen(MgpuPassKindCompute);
+
+      if (!m_passCur.segs.empty() && m_passCur.segs.back().kind == MgpuPassKindCompute) {
+        MgpuPassSeg& seg = m_passCur.segs.back();
+        seg.groups[0] = X;
+        seg.groups[1] = Y;
+        seg.groups[2] = Z;
+        seg.uav       = Uav;
+      }
+    }
+
+    void MgpuPassViewport(float W, float H, bool AppScissor, bool Split) {
+      m_passVpW     = uint32_t(std::max(W, 0.0f));
+      m_passVpH     = uint32_t(std::max(H, 0.0f));
+      m_passVpFlags = AppScissor ? MgpuPassVpAppScissor
+                    : (Split ? MgpuPassVpSplit : MgpuPassVpFull);
+
+      // A viewport set before the segment's first draw replaces the
+      // state inherited from the previous target; one set after it is
+      // a second state within the same target, and both are reported.
+      if (unlikely(m_passActive && !m_passCur.segs.empty())) {
+        MgpuPassSeg& seg = m_passCur.segs.back();
+        seg.vpW     = m_passVpW;
+        seg.vpH     = m_passVpH;
+        seg.vpFlags = seg.drawn ? (seg.vpFlags | m_passVpFlags) : m_passVpFlags;
+      }
+    }
+
+    void MgpuPassBind(uint32_t W, uint32_t H, uint32_t Colors, bool Depth, bool Msaa) {
+      m_passRtW     = W;
+      m_passRtH     = H;
+      m_passColors  = Colors;
+      m_passDepth   = Depth;
+      m_passMsaa    = Msaa;
+
+      if (unlikely(m_passActive))
+        MgpuPassOpen(MgpuPassKindRt);
+    }
+
+    void MgpuPassOpen(uint32_t Kind);
+    void MgpuPassFrame();
+    void MgpuPassPoll();
+    void MgpuPassReport();
+
+    bool              m_passActive  = false;
+    uint32_t          m_passKind    = 0u;
+    uint32_t          m_passRtW     = 0u;
+    uint32_t          m_passRtH     = 0u;
+    uint32_t          m_passColors  = 0u;
+    bool              m_passDepth   = false;
+    bool              m_passMsaa    = false;
+    uint32_t          m_passVpW     = 0u;
+    uint32_t          m_passVpH     = 0u;
+    uint32_t          m_passVpFlags = 0u;
+    uint64_t          m_passFrame   = 0u;
+    uint32_t          m_passFrames  = 0u;
+    uint32_t          m_passDropped = 0u;
+    MgpuPassRecord    m_passCur;
+    std::deque<MgpuPassRecord> m_passPending;
+    std::map<std::array<uint32_t, 4>, MgpuPassAgg> m_passAgg;
 
     struct MgpuSpanSlot {
       Rc<DxvkQuery> s0, e0, s1, e1;

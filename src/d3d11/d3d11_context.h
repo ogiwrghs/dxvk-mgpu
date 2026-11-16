@@ -943,6 +943,8 @@ namespace dxvk {
 
     void ApplyViewportState();
 
+    uint32_t MgpuPassUavInfo();
+
     void BatchDraw(
       const VkDrawIndirectCommand&            draw);
 

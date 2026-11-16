@@ -1445,6 +1445,7 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::DrawAuto() {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
+    GetTypedContext()->MgpuPassDraw();
 
     D3D11Buffer* buffer = m_state.ia.vertexBuffers[0].buffer.ptr();
 
@@ -1486,6 +1487,7 @@ namespace dxvk {
           UINT            StartVertexLocation) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
+    GetTypedContext()->MgpuPassDraw();
 
     if (unlikely(!VertexCount))
       return;
@@ -1507,6 +1509,7 @@ namespace dxvk {
           INT             BaseVertexLocation) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
+    GetTypedContext()->MgpuPassDraw();
 
     if (unlikely(!IndexCount))
       return;
@@ -1532,6 +1535,7 @@ namespace dxvk {
           UINT            StartInstanceLocation) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
+    GetTypedContext()->MgpuPassDraw();
 
     if (unlikely(!VertexCountPerInstance || !InstanceCount))
       return;
@@ -1555,6 +1559,7 @@ namespace dxvk {
           UINT            StartInstanceLocation) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
+    GetTypedContext()->MgpuPassDraw();
 
     if (unlikely(!IndexCountPerInstance || !InstanceCount))
       return;
@@ -1578,6 +1583,7 @@ namespace dxvk {
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
+    GetTypedContext()->MgpuPassDraw();
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (unlikely(HasDirtyGraphicsBindings()))
@@ -1620,6 +1626,7 @@ namespace dxvk {
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
+    GetTypedContext()->MgpuPassDraw();
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (unlikely(HasDirtyGraphicsBindings()))
@@ -1663,6 +1670,11 @@ namespace dxvk {
           UINT            ThreadGroupCountZ) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
+
+    if (unlikely(GetTypedContext()->MgpuPassProfiling())) {
+      GetTypedContext()->MgpuPassCompute(ThreadGroupCountX,
+        ThreadGroupCountY, ThreadGroupCountZ, MgpuPassUavInfo());
+    }
 
     if (unlikely(!ThreadGroupCountX || !ThreadGroupCountY || !ThreadGroupCountZ))
       return;
@@ -1754,6 +1766,9 @@ namespace dxvk {
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
+
+    if (unlikely(GetTypedContext()->MgpuPassProfiling()))
+      GetTypedContext()->MgpuPassCompute(0u, 0u, 0u, MgpuPassUavInfo());
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     AddCost(GpuCostEstimate::DispatchIndirect);
@@ -4251,6 +4266,26 @@ namespace dxvk {
   float MgpuGetSplitRatio();
 
 
+  // PASSTIME: what the first compute UAV is, packed into 32 bits.
+  // 0 = none; top bit set = buffer, low bits its byte length; else an
+  // image, width in the high half and height in the low half.
+  template<typename ContextType>
+  uint32_t D3D11CommonContext<ContextType>::MgpuPassUavInfo() {
+    auto uav0 = m_state.uav.views[0].ptr();
+
+    if (!uav0)
+      return 0u;
+
+    if (uav0->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+      return 0x80000000u | uint32_t(std::min<uint64_t>(uav0->GetViewInfo().Buffer.Length, 0x7fffffffu));
+
+    Com<ID3D11Resource> res;
+    uav0->GetResource(&res);
+    auto d = GetCommonTexture(res.ptr())->Desc();
+    return (std::min<uint32_t>(d->Width, 0x7fffu) << 16) | std::min<uint32_t>(d->Height, 0xffffu);
+  }
+
+
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::ApplyViewportState() {
     uint32_t viewportCount = m_state.rs.numViewports;
@@ -4290,6 +4325,9 @@ namespace dxvk {
       // corner so we can get away with flipping the viewport.
       for (uint32_t i = 0; i < viewportCount; i++) {
         const auto& vp = m_state.rs.viewports[i];
+
+        if (i == 0u && enableScissorTest)
+          GetTypedContext()->MgpuPassViewport(vp.Width, vp.Height, true, false);
 
         auto* dst = new (m_csData->at(i)) DxvkViewport();
         dst->viewport.x = vp.TopLeftX;
@@ -4332,6 +4370,9 @@ namespace dxvk {
             splitFrame
               ? uint32_t(std::max(1.0f, vp.Height * splitRatio))
               : D3D11_VIEWPORT_BOUNDS_MAX };
+
+          if (i == 0u)
+            GetTypedContext()->MgpuPassViewport(vp.Width, vp.Height, false, splitFrame);
         } else if (i < m_state.rs.numScissors) {
           const auto& sr = m_state.rs.scissors[i];
 
@@ -4728,6 +4769,28 @@ namespace dxvk {
           " primaryDsv=", attachments.depth.view != nullptr,
           " workerDsv=", workerAttachments.depth.view != nullptr));
       }
+    }
+
+    // PASSTIME: a render target change starts a new timed segment.
+    // Called before the bind is emitted so the timestamp lands after
+    // the previous target's draws.
+    {
+      uint32_t colors = 0u;
+      VkExtent3D extent = { 0u, 0u, 0u };
+
+      for (UINT i = 0; i < m_state.om.rtvs.size(); i++) {
+        if (attachments.color[i].view != nullptr) {
+          if (!colors)
+            extent = attachments.color[i].view->mipLevelExtent(0);
+          colors += 1u;
+        }
+      }
+
+      if (!colors && attachments.depth.view != nullptr)
+        extent = attachments.depth.view->mipLevelExtent(0);
+
+      GetTypedContext()->MgpuPassBind(extent.width, extent.height, colors,
+        attachments.depth.view != nullptr, sampleCount > 1u);
     }
 
     // Create and bind the framebuffer object to the context

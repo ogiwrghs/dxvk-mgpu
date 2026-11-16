@@ -3680,7 +3680,265 @@ namespace dxvk {
   }
 
 
+  void D3D11ImmediateContext::MgpuPassOpen(uint32_t Kind) {
+    m_passKind = Kind;
+
+    // A frame with more segments than this is not worth a timestamp
+    // each; the tail is charged to the last segment opened.
+    if (m_passCur.segs.size() >= 1024u)
+      return;
+
+    MgpuPassSeg seg;
+    seg.kind = Kind;
+
+    if (Kind == MgpuPassKindRt) {
+      seg.rtW     = m_passRtW;
+      seg.rtH     = m_passRtH;
+      seg.colors  = m_passColors;
+      seg.depth   = m_passDepth;
+      seg.msaa    = m_passMsaa;
+      seg.vpW     = m_passVpW;
+      seg.vpH     = m_passVpH;
+      seg.vpFlags = m_passVpFlags;
+    }
+
+    seg.q[0] = m_device->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+
+    EmitCs([cQuery = seg.q[0]] (DxvkContext* ctx) {
+      ctx->writeTimestamp(cQuery);
+    });
+
+    if (HasWorkerDevice()) {
+      seg.q[1] = m_parent->GetWorkerDXVKDevice()->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+
+      EmitWorkerCs([cQuery = seg.q[1]] (DxvkContext* ctx) {
+        ctx->writeTimestamp(cQuery);
+      });
+    }
+
+    m_passCur.segs.push_back(std::move(seg));
+  }
+
+
+  void D3D11ImmediateContext::MgpuPassFrame() {
+    static const bool s_enabled = env::getEnvVar("DXVK_MGPU_PASSTIME") == "1";
+
+    if (likely(!s_enabled))
+      return;
+
+    m_passFrame += 1u;
+
+    // Close the profiled frame with one last timestamp per device.
+    if (m_passActive) {
+      m_passActive = false;
+
+      m_passCur.end[0] = m_device->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+
+      EmitCs([cQuery = m_passCur.end[0]] (DxvkContext* ctx) {
+        ctx->writeTimestamp(cQuery);
+      });
+
+      if (HasWorkerDevice()) {
+        m_passCur.end[1] = m_parent->GetWorkerDXVKDevice()->createGpuQuery(VK_QUERY_TYPE_TIMESTAMP, 0, 0);
+
+        EmitWorkerCs([cQuery = m_passCur.end[1]] (DxvkContext* ctx) {
+          ctx->writeTimestamp(cQuery);
+        });
+      }
+
+      m_passCur.frame = m_passFrame;
+      m_passPending.push_back(std::move(m_passCur));
+      m_passCur = MgpuPassRecord();
+    }
+
+    MgpuPassPoll();
+
+    // The profiled frame runs from this Present to the next, so it
+    // opens with the present itself (HUD, composite, swap).
+    if ((m_passFrame % 32u) == 0u) {
+      m_passActive = true;
+      MgpuPassOpen(MgpuPassKindPresent);
+    }
+  }
+
+
+  void D3D11ImmediateContext::MgpuPassPoll() {
+    while (!m_passPending.empty()) {
+      MgpuPassRecord& rec = m_passPending.front();
+      uint64_t age = m_passFrame - rec.frame;
+
+      if (age < 4u)
+        return;
+
+      uint32_t devices = rec.end[1] != nullptr ? 2u : 1u;
+      DxvkQueryData endData[2] = { };
+      bool ready = true;
+
+      for (uint32_t d = 0; d < devices; d++)
+        ready = ready && rec.end[d]->getData(endData[d]) == DxvkGpuQueryStatus::Available;
+
+      if (!ready) {
+        if (age < 120u)
+          return;
+
+        m_passDropped += 1u;
+        m_passPending.pop_front();
+        continue;
+      }
+
+      // Every earlier timestamp of a device is available once its
+      // last one is; a missing one drops the whole frame.
+      std::vector<std::array<uint64_t, 2>> ticks(rec.segs.size() + 1u);
+      bool complete = true;
+
+      for (size_t i = 0; i < rec.segs.size() && complete; i++) {
+        for (uint32_t d = 0; d < devices; d++) {
+          DxvkQueryData data = { };
+          if (rec.segs[i].q[d]->getData(data) != DxvkGpuQueryStatus::Available) {
+            complete = false;
+            break;
+          }
+          ticks[i][d] = data.timestamp.time;
+        }
+      }
+
+      if (!complete) {
+        m_passDropped += 1u;
+        m_passPending.pop_front();
+        continue;
+      }
+
+      for (uint32_t d = 0; d < devices; d++)
+        ticks[rec.segs.size()][d] = endData[d].timestamp.time;
+
+      double period[2] = { 1.0, 1.0 };
+      period[0] = m_device->properties().core.properties.limits.timestampPeriod;
+
+      if (devices > 1u)
+        period[1] = m_parent->GetWorkerDXVKDevice()->properties().core.properties.limits.timestampPeriod;
+
+      for (size_t i = 0; i < rec.segs.size(); i++) {
+        const MgpuPassSeg& seg = rec.segs[i];
+
+        bool isRt      = seg.kind == MgpuPassKindRt;
+        bool isCompute = seg.kind == MgpuPassKindCompute;
+
+        std::array<uint32_t, 4> key = {
+          (seg.kind << 28) | (seg.colors << 8) | (seg.depth ? 16u : 0u) | (seg.msaa ? 1u : 0u),
+          (seg.rtW << 16) | (seg.rtH & 0xffffu),
+          isRt ? ((seg.vpW << 16) | (seg.vpH & 0xffffu)) : 0u,
+          isRt ? seg.vpFlags : 0u };
+
+        if (isCompute) {
+          key[1] = (std::min(seg.groups[0], 0xffffu) << 16) | std::min(seg.groups[1], 0xffffu);
+          key[2] = seg.groups[2];
+          key[3] = seg.uav;
+        }
+
+        MgpuPassAgg& agg = m_passAgg[key];
+        agg.segs += 1u;
+
+        for (uint32_t d = 0; d < devices; d++) {
+          if (ticks[i + 1u][d] > ticks[i][d])
+            agg.ns[d] += double(ticks[i + 1u][d] - ticks[i][d]) * period[d];
+        }
+      }
+
+      m_passFrames += 1u;
+      m_passPending.pop_front();
+
+      if (m_passFrames >= 16u)
+        MgpuPassReport();
+    }
+  }
+
+
+  void D3D11ImmediateContext::MgpuPassReport() {
+    struct Row {
+      std::array<uint32_t, 4> key;
+      MgpuPassAgg             agg;
+    };
+
+    std::vector<Row> rows;
+    double total[2] = { 0.0, 0.0 };
+    uint64_t totalSegs = 0u;
+
+    for (const auto& e : m_passAgg) {
+      rows.push_back({ e.first, e.second });
+      total[0]  += e.second.ns[0];
+      total[1]  += e.second.ns[1];
+      totalSegs += e.second.segs;
+    }
+
+    std::sort(rows.begin(), rows.end(), [] (const Row& a, const Row& b) {
+      return a.agg.ns[0] + a.agg.ns[1] > b.agg.ns[0] + b.agg.ns[1];
+    });
+
+    double frames = double(m_passFrames);
+    double other[2] = { 0.0, 0.0 };
+
+    for (const Row& r : rows) {
+      double ms0 = r.agg.ns[0] * 1.0e-6 / frames;
+      double ms1 = r.agg.ns[1] * 1.0e-6 / frames;
+
+      if (ms0 < 0.05 && ms1 < 0.05) {
+        other[0] += ms0;
+        other[1] += ms1;
+        continue;
+      }
+
+      uint32_t kind = r.key[0] >> 28;
+      const char* kindName = kind == MgpuPassKindCompute ? "compute"
+                           : kind == MgpuPassKindPresent ? "present" : "rt";
+      uint32_t flags = r.key[3];
+
+      if (kind == MgpuPassKindCompute) {
+        uint32_t uav = r.key[3];
+        std::string target = !uav ? std::string("none")
+          : (uav & 0x80000000u) ? str::format("buf:", uav & 0x7fffffffu)
+          : str::format("img:", uav >> 16, "x", uav & 0xffffu);
+
+        Logger::warn(str::format("PASSTIME compute",
+          " groups=", r.key[1] >> 16, "x", r.key[1] & 0xffffu, "x", r.key[2],
+          " uav0=", target,
+          " segs=", double(r.agg.segs) / frames,
+          " us_per_seg0=", r.agg.ns[0] * 1.0e-3 / double(r.agg.segs),
+          " gpu0_ms=", ms0,
+          " gpu1_ms=", ms1));
+        continue;
+      }
+
+      Logger::warn(str::format("PASSTIME ", kindName,
+        " rt=", r.key[1] >> 16, "x", r.key[1] & 0xffffu,
+        " c=", (r.key[0] >> 8) & 0xfu,
+        " d=", (r.key[0] & 16u) ? 1 : 0,
+        " msaa=", r.key[0] & 1u,
+        " vp=", r.key[2] >> 16, "x", r.key[2] & 0xffffu,
+        " flags=", (flags & MgpuPassVpSplit) ? "S" : "",
+                   (flags & MgpuPassVpAppScissor) ? "A" : "",
+                   (flags & MgpuPassVpFull) ? "F" : "",
+        " segs=", double(r.agg.segs) / frames,
+        " gpu0_ms=", ms0,
+        " gpu1_ms=", ms1));
+    }
+
+    Logger::warn(str::format("PASSTIME total frames=", m_passFrames,
+      " segs=", double(totalSegs) / frames,
+      " gpu0_ms=", total[0] * 1.0e-6 / frames,
+      " gpu1_ms=", total[1] * 1.0e-6 / frames,
+      " other0_ms=", other[0],
+      " other1_ms=", other[1],
+      " dropped=", m_passDropped));
+
+    m_passAgg.clear();
+    m_passFrames  = 0u;
+    m_passDropped = 0u;
+  }
+
+
   void D3D11ImmediateContext::MgpuFrameSpanEnd() {
+    MgpuPassFrame();
+
     if (!HasWorkerDevice())
       return;
 
