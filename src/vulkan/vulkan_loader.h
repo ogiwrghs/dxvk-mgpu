@@ -319,6 +319,7 @@ namespace dxvk::vk {
     VULKAN_FN(vkCmdDrawIndexedIndirect);
     VULKAN_FN(vkCmdDrawIndexedIndirectCount);
     VULKAN_FN(vkCmdDispatch);
+    VULKAN_FN(vkCmdDispatchBase);
     VULKAN_FN(vkCmdDispatchIndirect);
     VULKAN_FN(vkCmdCopyBuffer);
     VULKAN_FN(vkCmdCopyBuffer2);

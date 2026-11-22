@@ -457,7 +457,9 @@ namespace dxvk {
       uint64_t  segs  = 0u;
     };
 
-    void MgpuPassDraw() {
+    // Returns true when this draw is the first after a render target
+    // change in a frame whose dependency graph is being dumped.
+    bool MgpuPassDraw() {
       if (unlikely(m_passActive)) {
         if (m_passKind != MgpuPassKindRt)
           MgpuPassOpen(MgpuPassKindRt);
@@ -465,6 +467,17 @@ namespace dxvk {
         if (!m_passCur.segs.empty())
           m_passCur.segs.back().drawn = true;
       }
+
+      if (unlikely(m_graphWantDraw)) {
+        m_graphWantDraw = false;
+        return true;
+      }
+
+      return false;
+    }
+
+    bool MgpuGraphDumping() const {
+      return m_graphDump;
     }
 
     bool MgpuPassProfiling() const {
@@ -520,6 +533,8 @@ namespace dxvk {
 
       if (unlikely(m_passActive))
         MgpuPassOpen(MgpuPassKindRt);
+
+      m_graphWantDraw = m_graphDump;
     }
 
     void MgpuPassOpen(uint32_t Kind);
@@ -528,6 +543,10 @@ namespace dxvk {
     void MgpuPassReport();
 
     bool              m_passActive  = false;
+    bool              m_graphDump     = false;
+    bool              m_graphWantDraw = false;
+    uint64_t          m_graphFrame    = 0u;
+    uint32_t          m_graphDumps    = 0u;
     uint32_t          m_passKind    = 0u;
     uint32_t          m_passRtW     = 0u;
     uint32_t          m_passRtH     = 0u;

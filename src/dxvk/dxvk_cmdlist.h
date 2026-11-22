@@ -815,6 +815,23 @@ namespace dxvk {
       m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
       m_vkd->vkCmdDispatch(getCmdBuffer(cmdBuffer), x, y, z);
     }
+
+
+    void cmdDispatchBase(
+            DxvkCmdBuffer           cmdBuffer,
+            uint32_t                baseX,
+            uint32_t                baseY,
+            uint32_t                baseZ,
+            uint32_t                x,
+            uint32_t                y,
+            uint32_t                z) {
+     if (unlikely(m_checkpoints))
+        debugDispatch(cmdBuffer, "DispatchBase", x, y, z);
+
+      m_cmd.execCommands |= cmdBuffer == DxvkCmdBuffer::ExecBuffer;
+      m_vkd->vkCmdDispatchBase(getCmdBuffer(cmdBuffer),
+        baseX, baseY, baseZ, x, y, z);
+    }
     
     
     void cmdDispatchIndirect(

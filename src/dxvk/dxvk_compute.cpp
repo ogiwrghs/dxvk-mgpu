@@ -2,6 +2,7 @@
 #include <iomanip>
 #include <sstream>
 
+#include "../util/util_env.h"
 #include "../util/util_time.h"
 
 #include "dxvk_compute.h"
@@ -115,6 +116,19 @@ namespace dxvk {
     info.stage                = *stageInfo.getStageInfos();
     info.layout               = layout->getPipelineLayout();
     info.basePipelineIndex    = -1;
+
+    // The experimental multi-GPU compute split (DXVK_MGPU_COMPUTE_SPLIT=1)
+    // dispatches with a non-zero base, which needs this at creation.
+    // Off otherwise: no pipeline changes unless the experiment is on.
+    static const bool s_dispatchBase =
+      env::getEnvVar("DXVK_MGPU_COMPUTE_SPLIT") == "1";
+
+    if (s_dispatchBase) {
+      info.flags = VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
+
+      if (flags.flags)
+        flags.flags |= VK_PIPELINE_CREATE_2_DISPATCH_BASE_BIT;
+    }
 
     if (flags.flags)
       flags.pNext = std::exchange(info.pNext, &flags);

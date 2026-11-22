@@ -3939,6 +3939,28 @@ namespace dxvk {
   void D3D11ImmediateContext::MgpuFrameSpanEnd() {
     MgpuPassFrame();
 
+    // CGRAPH: dump one frame's dispatch and render target reads and
+    // writes every 1024 frames, eight times at most. Early dumps land
+    // in the menu; the later ones are the level.
+    {
+      static const bool s_graph = env::getEnvVar("DXVK_MGPU_DUMP_GRAPH") == "1";
+
+      if (unlikely(s_graph)) {
+        if (m_graphDump)
+          Logger::warn(str::format("CGRAPH end frame=", m_graphFrame));
+
+        m_graphFrame   += 1u;
+        m_graphDump     = (m_graphFrame % 1024u) == 0u && m_graphDumps < 8u;
+        m_graphWantDraw = false;
+
+        if (m_graphDump) {
+          m_graphDumps += 1u;
+          Logger::warn(str::format("CGRAPH begin frame=", m_graphFrame,
+            " ratio=", MgpuGetSplitRatio()));
+        }
+      }
+    }
+
     if (!HasWorkerDevice())
       return;
 

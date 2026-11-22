@@ -1,3 +1,5 @@
+#include "../util/util_env.h"
+
 #include "dxvk_device.h"
 #include "dxvk_pipemanager.h"
 #include "dxvk_shader.h"
@@ -564,6 +566,17 @@ namespace dxvk {
     info.stage        = *stageInfo.getStageInfos();
     info.layout       = getPipelineLibraryLayout()->getPipelineLayout();
     info.basePipelineIndex = -1;
+
+    // See DxvkComputePipeline: only for DXVK_MGPU_COMPUTE_SPLIT=1.
+    static const bool s_dispatchBase =
+      env::getEnvVar("DXVK_MGPU_COMPUTE_SPLIT") == "1";
+
+    if (s_dispatchBase) {
+      info.flags = VK_PIPELINE_CREATE_DISPATCH_BASE_BIT;
+
+      if (flagsInfo.flags)
+        flagsInfo.flags |= VK_PIPELINE_CREATE_2_DISPATCH_BASE_BIT;
+    }
 
     if (flagsInfo.flags)
       flagsInfo.pNext = std::exchange(info.pNext, &flagsInfo);

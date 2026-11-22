@@ -995,6 +995,25 @@ namespace dxvk {
   }
   
   
+  void DxvkContext::dispatchBase(
+          uint32_t baseY,
+          uint32_t x,
+          uint32_t y,
+          uint32_t z) {
+    MGPU_CTX_COUNT();
+    if (this->commitComputeState<false>()) {
+      m_queryManager.beginQueries(m_cmd,
+        VK_QUERY_TYPE_PIPELINE_STATISTICS);
+
+      m_cmd->cmdDispatchBase(DxvkCmdBuffer::ExecBuffer, 0u, baseY, 0u, x, y, z);
+      m_cmd->addStatCtr(DxvkStatCounter::CmdDispatchCalls, 1u);
+
+      m_queryManager.endQueries(m_cmd,
+        VK_QUERY_TYPE_PIPELINE_STATISTICS);
+    }
+  }
+
+
   void DxvkContext::dispatchIndirect(
           VkDeviceSize      offset) {
     MGPU_CTX_COUNT();

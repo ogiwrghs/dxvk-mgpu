@@ -762,6 +762,25 @@ namespace dxvk {
             uint32_t          x,
             uint32_t          y,
             uint32_t          z);
+
+    /**
+     * \brief Starts compute jobs for part of a grid
+     *
+     * Runs \c y rows of thread groups starting at row
+     * \c baseY. Thread IDs seen by the shader include
+     * the base, so the groups compute the same threads
+     * they would in a full dispatch. Used to split a
+     * screen-shaped dispatch between two devices.
+     * \param [in] baseY First row of thread groups
+     * \param [in] x Number of groups in X direction
+     * \param [in] y Number of group rows to run
+     * \param [in] z Number of groups in Z direction
+     */
+    void dispatchBase(
+            uint32_t          baseY,
+            uint32_t          x,
+            uint32_t          y,
+            uint32_t          z);
     
     /**
      * \brief Indirect dispatch call

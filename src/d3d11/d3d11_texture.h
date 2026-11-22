@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "../util/util_small_vector.h"
 
 #include "../dxvk/dxvk_cs.h"
@@ -117,6 +119,24 @@ namespace dxvk {
     const D3D11_COMMON_TEXTURE_DESC* Desc() const {
       return &m_desc;
     }
+
+    /**
+     * \brief Multi-GPU: texture must be complete on both devices
+     *
+     * Set once a compute dispatch that is not split between the
+     * devices reads this texture: it may look at any row, so no
+     * dispatch that writes the texture may be split either.
+     * \returns \c true if the flag was newly set
+     */
+    bool MgpuSetNeedsWhole() {
+      return !m_mgpuNeedsWhole.exchange(true, std::memory_order_relaxed);
+    }
+
+    bool MgpuNeedsWhole() const {
+      return m_mgpuNeedsWhole.load(std::memory_order_relaxed);
+    }
+
+    std::atomic<bool> m_mgpuNeedsWhole = { false };
 
     /**
      * \brief Retrieves D3D11 texture type

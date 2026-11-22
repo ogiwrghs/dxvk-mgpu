@@ -165,7 +165,8 @@ namespace dxvk {
     VkExtent2D PresentExtent() const;
 
     // PASSTIME is immediate-only; a deferred context records nothing.
-    void MgpuPassDraw() { }
+    bool MgpuPassDraw() { return false; }
+    bool MgpuGraphDumping() const { return false; }
     bool MgpuPassProfiling() const { return false; }
     void MgpuPassCompute(uint32_t, uint32_t, uint32_t, uint32_t) { }
     void MgpuPassViewport(float, float, bool, bool) { }

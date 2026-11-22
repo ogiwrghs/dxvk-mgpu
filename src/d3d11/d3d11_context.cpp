@@ -1,6 +1,8 @@
 #include <algorithm>
 
 #include <atomic>
+#include <cmath>
+#include <cstdio>
 #include <vector>
 
 #include "../util/util_env.h"
@@ -64,6 +66,8 @@ namespace dxvk {
   }
 
   std::atomic<MgpuCallCounter*> MgpuCallCounter::s_head = { nullptr };
+
+  float MgpuGetSplitRatio();
 
   bool g_mgpuCallTime = env::getEnvVar("DXVK_MGPU_CALLTIME") == "1";
 
@@ -1445,7 +1449,8 @@ namespace dxvk {
   void STDMETHODCALLTYPE D3D11CommonContext<ContextType>::DrawAuto() {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
-    GetTypedContext()->MgpuPassDraw();
+    if (unlikely(GetTypedContext()->MgpuPassDraw()))
+      MgpuGraphDraw();
 
     D3D11Buffer* buffer = m_state.ia.vertexBuffers[0].buffer.ptr();
 
@@ -1487,7 +1492,8 @@ namespace dxvk {
           UINT            StartVertexLocation) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
-    GetTypedContext()->MgpuPassDraw();
+    if (unlikely(GetTypedContext()->MgpuPassDraw()))
+      MgpuGraphDraw();
 
     if (unlikely(!VertexCount))
       return;
@@ -1509,7 +1515,8 @@ namespace dxvk {
           INT             BaseVertexLocation) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
-    GetTypedContext()->MgpuPassDraw();
+    if (unlikely(GetTypedContext()->MgpuPassDraw()))
+      MgpuGraphDraw();
 
     if (unlikely(!IndexCount))
       return;
@@ -1535,7 +1542,8 @@ namespace dxvk {
           UINT            StartInstanceLocation) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
-    GetTypedContext()->MgpuPassDraw();
+    if (unlikely(GetTypedContext()->MgpuPassDraw()))
+      MgpuGraphDraw();
 
     if (unlikely(!VertexCountPerInstance || !InstanceCount))
       return;
@@ -1559,7 +1567,8 @@ namespace dxvk {
           UINT            StartInstanceLocation) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
-    GetTypedContext()->MgpuPassDraw();
+    if (unlikely(GetTypedContext()->MgpuPassDraw()))
+      MgpuGraphDraw();
 
     if (unlikely(!IndexCountPerInstance || !InstanceCount))
       return;
@@ -1583,7 +1592,8 @@ namespace dxvk {
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
-    GetTypedContext()->MgpuPassDraw();
+    if (unlikely(GetTypedContext()->MgpuPassDraw()))
+      MgpuGraphDraw();
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (unlikely(HasDirtyGraphicsBindings()))
@@ -1626,7 +1636,8 @@ namespace dxvk {
           UINT            AlignedByteOffsetForArgs) {
     D3D10DeviceLock lock = LockContext();
     MGPU_CALL_TIMED(__func__);
-    GetTypedContext()->MgpuPassDraw();
+    if (unlikely(GetTypedContext()->MgpuPassDraw()))
+      MgpuGraphDraw();
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     if (unlikely(HasDirtyGraphicsBindings()))
@@ -1737,12 +1748,129 @@ namespace dxvk {
     if (unlikely(HasDirtyComputeBindings()))
       ApplyDirtyComputeBindings();
 
-    EmitCs([=] (DxvkContext* ctx) {
-      ctx->dispatch(
-        ThreadGroupCountX,
-        ThreadGroupCountY,
-        ThreadGroupCountZ);
+    // Compute split. PASSTIME on BeamNG at 4K: over half of each GPU's
+    // frame is compute over screen-shaped images (nine 480x270 group
+    // dispatches on 3840x2160 alone are 8-10 ms), all of it run in
+    // full on both devices. Such a dispatch is split by rows like the
+    // scissor splits a draw: the primary runs the top group rows, the
+    // worker the rest through vkCmdDispatchBase, so thread IDs and
+    // therefore pixel coordinates are unchanged.
+    //
+    // Split only when the mapping from group row to screen row is as
+    // sure as it can be without reading the shader:
+    //   - a flat grid (Z == 1) whose shape matches the swapchain's
+    //   - every bound UAV is an image of that same shape, and the
+    //     largest is at least half the swapchain's width
+    //   - no buffer UAV: a pass that accumulates into a buffer (a
+    //     histogram) must see the whole image on both devices
+    // The two ranges overlap by a group row on each side of the line
+    // to absorb rounding between the scissor row and the group rows.
+    bool     splitCompute = false;
+    uint32_t topRows      = ThreadGroupCountY;
+    uint32_t baseRow      = 0u;
+
+    if (GetTypedContext()->HasWorkerDevice()) {
+      // Off by default. Splitting by group rows assumes a dispatch
+      // only reads the rows it writes; BeamNG's post-processing does
+      // not (screen-space passes read other rows), and both rules
+      // tried so far either broke the picture or ended up splitting
+      // nothing that mattered. Kept for experiments.
+      static const bool s_noComputeSplit =
+        env::getEnvVar("DXVK_MGPU_COMPUTE_SPLIT") != "1";
+
+      VkExtent2D ref = GetTypedContext()->PresentExtent();
+
+      bool candidate = !s_noComputeSplit
+                    && !GetTypedContext()->NoScissor()
+                    && ThreadGroupCountZ == 1u
+                    && ThreadGroupCountY >= 8u
+                    && ref.width && ref.height;
+
+      uint32_t images   = 0u;
+      uint32_t maxWidth = 0u;
+
+      if (candidate) {
+        float r = float(ref.width) / float(ref.height);
+        float g = float(ThreadGroupCountX) / float(ThreadGroupCountY);
+
+        candidate = std::abs(g - r) < 0.05f * r;
+
+        for (uint32_t i = 0; i < m_state.uav.maxCount && candidate; i++) {
+          auto v = m_state.uav.views[i].ptr();
+
+          if (!v)
+            continue;
+
+          if (v->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER
+           || v->GetImageView() == nullptr) {
+            candidate = false;
+            break;
+          }
+
+          VkExtent3D e = v->GetImageView()->mipLevelExtent(0);
+          float a = e.height ? float(e.width) / float(e.height) : 0.0f;
+
+          if (e.depth != 1u || std::abs(a - r) >= 0.05f * r) {
+            candidate = false;
+            break;
+          }
+
+          Com<ID3D11Resource> res;
+          v->GetResource(&res);
+
+          if (GetCommonTexture(res.ptr())->MgpuNeedsWhole()) {
+            candidate = false;
+            break;
+          }
+
+          images   += 1u;
+          maxWidth  = std::max(maxWidth, e.width);
+        }
+      }
+
+      splitCompute = candidate && images && maxWidth * 2u >= ref.width;
+
+      // A dispatch that runs whole may read any row of its inputs, so
+      // whatever writes them must run whole as well. The flag sticks
+      // to the texture and takes effect from the next frame; a chain
+      // of dependent passes settles within a few frames.
+      if (!splitCompute && !s_noComputeSplit)
+        MgpuMarkComputeInputsWhole(ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
+
+      if (splitCompute) {
+        float line = float(ThreadGroupCountY) * MgpuGetSplitRatio();
+
+        topRows = std::min(ThreadGroupCountY, uint32_t(std::ceil(line)) + 1u);
+        baseRow = uint32_t(std::max(0.0f, std::floor(line) - 1.0f));
+        baseRow = std::min(baseRow, ThreadGroupCountY - 1u);
+      }
+
+      static std::atomic<uint64_t> s_split = { 0u };
+      static std::atomic<uint64_t> s_whole = { 0u };
+      uint64_t n = splitCompute ? ++s_split : ++s_whole;
+
+      if (n <= 6u || (n % 100000u) == 0u) {
+        Logger::warn(str::format("COMPUTESPLIT ",
+          splitCompute ? "split=" : "whole=", n,
+          " groups=", ThreadGroupCountX, "x", ThreadGroupCountY, "x", ThreadGroupCountZ,
+          " images=", images, " maxw=", maxWidth,
+          " top=", topRows, " base=", baseRow));
+      }
+    }
+
+    if (unlikely(GetTypedContext()->MgpuGraphDumping())) {
+      MgpuGraphDispatch(ThreadGroupCountX, ThreadGroupCountY,
+        ThreadGroupCountZ, splitCompute);
+    }
+
+    EmitCs([
+      cX = ThreadGroupCountX,
+      cY = topRows,
+      cZ = ThreadGroupCountZ
+    ] (DxvkContext* ctx) {
+      ctx->dispatch(cX, cY, cZ);
     });
+
     if (GetTypedContext()->HasWorkerDevice()) {
       {
         static std::atomic<uint64_t> s_n = { 0u };
@@ -1750,12 +1878,24 @@ namespace dxvk {
         if (n <= 2u || (n % 100000u) == 0u)
           Logger::warn(str::format("DISPATCHMIRROR n=", n));
       }
-      GetTypedContext()->EmitWorkerCs([=] (DxvkContext* ctx) {
-        ctx->dispatch(
-          ThreadGroupCountX,
-          ThreadGroupCountY,
-          ThreadGroupCountZ);
-      });
+
+      if (splitCompute) {
+        GetTypedContext()->EmitWorkerCs([
+          cX    = ThreadGroupCountX,
+          cBase = baseRow,
+          cRows = ThreadGroupCountY - baseRow,
+          cZ    = ThreadGroupCountZ
+        ] (DxvkContext* ctx) {
+          ctx->dispatchBase(cBase, cX, cRows, cZ);
+        });
+      } else {
+        GetTypedContext()->EmitWorkerCs([=] (DxvkContext* ctx) {
+          ctx->dispatch(
+            ThreadGroupCountX,
+            ThreadGroupCountY,
+            ThreadGroupCountZ);
+        });
+      }
     }
   }
 
@@ -1769,6 +1909,13 @@ namespace dxvk {
 
     if (unlikely(GetTypedContext()->MgpuPassProfiling()))
       GetTypedContext()->MgpuPassCompute(0u, 0u, 0u, MgpuPassUavInfo());
+
+    static const bool s_computeSplit =
+      env::getEnvVar("DXVK_MGPU_COMPUTE_SPLIT") == "1";
+
+    if (s_computeSplit && GetTypedContext()->HasWorkerDevice())
+      MgpuMarkComputeInputsWhole(0u, 0u, 0u);
+
     SetDrawBuffers(pBufferForArgs, nullptr);
 
     AddCost(GpuCostEstimate::DispatchIndirect);
@@ -4264,6 +4411,115 @@ namespace dxvk {
 
 
   float MgpuGetSplitRatio();
+
+
+  // CGRAPH (DXVK_MGPU_DUMP_GRAPH=1): which images each dispatch and
+  // each render target's first draw reads and writes, for one frame
+  // now and then. A view prints as id:WxH (id = low bits of the
+  // resource pointer) or as buf:length.
+  template<typename View>
+  static std::string MgpuGraphView(View* view) {
+    if (view->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+      return "buf";
+
+    Com<ID3D11Resource> res;
+    view->GetResource(&res);
+    auto d = GetCommonTexture(res.ptr())->Desc();
+
+    char id[16];
+    std::snprintf(id, sizeof(id), "%05x",
+      unsigned((reinterpret_cast<uintptr_t>(res.ptr()) >> 4) & 0xfffffu));
+
+    return str::format(id, ":", d->Width, "x", d->Height);
+  }
+
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::MgpuGraphDraw() {
+    std::string line = "CGRAPH draw rt:";
+
+    for (UINT i = 0; i < m_state.om.rtvs.size(); i++) {
+      if (m_state.om.rtvs[i] != nullptr)
+        line += str::format(" c", i, "=", MgpuGraphView(m_state.om.rtvs[i].ptr()));
+    }
+
+    if (m_state.om.dsv != nullptr)
+      line += str::format(" d=", MgpuGraphView(m_state.om.dsv.ptr()));
+
+    line += " ps:";
+
+    const auto& srvs = m_state.srv[D3D11ShaderType::ePixel];
+
+    for (uint32_t i = 0; i < srvs.maxCount; i++) {
+      auto v = srvs.views[i].ptr();
+
+      if (v && v->GetViewInfo().Dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
+        line += str::format(" s", i, "=", MgpuGraphView(v));
+    }
+
+    Logger::warn(line);
+  }
+
+
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::MgpuGraphDispatch(
+          uint32_t X, uint32_t Y, uint32_t Z, bool Split) {
+    std::string line = str::format("CGRAPH dispatch groups=", X, "x", Y, "x", Z,
+      " split=", Split ? 1 : 0, " uav:");
+
+    for (uint32_t i = 0; i < m_state.uav.maxCount; i++) {
+      auto v = m_state.uav.views[i].ptr();
+
+      if (v)
+        line += str::format(" u", i, "=", MgpuGraphView(v));
+    }
+
+    line += " srv:";
+
+    const auto& srvs = m_state.srv[D3D11ShaderType::eCompute];
+
+    for (uint32_t i = 0; i < srvs.maxCount; i++) {
+      auto v = srvs.views[i].ptr();
+
+      if (v)
+        line += str::format(" s", i, "=", MgpuGraphView(v));
+    }
+
+    Logger::warn(line);
+  }
+
+
+  // Compute split: every image the current compute shader can read
+  // must be complete on both devices, because this dispatch is not
+  // split. Bound-but-unused views are flagged too; that only costs a
+  // split that would have been safe.
+  template<typename ContextType>
+  void D3D11CommonContext<ContextType>::MgpuMarkComputeInputsWhole(
+          uint32_t X, uint32_t Y, uint32_t Z) {
+    const auto& srvs = m_state.srv[D3D11ShaderType::eCompute];
+
+    for (uint32_t i = 0; i < srvs.maxCount; i++) {
+      auto v = srvs.views[i].ptr();
+
+      if (!v || v->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
+        continue;
+
+      Com<ID3D11Resource> res;
+      v->GetResource(&res);
+      auto texture = GetCommonTexture(res.ptr());
+
+      if (texture->MgpuSetNeedsWhole()) {
+        static std::atomic<uint32_t> s_n = { 0u };
+        uint32_t n = ++s_n;
+
+        if (n <= 200u) {
+          Logger::warn(str::format("COMPUTESPLIT needwhole #", n,
+            " tex=", MgpuGraphView(v),
+            " read by groups=", X, "x", Y, "x", Z));
+        }
+      }
+    }
+  }
 
 
   // PASSTIME: what the first compute UAV is, packed into 32 bits.

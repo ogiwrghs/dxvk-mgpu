@@ -945,6 +945,14 @@ namespace dxvk {
 
     uint32_t MgpuPassUavInfo();
 
+    void MgpuGraphDraw();
+
+    void MgpuMarkComputeInputsWhole(
+            uint32_t X, uint32_t Y, uint32_t Z);
+
+    void MgpuGraphDispatch(
+            uint32_t X, uint32_t Y, uint32_t Z, bool Split);
+
     void BatchDraw(
       const VkDrawIndirectCommand&            draw);
 
