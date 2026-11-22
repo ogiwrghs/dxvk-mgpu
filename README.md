@@ -15,21 +15,34 @@ for general use.
 
 ## Results
 
-Test system: 2x GTX 1080 Ti (MSI factory-OC on x16 Gen3 as primary,
-Founders Edition on x8 Gen3 as worker), i9-10940X, Windows VM on Proxmox KVM
-with both GPUs passed through, NVIDIA 560.94.
+Test system: 2x GTX 1080 Ti (MSI factory-OC on x16 Gen3, Founders Edition
+on x8 Gen3; the card driving the display is the primary), i9-10940X,
+Windows VM on Proxmox KVM with both GPUs passed through, NVIDIA 560.94.
 
-| Workload | Single GPU | Dual GPU | Gain | Limit |
-|---|---|---|---|---|
-| 3DMark Fire Strike GT2, 3840x2160 | 23.7 fps | 29.5 fps | **+25%** | GPUs |
-| 3DMark Fire Strike GT2, 1366x768 | 92.1 fps | 103.5 fps | +12% | application thread |
-| BeamNG.drive, 3840x2160 | ~43 fps | ~47 fps | ~+9% | GPUs (to be re-measured) |
-| BeamNG.drive, 1920x1200 | ~110 fps | ~110 fps | 0 | application thread |
+**3DMark Fire Strike, graphics test 2, 3840x2160** (3DMark's own per-test
+result; custom run, so no overall score):
 
-Fire Strike figures are the mean frame rate over a full graphics-test run,
-from the fork's own Present counters. Both GPUs are the same model, but the
-worker card runs at lower clocks under load, so it gets the smaller share of
-the frame.
+| Configuration | GT2 fps |
+|---|---|
+| Single GPU, Founders Edition (has the display) | 19.57 |
+| Single GPU, MSI | 18.39 |
+| **Both GPUs, this fork** | **31.38, 30.31** (two runs) |
+
+That is **+55-60% over the faster single card**. 3DMark itself reports one
+GPU and SLI off: the application never knows a second GPU is rendering.
+
+**Where it does not help.** The gain depends on how much of a frame can be
+split:
+
+| Workload | Single | Dual | Why |
+|---|---|---|---|
+| BeamNG.drive, empty map, 3840x2160 | 45-48 fps | 44-46 fps | over half of each GPU's frame is full-screen compute, which both GPUs run whole |
+| BeamNG.drive, West Coast USA, 1080p | 50.9 fps | 37.0 fps | the application thread is the limit; mirroring every command adds to it |
+
+Both are measured with the fork's own instruments (PASSTIME and CALLTIME,
+below), which is how the causes are known. Splitting compute by rows was
+tried and is off by default: whether a dispatch may be split depends on
+which rows its shader reads, which the bindings do not say.
 
 **Renders correctly on both GPUs:** 3DMark Fire Strike (all graphics tests
 and the physics test), BeamNG.drive, and the project's own D3D11 test
@@ -76,6 +89,15 @@ its own instruments, all off the hot path or sampled:
 - **FRAMESPAN:** per-frame GPU timestamps on both devices on one time axis
   (`VK_EXT_calibrated_timestamps`), mapped onto the CPU clock, to see which
   GPU waits for which.
+- **PASSTIME:** GPU time per render target and per kind of compute
+  dispatch, on each device, for one frame in 32. Shows which work is split
+  and which both GPUs repeat.
+- **CALLTIME:** application-thread time inside each D3D11 method, sampled.
+  Found that copying each dynamic buffer to the second GPU on the
+  application thread cost 5.2 ms per frame; that copy now runs on the
+  worker's thread.
+- **CGRAPH:** for one frame, which images each dispatch and render pass
+  reads and writes.
 
 Examples of what they found: the hull shader's max tessellation factor was
 pushed to the primary only, so the worker culled every tessellated patch;
@@ -89,17 +111,23 @@ what was measured, what was ruled out, and which earlier conclusions were
 retracted:
 
 ```
-git log --reverse 02e2028c..mgpu
+git log --reverse d647fdf3..mgpu
 ```
 
 ## Known limitations
 
-- About half of a frame's GPU work (shadows, compute, off-screen passes, and
-  all vertex work, since scissoring only splits fragments) is done in full on
-  both GPUs. That caps the gain well below 2x.
+- Work that is not a screen-space draw (compute, shadow maps, off-screen
+  passes, and all vertex work, since scissoring only splits fragments) runs
+  in full on both GPUs. How much of a frame that is decides the gain: little
+  in Fire Strike, over half in BeamNG.
+- Every command is recorded twice on the CPU, so when the application thread
+  is already the limit, two GPUs are slower than one.
 - The composite costs ~1-2.5 ms per frame per GPU at 4K and adds one frame of
   latency.
 - D3D11 only. Tested on NVIDIA only, two identical GPU models only.
+- BeamNG shows a static diagonal line where shadows drop out in the lower
+  right of the screen. Clean upstream DXVK at this fork's base does the same;
+  native D3D11 does not.
 - Some mirror paths are still immediate-context only or use staging copies.
 
 ## Building
@@ -127,6 +155,10 @@ two lines fixed.
 | `DXVK_MGPU_NO_PIPELINE=1` | synchronous composite instead of frame-behind |
 | `DXVK_MGPU_DUMP_RT=WxH[@N]` | RTDUMP every N presents |
 | `DXVK_MGPU_DUMP_BUF=N` | BUFDUMP every N presents |
+| `DXVK_MGPU_PASSTIME=1` | per-pass GPU timing |
+| `DXVK_MGPU_CALLTIME=1` | per-method CPU timing |
+| `DXVK_MGPU_DUMP_GRAPH=1` | one frame's read/write graph |
+| `DXVK_MGPU_COMPUTE_SPLIT=1` | experimental compute split (breaks BeamNG's post-processing) |
 
 ## License and credit
 
