@@ -41,13 +41,15 @@ split:
 
 | Workload | Single | Dual | Why |
 |---|---|---|---|
-| BeamNG.drive, empty map, 3840x2160 | 45-48 fps | 44-46 fps | over half of each GPU's frame is full-screen compute, which both GPUs run whole |
+| BeamNG.drive, empty map, 3840x2160 | 44.5 fps | 45.2 fps | over half of each GPU's frame is full-screen compute, which both GPUs run whole |
 | BeamNG.drive, West Coast USA, 1080p | 50.9 fps | 37.0 fps | the application thread is the limit; mirroring every command adds to it |
 
 Both are measured with the fork's own instruments (PASSTIME and CALLTIME,
-below), which is how the causes are known. These BeamNG runs predate the
-`MGPU: roles` log line, so which card ran the single-GPU baseline was not
-recorded; they are being re-measured on the setup above. Splitting compute by rows was
+below), which is how the causes are known. Medians over a parked camera,
+both runs on the setup above (single on the MSI, dual with the MSI primary).
+The West Coast pair predates the `MGPU: roles` log line, so which card ran
+its single baseline was not recorded; that scene is limited by the
+application thread, not the GPU. Splitting compute by rows was
 tried and is off by default: whether a dispatch may be split depends on
 which rows its shader reads, which the bindings do not say.
 
