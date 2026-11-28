@@ -4420,30 +4420,46 @@ namespace dxvk {
   float MgpuGetSplitRatio();
 
 
-  // CGRAPH (DXVK_MGPU_DUMP_GRAPH=1): which images each dispatch and
-  // each render target's first draw reads and writes, for one frame
-  // now and then. A view prints as id:WxH (id = low bits of the
-  // resource pointer) or as buf:length.
+  // CGRAPH (DXVK_MGPU_DUMP_GRAPH=1): what each dispatch and draw reads
+  // and writes, for one frame now and then. Every draw and dispatch of
+  // the frame is considered; a line identical to one already printed
+  // in that frame is dropped, and #N is its place among the frame's
+  // draws and dispatches. A view prints as id:WxH, or as buf:id:length
+  // for buffers (id = low bits of the resource pointer, as in CREAD).
   template<typename View>
   static std::string MgpuGraphView(View* view) {
-    if (view->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER)
-      return "buf";
-
     Com<ID3D11Resource> res;
     view->GetResource(&res);
-    auto d = GetCommonTexture(res.ptr())->Desc();
 
     char id[16];
     std::snprintf(id, sizeof(id), "%05x",
       unsigned((reinterpret_cast<uintptr_t>(res.ptr()) >> 4) & 0xfffffu));
 
+    if (view->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+      D3D11_BUFFER_DESC desc = { };
+      static_cast<ID3D11Buffer*>(res.ptr())->GetDesc(&desc);
+      return str::format("buf:", id, ":", desc.ByteWidth);
+    }
+
+    auto d = GetCommonTexture(res.ptr())->Desc();
     return str::format(id, ":", d->Width, "x", d->Height);
+  }
+
+
+  template<typename Shader>
+  static std::string MgpuGraphShader(Shader* shader) {
+    return shader ? shader->GetCommonShader()->GetName() : std::string("none");
   }
 
 
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::MgpuGraphDraw() {
-    std::string line = "CGRAPH draw rt:";
+    VkExtent2D vp = GetTypedContext()->MgpuGraphViewport();
+
+    std::string line = str::format("draw vs=", MgpuGraphShader(m_state.vs.ptr()),
+      " ps=", MgpuGraphShader(m_state.ps.ptr()),
+      " vp=", vp.width, "x", vp.height, " ", GetTypedContext()->MgpuGraphVpFlag(),
+      " rt:");
 
     for (UINT i = 0; i < m_state.om.rtvs.size(); i++) {
       if (m_state.om.rtvs[i] != nullptr)
@@ -4460,19 +4476,20 @@ namespace dxvk {
     for (uint32_t i = 0; i < srvs.maxCount; i++) {
       auto v = srvs.views[i].ptr();
 
-      if (v && v->GetViewInfo().Dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
+      if (v)
         line += str::format(" s", i, "=", MgpuGraphView(v));
     }
 
-    Logger::warn(line);
+    if (GetTypedContext()->MgpuGraphFirst(line))
+      Logger::warn(str::format("CGRAPH #", GetTypedContext()->MgpuGraphSeq(), " ", line));
   }
 
 
   template<typename ContextType>
   void D3D11CommonContext<ContextType>::MgpuGraphDispatch(
           uint32_t X, uint32_t Y, uint32_t Z, bool Split) {
-    std::string line = str::format("CGRAPH dispatch groups=", X, "x", Y, "x", Z,
-      " split=", Split ? 1 : 0, " uav:");
+    std::string line = str::format("dispatch cs=", MgpuGraphShader(m_state.cs.ptr()),
+      " groups=", X, "x", Y, "x", Z, " split=", Split ? 1 : 0, " uav:");
 
     for (uint32_t i = 0; i < m_state.uav.maxCount; i++) {
       auto v = m_state.uav.views[i].ptr();
@@ -4492,7 +4509,8 @@ namespace dxvk {
         line += str::format(" s", i, "=", MgpuGraphView(v));
     }
 
-    Logger::warn(line);
+    if (GetTypedContext()->MgpuGraphFirst(line))
+      Logger::warn(str::format("CGRAPH #", GetTypedContext()->MgpuGraphSeq(), " ", line));
   }
 
 

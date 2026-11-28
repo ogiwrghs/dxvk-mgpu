@@ -6,6 +6,7 @@
 #include <array>
 #include <deque>
 #include <map>
+#include <unordered_set>
 #include "../util/util_time.h"
 
 #include "../util/sync/sync_signal.h"
@@ -468,12 +469,35 @@ namespace dxvk {
           m_passCur.segs.back().drawn = true;
       }
 
-      if (unlikely(m_graphWantDraw)) {
-        m_graphWantDraw = false;
+      // CGRAPH logs every draw of a dumped frame; MgpuGraphFirst drops
+      // the lines already printed in it.
+      if (unlikely(m_graphDump))
         return true;
-      }
 
       return false;
+    }
+
+    // CGRAPH: true the first time a line is seen in the dumped frame.
+    // Also numbers the frame's draws and dispatches, so the order of
+    // the printed lines can be read back.
+    bool MgpuGraphFirst(const std::string& line) {
+      m_graphSeq += 1u;
+      return m_graphLines.insert(line).second;
+    }
+
+    uint32_t MgpuGraphSeq() const {
+      return m_graphSeq;
+    }
+
+    // S: split scissor applied, A: the application's scissor (never
+    // split), F: whole target; as PASSTIME's rt flags.
+    char MgpuGraphVpFlag() const {
+      return m_passVpFlags == MgpuPassVpSplit ? 'S'
+           : m_passVpFlags == MgpuPassVpAppScissor ? 'A' : 'F';
+    }
+
+    VkExtent2D MgpuGraphViewport() const {
+      return VkExtent2D { m_passVpW, m_passVpH };
     }
 
     bool MgpuGraphDumping() const {
@@ -566,6 +590,8 @@ namespace dxvk {
     bool              m_graphWantDraw = false;
     uint64_t          m_graphFrame    = 0u;
     uint32_t          m_graphDumps    = 0u;
+    uint32_t          m_graphSeq      = 0u;
+    std::unordered_set<std::string> m_graphLines;
     uint32_t          m_passKind    = 0u;
     uint32_t          m_passRtW     = 0u;
     uint32_t          m_passRtH     = 0u;

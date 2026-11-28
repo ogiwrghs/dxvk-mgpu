@@ -4635,7 +4635,8 @@ namespace dxvk {
 
       if (unlikely(s_graph)) {
         if (m_graphDump)
-          Logger::warn(str::format("CGRAPH end frame=", m_graphFrame));
+          Logger::warn(str::format("CGRAPH end frame=", m_graphFrame,
+            " calls=", m_graphSeq, " distinct=", m_graphLines.size()));
 
         m_graphFrame   += 1u;
         m_graphDump     = (m_graphFrame % 1024u) == 0u && m_graphDumps < 8u;
@@ -4643,6 +4644,8 @@ namespace dxvk {
 
         if (m_graphDump) {
           m_graphDumps += 1u;
+          m_graphSeq    = 0u;
+          m_graphLines.clear();
           Logger::warn(str::format("CGRAPH begin frame=", m_graphFrame,
             " ratio=", MgpuGetSplitRatio()));
         }

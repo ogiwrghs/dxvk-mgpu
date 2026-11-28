@@ -167,6 +167,10 @@ namespace dxvk {
     // PASSTIME is immediate-only; a deferred context records nothing.
     bool MgpuPassDraw() { return false; }
     bool MgpuGraphDumping() const { return false; }
+    bool MgpuGraphFirst(const std::string&) { return false; }
+    uint32_t MgpuGraphSeq() const { return 0u; }
+    char MgpuGraphVpFlag() const { return 'F'; }
+    VkExtent2D MgpuGraphViewport() const { return VkExtent2D { 0u, 0u }; }
     bool MgpuReadProbing() const { return false; }
     void MgpuProbeComputeRead(uint32_t, uint32_t, uint32_t) { }
     bool MgpuPassProfiling() const { return false; }
