@@ -1863,6 +1863,13 @@ namespace dxvk {
         ThreadGroupCountZ, splitCompute);
     }
 
+    // CREAD probes run the dispatch whole on the primary; a split one
+    // would measure the split, not the shader.
+    if (unlikely(GetTypedContext()->MgpuReadProbing()) && !splitCompute) {
+      GetTypedContext()->MgpuProbeComputeRead(ThreadGroupCountX,
+        ThreadGroupCountY, ThreadGroupCountZ);
+    }
+
     EmitCs([
       cX = ThreadGroupCountX,
       cY = topRows,

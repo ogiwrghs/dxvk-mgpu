@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <unordered_set>
 
 constexpr static uint32_t MinFlushIntervalUs = 750;
 constexpr static uint32_t IncFlushIntervalUs = 250;
@@ -3936,6 +3937,693 @@ namespace dxvk {
   }
 
 
+  // CREAD: one image the probe saves, restores and possibly overwrites.
+  // All copies use the image's own format, so the bytes go in and out
+  // exactly as stored, whatever the format.
+  struct MgpuReadImage {
+    Rc<DxvkImage>             image;
+    VkImageSubresourceLayers  sub      = { };
+    VkExtent3D                extent   = { };
+    VkDeviceSize              texel    = 0u;
+    VkDeviceSize              size     = 0u;
+    VkDeviceSize              saveAt   = 0u;
+    VkDeviceSize              outAt    = 0u;
+    VkDeviceSize              poisonAt = 0u;
+    bool                      output   = false;
+    bool                      screen   = false;
+    bool                      poison   = false;
+    bool                      depth    = false;
+    std::string               label;
+    std::string               desc;
+  };
+
+
+  struct MgpuReadBuffer {
+    DxvkBufferSlice           slice;
+    VkDeviceSize              saveAt   = 0u;
+    VkDeviceSize              outAt    = 0u;
+    std::string               label;
+  };
+
+
+  struct MgpuReadRows {
+    uint32_t diffRows = 0u;
+    uint32_t top      = 0u;
+    uint32_t bottom   = 0u;
+    int32_t  minRow   = -1;
+    int32_t  maxRow   = -1;
+  };
+
+
+  template<typename View>
+  static std::string MgpuReadId(View* view) {
+    Com<ID3D11Resource> res;
+    view->GetResource(&res);
+
+    char id[16];
+    std::snprintf(id, sizeof(id), "%05x",
+      unsigned((reinterpret_cast<uintptr_t>(res.ptr()) >> 4) & 0xfffffu));
+    return id;
+  }
+
+
+  // Screen-shaped: within 5% of the swapchain's aspect, as the scissor
+  // and the old compute split decide it. Only for these does "the
+  // bottom half of the rows" mean the bottom half of the screen.
+  static bool MgpuReadScreenShaped(VkExtent3D e, VkExtent2D ref) {
+    if (!ref.width || !ref.height || e.height < 8u || e.depth != 1u)
+      return false;
+
+    float r = float(ref.width) / float(ref.height);
+    float a = float(e.width) / float(e.height);
+    return std::abs(a - r) < 0.05f * r;
+  }
+
+
+  static bool MgpuReadImageFromView(
+    const Rc<DxvkImageView>&  view,
+          MgpuReadImage&      entry,
+          std::string&        why) {
+    if (view == nullptr) {
+      why = "noview";
+      return false;
+    }
+
+    DxvkImageViewKey key = view->info();
+
+    if (key.viewType != VK_IMAGE_VIEW_TYPE_2D
+     && key.viewType != VK_IMAGE_VIEW_TYPE_2D_ARRAY) {
+      why = str::format("viewtype=", uint32_t(key.viewType));
+      return false;
+    }
+
+    if (key.layerCount != 1u) {
+      why = str::format("layers=", key.layerCount);
+      return false;
+    }
+
+    DxvkImage* image = view->image();
+
+    if (image->info().sampleCount != VK_SAMPLE_COUNT_1_BIT) {
+      why = "msaa";
+      return false;
+    }
+
+    VkFormat format = image->info().format;
+    auto fi = lookupFormatInfo(format);
+
+    if (fi->flags.test(DxvkFormatFlag::BlockCompressed)) {
+      why = str::format("compressed fmt=", uint32_t(format));
+      return false;
+    }
+
+    bool depth = (fi->aspectMask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0u;
+
+    // Depth is copied as its own aspect, which a plain buffer copy lays
+    // out as 2 bytes per texel for D16 and 4 for the others (D24 in the
+    // low 24 bits, D32 as a float). Stencil is never touched.
+    VkDeviceSize texel = fi->elementSize;
+
+    if (depth) {
+      switch (format) {
+        case VK_FORMAT_D16_UNORM:          texel = 2u; break;
+        case VK_FORMAT_D24_UNORM_S8_UINT:
+        case VK_FORMAT_X8_D24_UNORM_PACK32:
+        case VK_FORMAT_D32_SFLOAT:
+        case VK_FORMAT_D32_SFLOAT_S8_UINT: texel = 4u; break;
+        default:
+          why = str::format("depthfmt=", uint32_t(format));
+          return false;
+      }
+    } else if (fi->aspectMask != VK_IMAGE_ASPECT_COLOR_BIT) {
+      why = str::format("aspects=", uint32_t(fi->aspectMask));
+      return false;
+    }
+
+    entry.image              = image;
+    entry.depth              = depth;
+    entry.sub.aspectMask     = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    entry.sub.mipLevel       = key.mipIndex;
+    entry.sub.baseArrayLayer = key.layerIndex;
+    entry.sub.layerCount     = 1u;
+    entry.extent             = image->mipLevelExtent(key.mipIndex);
+    entry.texel              = texel;
+
+    // Spaced by the whole format's element size, which is what DXVK
+    // assumes for the buffer range it tracks, even when one aspect of a
+    // depth-stencil image needs less.
+    entry.size               = VkDeviceSize(entry.extent.width) * entry.extent.height
+                             * std::max<VkDeviceSize>(texel, fi->elementSize);
+
+    entry.desc = str::format(entry.extent.width, "x", entry.extent.height,
+      " fmt=", uint32_t(format), " mip=", uint32_t(key.mipIndex));
+
+    if (key.mipCount > 1u)
+      entry.desc += str::format("/", uint32_t(key.mipCount));
+
+    return true;
+  }
+
+
+  static MgpuReadRows MgpuReadCompareRows(
+    const uint8_t*            a,
+    const uint8_t*            b,
+          VkExtent3D          extent,
+          VkDeviceSize        texel) {
+    MgpuReadRows result;
+
+    VkDeviceSize row  = VkDeviceSize(extent.width) * texel;
+    uint32_t     line = extent.height / 2u;
+
+    for (uint32_t y = 0; y < extent.height; y++) {
+      if (!std::memcmp(a + y * row, b + y * row, row))
+        continue;
+
+      result.diffRows += 1u;
+
+      if (y < line)
+        result.top += 1u;
+      else
+        result.bottom += 1u;
+
+      if (result.minRow < 0)
+        result.minRow = int32_t(y);
+
+      result.maxRow = int32_t(y);
+    }
+
+    return result;
+  }
+
+
+  // Verdicts, worst last; the dispatch's verdict is its worst output's.
+  enum MgpuReadVerdict : uint32_t {
+    MgpuReadInsensitive = 0,
+    MgpuReadLocal       = 1,
+    MgpuReadRadius      = 2,
+    MgpuReadGlobal      = 3,
+    MgpuReadNondet      = 4,
+    MgpuReadSkipped     = 5,
+    MgpuReadVerdictCount
+  };
+
+
+  static const char* MgpuReadVerdictName(uint32_t v) {
+    static const char* names[] = {
+      "insensitive", "local", "radius", "global", "nondet", "skipped" };
+    return v < MgpuReadVerdictCount ? names[v] : "?";
+  }
+
+
+  void D3D11ImmediateContext::MgpuProbeComputeRead(
+          uint32_t                  X,
+          uint32_t                  Y,
+          uint32_t                  Z) {
+    constexpr uint32_t     MaxProbes = 128u;
+    constexpr VkDeviceSize MaxBytes  = VkDeviceSize(2u) << 30;
+
+    static std::unordered_set<std::string> s_seen;
+    static uint32_t s_probes = 0u;
+    static uint32_t s_tally[MgpuReadVerdictCount] = { };
+
+    if (s_probes >= MaxProbes || m_state.cs == nullptr)
+      return;
+
+    std::string name = m_state.cs->GetCommonShader()->GetName();
+    std::string key  = str::format(name, " ", X, "x", Y, "x", Z);
+
+    if (!s_seen.insert(key).second)
+      return;
+
+    uint32_t probe = ++s_probes;
+
+    std::string head = str::format("CREAD #", probe, " cs=", name,
+      " groups=", X, "x", Y, "x", Z);
+
+    auto tally = [&] (uint32_t verdict) {
+      s_tally[verdict] += 1u;
+
+      std::string line = str::format("CREAD tally probes=", probe);
+
+      for (uint32_t i = 0; i < MgpuReadVerdictCount; i++)
+        line += str::format(" ", MgpuReadVerdictName(i), "=", s_tally[i]);
+
+      Logger::warn(line);
+    };
+
+    VkExtent2D ref = m_readProbeRef;
+
+    std::vector<MgpuReadImage>  images;
+    std::vector<MgpuReadBuffer> buffers;
+    std::string                 skip;
+    std::string                 unpoisoned;
+    uint32_t                    unpoisonedCount = 0u;
+
+    // Outputs: every UAV. A screen-shaped image UAV is an input too
+    // (the shader may read it), so it is overwritten like an SRV.
+    for (uint32_t i = 0; i < m_state.uav.maxCount && skip.empty(); i++) {
+      auto v = m_state.uav.views[i].ptr();
+
+      if (!v)
+        continue;
+
+      std::string label = str::format("u", i);
+
+      if (v->GetCounterView() != nullptr) {
+        skip = label + " has an append/consume counter";
+        break;
+      }
+
+      if (v->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+        MgpuReadBuffer entry;
+        entry.slice = DxvkBufferSlice(v->GetBufferView());
+        entry.label = label;
+        buffers.push_back(std::move(entry));
+        continue;
+      }
+
+      MgpuReadImage entry;
+      std::string   why;
+
+      if (!MgpuReadImageFromView(v->GetImageView(), entry, why)) {
+        skip = str::format(label, " ", why);
+        break;
+      }
+
+      entry.output = true;
+      entry.screen = MgpuReadScreenShaped(entry.extent, ref);
+      entry.poison = entry.screen;
+      entry.label  = label;
+      entry.desc   = str::format(MgpuReadId(v), ":", entry.desc);
+      images.push_back(std::move(entry));
+    }
+
+    // Inputs: screen-shaped image SRVs are saved and overwritten. Any
+    // other input stays as it is and is listed, because the verdict
+    // says nothing about what the shader reads from it.
+    const auto& srvs = m_state.srv[D3D11ShaderType::eCompute];
+
+    for (uint32_t i = 0; i < srvs.maxCount && skip.empty(); i++) {
+      auto v = srvs.views[i].ptr();
+
+      if (!v)
+        continue;
+
+      std::string label = str::format("s", i);
+
+      if (v->GetViewInfo().Dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+        unpoisoned += str::format(" ", label, "=buf");
+        unpoisonedCount += 1u;
+        continue;
+      }
+
+      MgpuReadImage entry;
+      std::string   why;
+
+      if (!MgpuReadImageFromView(v->GetImageView(), entry, why)) {
+        unpoisoned += str::format(" ", label, "=", MgpuReadId(v), ":", why);
+        unpoisonedCount += 1u;
+        continue;
+      }
+
+      if (!MgpuReadScreenShaped(entry.extent, ref)) {
+        unpoisoned += str::format(" ", label, "=", MgpuReadId(v), ":",
+          entry.extent.width, "x", entry.extent.height, ":notscreen");
+        unpoisonedCount += 1u;
+        continue;
+      }
+
+      entry.screen = true;
+      entry.poison = true;
+      entry.label  = label;
+      entry.desc   = str::format(MgpuReadId(v), ":", entry.desc);
+      images.push_back(std::move(entry));
+    }
+
+    uint32_t outputs  = uint32_t(buffers.size());
+    uint32_t poisoned = 0u;
+
+    for (const auto& e : images) {
+      outputs  += e.output ? 1u : 0u;
+      poisoned += e.poison ? 1u : 0u;
+    }
+
+    if (skip.empty() && !outputs)
+      skip = "no outputs";
+
+    if (skip.empty() && !poisoned)
+      skip = str::format("nothing screen-shaped to overwrite (ref ", ref.width, "x", ref.height, ")");
+
+    // Layout: one save area for everything that gets restored, one
+    // result area per run, one area of replacement data per image.
+    VkDeviceSize saveTotal   = 0u;
+    VkDeviceSize outTotal    = 0u;
+    VkDeviceSize poisonTotal = 0u;
+
+    for (auto& e : images) {
+      e.saveAt   = saveTotal;
+      saveTotal += e.size;
+
+      if (e.output) {
+        e.outAt   = outTotal;
+        outTotal += e.size;
+      }
+
+      if (e.poison) {
+        e.poisonAt   = poisonTotal;
+        poisonTotal += e.size;
+      }
+    }
+
+    for (auto& b : buffers) {
+      b.saveAt   = saveTotal;
+      saveTotal += b.slice.length();
+      b.outAt    = outTotal;
+      outTotal  += b.slice.length();
+    }
+
+    constexpr uint32_t Runs = 4u;
+    VkDeviceSize total = saveTotal + Runs * outTotal + poisonTotal;
+
+    if (skip.empty() && total > MaxBytes)
+      skip = str::format("needs ", total >> 20, " MB");
+
+    if (!skip.empty()) {
+      Logger::warn(str::format(head, " skip: ", skip));
+      tally(MgpuReadSkipped);
+      return;
+    }
+
+    Logger::warn(str::format(head, " ref=", ref.width, "x", ref.height,
+      " outputs=", outputs, " overwritten=", poisoned,
+      " untouched=", unpoisonedCount, " mb=", total >> 20));
+
+    for (const auto& e : images) {
+      Logger::warn(str::format("CREAD #", probe, "   ", e.label,
+        e.output ? " out " : " in  ", e.desc,
+        e.poison ? " overwritten" : " kept (not screen-shaped)"));
+    }
+
+    for (const auto& b : buffers) {
+      Logger::warn(str::format("CREAD #", probe, "   ", b.label,
+        " out buf len=", b.slice.length()));
+    }
+
+    if (unpoisonedCount)
+      Logger::warn(str::format("CREAD #", probe, "   untouched:", unpoisoned));
+
+    auto makeBuffer = [this] (VkDeviceSize size, VkMemoryPropertyFlags mem, const char* debugName) {
+      DxvkBufferCreateInfo info;
+      info.size   = std::max<VkDeviceSize>(size, 256u);
+      info.usage  = VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                  | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT
+                  | VK_PIPELINE_STAGE_HOST_BIT;
+      info.access = VK_ACCESS_TRANSFER_READ_BIT
+                  | VK_ACCESS_TRANSFER_WRITE_BIT
+                  | VK_ACCESS_HOST_READ_BIT
+                  | VK_ACCESS_HOST_WRITE_BIT;
+      info.debugName = debugName;
+      return m_device->createBuffer(info, mem);
+    };
+
+    // Cached host memory for anything the CPU reads (358be5d9).
+    VkMemoryPropertyFlags hostMem = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                  | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                                  | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    Rc<DxvkBuffer> saveBuf   = makeBuffer(saveTotal, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "MGPU CREAD save");
+    Rc<DxvkBuffer> outBuf    = makeBuffer(Runs * outTotal, hostMem, "MGPU CREAD results");
+    Rc<DxvkBuffer> poisonBuf = makeBuffer(poisonTotal, hostMem, "MGPU CREAD overwrite");
+
+    uint8_t* poisonData = reinterpret_cast<uint8_t*>(poisonBuf->mapPtr(0));
+    const uint8_t* outData = reinterpret_cast<const uint8_t*>(outBuf->mapPtr(0));
+
+    if (!poisonData || !outData) {
+      Logger::warn(str::format(head, " skip: buffers not mapped"));
+      tally(MgpuReadSkipped);
+      return;
+    }
+
+    // Replacement data. Colour: pseudo-random bytes, which in float
+    // formats include NaNs and huge values, so a shader cannot read
+    // them back as a plausible copy of the original. Depth: random but
+    // valid depths, because buffer-to-image depth copies must be in
+    // range (D32 in [0,1), D24 with the top byte clear).
+    uint64_t seed = 0x9e3779b97f4a7c15ull ^ (uint64_t(probe) << 32);
+
+    auto next = [&seed] {
+      seed ^= seed << 13;
+      seed ^= seed >> 7;
+      seed ^= seed << 17;
+      return seed;
+    };
+
+    for (const auto& e : images) {
+      if (!e.poison)
+        continue;
+
+      uint8_t* dst = poisonData + e.poisonAt;
+
+      if (e.depth) {
+        VkFormat     format = e.image->info().format;
+        VkDeviceSize texels = VkDeviceSize(e.extent.width) * e.extent.height;
+
+        for (VkDeviceSize t = 0; t < texels; t++) {
+          uint64_t r = next();
+
+          if (e.texel == 2u) {
+            uint16_t d = uint16_t(r >> 48);
+            std::memcpy(dst + t * 2u, &d, 2u);
+          } else if (format == VK_FORMAT_D32_SFLOAT || format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+            float d = float(r >> 40) * (1.0f / 16777216.0f);
+            std::memcpy(dst + t * 4u, &d, 4u);
+          } else {
+            uint32_t d = uint32_t(r >> 40) & 0xffffffu;
+            std::memcpy(dst + t * 4u, &d, 4u);
+          }
+        }
+      } else {
+        for (VkDeviceSize i = 0; i < e.size; i += 8u) {
+          uint64_t r = next();
+          std::memcpy(dst + i, &r, std::min<VkDeviceSize>(8u, e.size - i));
+        }
+      }
+    }
+
+    // Four runs from the same saved state:
+    //   0  clean
+    //   1  clean again: a control, nondeterministic shaders differ here
+    //   2  bottom half of every overwritten image replaced
+    //   3  top half replaced
+    // then everything is put back and the real dispatch follows.
+    EmitCs([
+      cImages  = images,
+      cBuffers = buffers,
+      cSave    = saveBuf,
+      cOut     = outBuf,
+      cPoison  = poisonBuf,
+      cOutSize = outTotal,
+      cX = X, cY = Y, cZ = Z
+    ] (DxvkContext* ctx) {
+      VkOffset3D zero = { 0, 0, 0 };
+
+      for (const auto& e : cImages) {
+        ctx->copyImageToBuffer(cSave, e.saveAt, 0u, 0u,
+          e.image->info().format, e.image, e.sub, zero, e.extent);
+      }
+
+      for (const auto& b : cBuffers)
+        ctx->copyBuffer(cSave, b.saveAt, b.slice.buffer(), b.slice.offset(), b.slice.length());
+
+      auto restore = [&] (bool outputsOnly) {
+        for (const auto& e : cImages) {
+          if (outputsOnly && !e.output)
+            continue;
+
+          ctx->copyBufferToImage(e.image, e.sub, zero, e.extent,
+            cSave, e.saveAt, 0u, 0u, e.image->info().format);
+        }
+
+        for (const auto& b : cBuffers)
+          ctx->copyBuffer(b.slice.buffer(), b.slice.offset(), cSave, b.saveAt, b.slice.length());
+      };
+
+      auto overwrite = [&] (bool bottom) {
+        for (const auto& e : cImages) {
+          if (!e.poison)
+            continue;
+
+          uint32_t line = e.extent.height / 2u;
+          uint32_t y0   = bottom ? line : 0u;
+          uint32_t rows = bottom ? e.extent.height - line : line;
+
+          ctx->copyBufferToImage(e.image, e.sub,
+            VkOffset3D { 0, int32_t(y0), 0 },
+            VkExtent3D { e.extent.width, rows, 1u },
+            cPoison, e.poisonAt, 0u, 0u, e.image->info().format);
+        }
+      };
+
+      auto capture = [&] (uint32_t run) {
+        VkDeviceSize base = VkDeviceSize(run) * cOutSize;
+
+        for (const auto& e : cImages) {
+          if (!e.output)
+            continue;
+
+          ctx->copyImageToBuffer(cOut, base + e.outAt, 0u, 0u,
+            e.image->info().format, e.image, e.sub, zero, e.extent);
+        }
+
+        for (const auto& b : cBuffers)
+          ctx->copyBuffer(cOut, base + b.outAt, b.slice.buffer(), b.slice.offset(), b.slice.length());
+      };
+
+      ctx->dispatch(cX, cY, cZ);
+      capture(0u);
+
+      restore(true);
+      ctx->dispatch(cX, cY, cZ);
+      capture(1u);
+
+      restore(true);
+      overwrite(true);
+      ctx->dispatch(cX, cY, cZ);
+      capture(2u);
+
+      restore(false);
+      overwrite(false);
+      ctx->dispatch(cX, cY, cZ);
+      capture(3u);
+
+      restore(false);
+    });
+
+    auto t0 = dxvk::high_resolution_clock::now();
+
+    ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);
+    SynchronizeCsThread(DxvkCsThread::SynchronizeAll);
+    m_device->waitForResource(*outBuf, DxvkAccess::Write);
+
+    auto t1 = dxvk::high_resolution_clock::now();
+    double waitMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    const uint8_t* run[Runs];
+
+    for (uint32_t r = 0; r < Runs; r++)
+      run[r] = outData + VkDeviceSize(r) * outTotal;
+
+    uint32_t verdict   = MgpuReadInsensitive;
+    uint32_t maxRadius = 0u;
+
+    for (const auto& e : images) {
+      if (!e.output)
+        continue;
+
+      MgpuReadRows ctrl = MgpuReadCompareRows(run[0] + e.outAt, run[1] + e.outAt, e.extent, e.texel);
+      MgpuReadRows bot  = MgpuReadCompareRows(run[0] + e.outAt, run[2] + e.outAt, e.extent, e.texel);
+      MgpuReadRows top  = MgpuReadCompareRows(run[0] + e.outAt, run[3] + e.outAt, e.extent, e.texel);
+
+      uint32_t line = e.extent.height / 2u;
+
+      // Bottom half replaced: how far above the line the output moved.
+      // Top half replaced: how far below it.
+      uint32_t upReach   = bot.top    ? line - uint32_t(bot.minRow)     : 0u;
+      uint32_t downReach = top.bottom ? uint32_t(top.maxRow) - line + 1u : 0u;
+      uint32_t reach     = std::max(upReach, downReach);
+
+      uint32_t v;
+
+      if (ctrl.diffRows)
+        v = MgpuReadNondet;
+      else if (!bot.diffRows && !top.diffRows)
+        v = MgpuReadInsensitive;
+      else if (!e.screen)
+        v = MgpuReadGlobal;
+      else if (!reach)
+        v = MgpuReadLocal;
+      else if (reach >= line / 2u)
+        v = MgpuReadGlobal;
+      else
+        v = MgpuReadRadius;
+
+      if (v == MgpuReadRadius)
+        maxRadius = std::max(maxRadius, reach);
+
+      verdict = std::max(verdict, v);
+
+      Logger::warn(str::format("CREAD #", probe, "   ", e.label, " result",
+        " ctrl_rows=", ctrl.diffRows,
+        " | bottom replaced: rows above=", bot.top, " below=", bot.bottom,
+        " reach_up=", upReach,
+        " | top replaced: rows above=", top.top, " below=", top.bottom,
+        " reach_down=", downReach,
+        " | line=", line, " of ", e.extent.height,
+        " -> ", MgpuReadVerdictName(v),
+        v == MgpuReadRadius ? str::format(" ", reach) : std::string()));
+    }
+
+    for (const auto& b : buffers) {
+      VkDeviceSize len = b.slice.length();
+
+      // Where in the buffer the bytes moved, as a fraction of its
+      // length. A per-tile buffer written in screen order changes only
+      // in its second part when the bottom is replaced and only in its
+      // first part when the top is; a reduction changes everywhere.
+      auto range = [&] (const uint8_t* a, const uint8_t* b, VkDeviceSize& first, VkDeviceSize& last) {
+        first = len;
+        last  = 0u;
+
+        for (VkDeviceSize i = 0; i < len; i++) {
+          if (a[i] != b[i]) {
+            first = std::min(first, i);
+            last  = i;
+          }
+        }
+
+        return first < len;
+      };
+
+      VkDeviceSize f0, l0, f1, l1, f2, l2;
+
+      bool ctrl = range(run[0] + b.outAt, run[1] + b.outAt, f0, l0);
+      bool bot  = range(run[0] + b.outAt, run[2] + b.outAt, f1, l1);
+      bool top  = range(run[0] + b.outAt, run[3] + b.outAt, f2, l2);
+
+      auto frac = [len] (VkDeviceSize first, VkDeviceSize last) {
+        char s[32];
+        std::snprintf(s, sizeof(s), "[%.3f,%.3f]",
+          double(first) / double(len), double(last + 1u) / double(len));
+        return std::string(s);
+      };
+
+      // Without rows to locate a difference in, any change under either
+      // replacement counts as global; the ranges say whether it might
+      // be tiled after all.
+      uint32_t v = ctrl ? MgpuReadNondet
+                 : (bot || top) ? MgpuReadGlobal
+                 : MgpuReadInsensitive;
+
+      verdict = std::max(verdict, v);
+
+      Logger::warn(str::format("CREAD #", probe, "   ", b.label, " result buf",
+        " ctrl=", ctrl ? frac(f0, l0) : std::string("same"),
+        " bottom_replaced=", bot ? frac(f1, l1) : std::string("same"),
+        " top_replaced=", top ? frac(f2, l2) : std::string("same"),
+        " -> ", MgpuReadVerdictName(v)));
+    }
+
+    Logger::warn(str::format("CREAD #", probe, " verdict=", MgpuReadVerdictName(verdict),
+      verdict == MgpuReadRadius ? str::format(" radius=", maxRadius) : std::string(),
+      unpoisonedCount ? str::format(" (", unpoisonedCount, " inputs untouched)") : std::string(),
+      " cs=", name, " groups=", X, "x", Y, "x", Z,
+      " wait_ms=", waitMs));
+
+    tally(verdict);
+  }
+
+
   void D3D11ImmediateContext::MgpuFrameSpanEnd() {
     MgpuPassFrame();
 
@@ -3957,6 +4645,33 @@ namespace dxvk {
           m_graphDumps += 1u;
           Logger::warn(str::format("CGRAPH begin frame=", m_graphFrame,
             " ratio=", MgpuGetSplitRatio()));
+        }
+      }
+    }
+
+    // CREAD: armed once the application has presented N frames, so the
+    // probes land in the level rather than the menu or a loading screen.
+    // DXVK_MGPU_PROBE_READ=1 means 2400 presents; any larger value is
+    // the count itself.
+    {
+      static const uint64_t s_probeStart = [] {
+        std::string v = env::getEnvVar("DXVK_MGPU_PROBE_READ");
+
+        if (v.empty())
+          return uint64_t(0u);
+
+        uint64_t n = std::strtoull(v.c_str(), nullptr, 10);
+        return n > 1u ? n : uint64_t(2400u);
+      }();
+
+      if (unlikely(s_probeStart)) {
+        m_readProbeFrame += 1u;
+
+        if (!m_readProbeArmed && m_readProbeFrame >= s_probeStart) {
+          m_readProbeArmed = true;
+          Logger::warn(str::format("CREAD armed frame=", m_readProbeFrame,
+            " present=", m_readProbeRef.width, "x", m_readProbeRef.height,
+            " worker=", HasWorkerDevice() ? 1 : 0));
         }
       }
     }

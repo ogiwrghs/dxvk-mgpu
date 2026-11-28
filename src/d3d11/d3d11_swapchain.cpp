@@ -398,6 +398,14 @@ namespace dxvk {
     auto immediateContextLock = immediateContext->LockContext();
 
     auto phaseT0 = dxvk::high_resolution_clock::now();
+
+    // CREAD needs the swapchain's shape in single-GPU runs too, where
+    // the composite never learns it.
+    if (!m_backBuffers.empty()) {
+      auto desc = GetCommonTexture(m_backBuffers[0].ptr())->Desc();
+      immediateContext->MgpuSetProbeExtent(desc->Width, desc->Height);
+    }
+
     immediateContext->MgpuFrameSpanEnd();
     immediateContext->EndFrame(m_latency);
     immediateContext->ExecuteFlush(GpuFlushType::ExplicitFlush, nullptr, true);

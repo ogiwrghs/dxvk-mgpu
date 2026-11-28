@@ -480,6 +480,22 @@ namespace dxvk {
       return m_graphDump;
     }
 
+    // CREAD (DXVK_MGPU_PROBE_READ): how far each compute shader reads
+    // vertically. Once per shader and group count, the dispatch is run
+    // on the primary against saved state with the bottom, then the top
+    // half of its screen-shaped inputs overwritten, and the outputs are
+    // compared row by row with a clean run. Everything is restored
+    // before the real dispatch, so the picture is unchanged.
+    bool MgpuReadProbing() const {
+      return m_readProbeArmed;
+    }
+
+    void MgpuProbeComputeRead(uint32_t X, uint32_t Y, uint32_t Z);
+
+    void MgpuSetProbeExtent(uint32_t W, uint32_t H) {
+      m_readProbeRef = VkExtent2D { W, H };
+    }
+
     bool MgpuPassProfiling() const {
       return m_passActive;
     }
@@ -543,6 +559,9 @@ namespace dxvk {
     void MgpuPassReport();
 
     bool              m_passActive  = false;
+    bool              m_readProbeArmed = false;
+    uint64_t          m_readProbeFrame = 0u;
+    VkExtent2D        m_readProbeRef   = { 0u, 0u };
     bool              m_graphDump     = false;
     bool              m_graphWantDraw = false;
     uint64_t          m_graphFrame    = 0u;
