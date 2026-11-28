@@ -135,6 +135,30 @@ extern "C" {
           break;
         }
       }
+      // Which physical card is which role. Both cards report the same
+      // name, and the candidate lines above print pointers, so the UUID
+      // is the only identity the log can carry. Compare with
+      // nvidia-smi -q's GPU UUID or DXVK_FILTER_DEVICE_UUID.
+      auto uuidHex = [] (const Rc<DxvkAdapter>& adapter) {
+        std::string s;
+
+        if (adapter == nullptr)
+          return std::string("none");
+
+        DxvkAdapterInfo info = adapter->info();
+
+        for (uint32_t b = 0; b < VK_UUID_SIZE; b++) {
+          static const char digits[] = "0123456789abcdef";
+          s += digits[uint8_t(info.deviceUuid[b]) >> 4];
+          s += digits[uint8_t(info.deviceUuid[b]) & 0xf];
+        }
+
+        return s;
+      };
+
+      Logger::warn(str::format("MGPU: roles primary uuid=", uuidHex(dxvkAdapter),
+        " worker uuid=", uuidHex(workerAdapter)));
+
       if (workerAdapter != nullptr) {
         Logger::info("D3D11InternalCreateDevice: Found second GPU, creating worker device");
         workerAdapter->enableExtensions(mgpuExtensions);

@@ -16,20 +16,25 @@ for general use.
 ## Results
 
 Test system: 2x GTX 1080 Ti (MSI factory-OC on x16 Gen3, Founders Edition
-on x8 Gen3; the card driving the display is the primary), i9-10940X,
-Windows VM on Proxmox KVM with both GPUs passed through, NVIDIA 560.94.
+on x8 Gen3), i9-10940X, Windows VM on Proxmox KVM with both GPUs passed
+through, NVIDIA 560.94. The display is on the MSI, which is also the
+primary GPU (it composites and presents) and the card the single-GPU
+baseline runs on. The log records which card is which (`MGPU: roles`).
 
 **3DMark Fire Strike, graphics test 2, 3840x2160** (3DMark's own per-test
 result; custom run, so no overall score):
 
 | Configuration | GT2 fps |
 |---|---|
-| Single GPU, Founders Edition (has the display) | 19.57 |
-| Single GPU, MSI | 18.39 |
-| **Both GPUs, this fork** | **31.38, 30.31** (two runs) |
+| Single GPU, MSI | 20.58 |
+| **Both GPUs, this fork** | **30.03** |
 
-That is **+55-60% over the faster single card**. 3DMark itself reports one
-GPU and SLI off: the application never knows a second GPU is rendering.
+That is **+46% over the single card**. 3DMark itself reports one GPU and
+SLI off: the application never knows a second GPU is rendering.
+
+An earlier figure of +55-60% is withdrawn. It was measured with the display
+on the other card, so its single-GPU baselines either ran on the slower
+Founders Edition or had every frame copied across to the display's card.
 
 **Where it does not help.** The gain depends on how much of a frame can be
 split:
@@ -40,7 +45,9 @@ split:
 | BeamNG.drive, West Coast USA, 1080p | 50.9 fps | 37.0 fps | the application thread is the limit; mirroring every command adds to it |
 
 Both are measured with the fork's own instruments (PASSTIME and CALLTIME,
-below), which is how the causes are known. Splitting compute by rows was
+below), which is how the causes are known. These BeamNG runs predate the
+`MGPU: roles` log line, so which card ran the single-GPU baseline was not
+recorded; they are being re-measured on the setup above. Splitting compute by rows was
 tried and is off by default: whether a dispatch may be split depends on
 which rows its shader reads, which the bindings do not say.
 
